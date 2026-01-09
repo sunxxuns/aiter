@@ -61,7 +61,7 @@
 
 ### Next Steps
 
-1. **Multi-wave support** (NEXT)
+1. **Multi-wave support** (ANALYZING)
    - Currently single wave (64 threads)
    - Need multiple waves for larger sequences
 
@@ -69,6 +69,74 @@
    - Coalesced V loading (replace strided loads)
    - Better LDS utilization
    - Instruction scheduling
+
+## BF16 Multi-Wave Architecture Analysis
+
+### Thread Organization (from fwd_hd128_bf16.co disassembly)
+
+```assembly
+v_lshrrev_b32_e32 v3, 6, v0      // wave_id = tid >> 6
+v_and_b32_e32 v0, 63, v0         // lane_id = tid & 63
+v_readfirstlane_b32 s5, v3       // s5 = wave index for conditionals
+```
+
+### Key Characteristics
+
+| Property | BF16 Kernel | FP8 v4 (current) |
+|----------|-------------|------------------|
+| Max threads | 512 (8 waves) | 64 (1 wave) |
+| VGPRs | 256 | 120 |
+| SGPRs | 96 | 50 |
+| LDS | 160KB | 32KB |
+| Barriers | 20 | few |
+
+### Work Distribution Pattern
+
+1. **Data Loading**:
+   - Waves 0-3 (s5 < 4): Load V to LDS
+   - Waves 4-7: Skip loading via `s_cbranch_scc0`
+   - Uses `buffer_load_dwordx4 ... offen lds` for direct global→LDS
+
+2. **Computation**:
+   - All waves participate in MFMA after s_barrier
+   - Each wave processes different Q rows
+
+3. **Conditional Execution**:
+   ```assembly
+   s_cmp_lt_i32 s5, 4           // if wave_id < 4
+   s_cbranch_scc0 skip_load    // skip V loading for waves 4-7
+   ```
+
+### FP8 Multi-Wave Options
+
+**Option A: Scale Up Current Design (Simple)**
+- Keep 64 threads, add workgroup_id_x for Q-tile parallelism
+- Each workgroup processes one Q-tile independently
+- Pro: Minimal code change, good for small batch sizes
+- Con: Limited parallelism within single attention head
+
+**Option B: 4-Wave Design (256 threads)**
+- Wave 0: Q row 0-7 (threads 0-63)
+- Wave 1: Q row 8-15 (threads 64-127)
+- Wave 2: Q row 16-23 (threads 128-191)
+- Wave 3: Q row 24-31 (threads 192-255)
+- Pro: Better LDS utilization, more compute density
+- Con: More complex coordination
+
+**Option C: 2-Wave Design (128 threads)**
+- Wave 0: Q row 0-15 (threads 0-63)
+- Wave 1: Q row 16-31 (threads 64-127)
+- Middle ground between A and B
+
+### Recommended Approach for FP8
+
+Start with **Option A** (multiple workgroups, 64 threads each):
+1. Already working single-wave kernel
+2. Launch grid with (num_q_tiles, num_heads, batch_size)
+3. Each workgroup independent - no inter-wave coordination needed
+4. Good parallelism at batch level
+
+Later optimize with **Option B** for single-batch high-performance
 
 ### Files
 
