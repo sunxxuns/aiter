@@ -434,10 +434,11 @@ K_LOOP:
     
     // ========================================================================
     // PV MFMAs
+    // V loading uses (lane % 32) * 8 for MFMA B operand layout
     // ========================================================================
-    v_and_b32_e32 v7, 31, v0
-    v_lshlrev_b32_e32 v7, 3, v7
-    v_add_u32_e32 v7, LDS_V_OFFSET, v7
+    v_and_b32_e32 v7, 31, v0              // lane within 32
+    v_lshlrev_b32_e32 v7, 3, v7           // * 8 bytes
+    v_add_u32_e32 v7, LDS_V_OFFSET, v7    // base + lane offset
     
     ds_read_b64 v[64:65], v7
     ds_read_b64 v[66:67], v7 offset:128
