@@ -1,0 +1,88 @@
+# FP8 Flash Attention Kernel Progress
+
+## Current Status: D=0..31 WORKING, Ready for D-tile Loop
+
+### Completed Steps
+
+1. ✅ **Basic FP8 kernel structure** (v1)
+   - Kernel launch, args parsing, thread mapping
+
+2. ✅ **QK MFMA computation** (v1)
+   - Q/K loading from global memory to LDS
+   - ds_read_b64_tr_b8 for transpose read
+   - v_mfma_f32_32x32x16_fp8_fp8 for 8 K-tiles (K=0..127)
+   - Accumulated FP32 results in v[32:47]
+
+3. ✅ **Online softmax** (v1)
+   - Row-wise max finding with v_max_f32
+   - Exp computation with v_exp_f32
+   - Running sum accumulation
+   - Final 1/sum normalization
+
+4. ✅ **PV MFMA computation** (v2 - NUMERICALLY CORRECT)
+   - V loading: 16 strided flat_load_ubyte per thread
+   - LDS layout: K-inner V[D,K] at offset D*32 + K
+   - ds_read_b64 for MFMA B operand
+   - P→FP8 packing with v_cvt_pk_fp8_f32
+   - v_mfma_f32_32x32x16_fp8_fp8 for 2 K-groups (K=0..31)
+
+5. ✅ **Output normalization and store** (v2)
+   - Multiply by 1/sum
+   - Store FP32 output to global memory
+
+6. ✅ **Debug store removal** (v3_clean)
+   - Removed all debug stores
+   - Performance: 4.58us → 3.11us (32% faster)
+
+### Current Kernel Performance
+
+| Kernel | Time | Notes |
+|--------|------|-------|
+| fwd_hd128_fp8_v3.s | 4.58 us | With debug stores |
+| fwd_hd128_fp8_v3_clean.s | 3.11 us | No debug stores |
+
+### Numerical Accuracy (Verified)
+
+- Controlled V pattern: ✓ Expected 15.5, Got 15.5
+- All zeros V: ✓ Expected 0.0, Got 0.0  
+- Constant V=1: ✓ Expected 1.0, Got 1.0
+- PyTorch reference: ✓ Max error 0.36
+
+### Next Steps
+
+1. **D-tile loop** (CURRENT)
+   - Currently only processes D=0..31 (32 elements)
+   - Need to loop 4 times for full head_dim=128
+   - Each iteration: different V slice, different output slice
+
+2. **Multi-wave support**
+   - Currently single wave (64 threads)
+   - Need multiple waves for larger sequences
+
+3. **Performance optimization**
+   - Coalesced V loading (replace strided loads)
+   - Better LDS utilization
+   - Instruction scheduling
+
+### Files
+
+```
+fwd_hd128_fp8_v2.s       - Working kernel with debug stores (reference)
+fwd_hd128_fp8_v3.s       - Working kernel with debug stores (copy of v2)
+fwd_hd128_fp8_v3_clean.s - Optimized kernel without debug stores
+```
+
+### Key Learnings
+
+1. **ds_read_b64_tr_b8** has addressing limitations (128-byte window)
+2. **Strided V loads** work but are slow (16 flat_load_ubyte per thread)
+3. **K-inner LDS layout** V[D,K] enables simple ds_read_b64 for MFMA
+4. **Debug stores** can be safely removed by replacing with s_nop
+
+### Architecture Notes
+
+- Target: AMD gfx950
+- MFMA: v_mfma_f32_32x32x16_fp8_fp8 (64 FLOPs per instruction)
+- Threads: 64 (single wave)
+- LDS: 32KB allocated
+- Tile: 32×32 attention with 128-dim heads

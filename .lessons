@@ -90,3 +90,110 @@ ds_read_b64_tr_b8 v[30:31], v6        // Gets V[K=0..7, D=lane%16]
 ```
 
 **Result**: Each lane correctly gets 8 K values at its D position!
+
+### LDS Offset Limitation for tr_b8
+
+**CRITICAL**: `ds_read_b64_tr_b8` has complex addressing that limits its use:
+
+1. **Base scaling**: base = position * 8, address = base/8 + i*16 for i=0..7
+2. **Range limitation**: For larger byte positions (e.g., 128+), base = 1024+ may cause incorrect addressing
+3. **Observed behavior**: base=1024 (for position=128) reads from LDS[1024] directly instead of LDS[128]
+
+**Working range**: Only positions 0..127 (base 0..1016) are reliable for accessing a 128-byte window.
+
+**For K=0..7**: Works correctly with base = D * 8 (D = column 0..15)
+**For K=8..15**: Unreliable; falls back to reading wrong addresses
+
+**Solutions**:
+1. Use regular `ds_read_b64` with K-inner LDS layout (V[D, K])
+2. For FP8 with 32 K values needed, use 16 strided loads as fallback
+3. Structure LDS to keep each transpose-read window within 128 bytes
+
+### Debug Store Removal
+
+Debug stores are NOT needed for correctness - they're purely for debugging. Earlier issues with removal were due to script bugs, not actual dependencies.
+
+**Correct removal method**:
+Replace each debug block with a minimal placeholder (e.g., `s_nop 7`) to preserve code structure:
+
+```python
+# Replace debug block with s_nop while preserving blank lines
+if '// DEBUG:' in line and 'Store output' not in line:
+    result.append('    s_nop 7\n')
+    result.append('\n')
+    # Skip to after s_waitcnt vmcnt(0)
+```
+
+**Performance impact**:
+- With debug stores: 4.58 us
+- Without debug stores: 3.63 us (21% faster)
+
+**Common mistakes**:
+1. Regex removing extra blank lines, breaking section structure
+2. Accidentally removing the final output store (labeled as DEBUG)
+
+## FP8 Flash Attention Kernel Implementation
+
+### Working Kernel: `fwd_hd128_fp8_v2.s`
+
+**Key Components**:
+- 64 threads (single wave) processing 32×32 attention tiles
+- Online softmax with streaming max/sum computation
+- FP8 MFMA `v_mfma_f32_32x32x16_fp8_fp8` for QK and PV computations
+
+**V Loading Strategy (Current - Strided Loads)**:
+```assembly
+// 16 strided byte loads per thread
+flat_load_ubyte v72, v[10:11]          // V[K=0, D=d]
+flat_load_ubyte v73, v[10:11] offset:128  // V[K=1, D=d]
+// ... 14 more loads with stride 128
+```
+
+This is slow but numerically correct. Each thread loads one D column, 16 K values.
+
+**LDS Layout for V (K-inner)**:
+```
+V[D, K] at offset D*32 + K
+ds_read_b64 at D*32 gives consecutive K values for MFMA B operand
+```
+
+### MFMA Operand Mapping (32x32x16 FP8)
+
+**A operand (P values)**:
+- Pack FP32 softmax P into FP8 with `v_cvt_pk_fp8_f32`
+- Write to AGPRs `a[0:3]` (4 registers × 4 FP8 = 16 values)
+
+**B operand (V values)**:
+- Lanes 0-31: V[K=0..7, D=lane]
+- Lanes 32-63: V[K=8..15, D=lane-32]
+- Read with `ds_read_b64` from K-inner LDS layout
+
+### Debug Store Removal Warning
+
+When removing debug stores, be VERY careful not to remove:
+1. The actual output store (may be labeled "DEBUG: Store output accumulators")
+2. Essential computation code between debug blocks
+
+**Safe removal strategy**:
+1. Comment out debug blocks first (don't delete)
+2. Test after each removal
+3. Only delete after verification
+
+### ds_read_b64_tr_b8 Addressing Details (Further Investigation)
+
+**Without base*8 scaling**:
+- The instruction reads the same byte 8 times (no stride)
+- Example: base=128 reads LDS[128] eight times → [80, 80, 80, 80, 80, 80, 80, 80]
+
+**With base*8 scaling**:
+- Stride of 16 is enabled
+- But for base >= 1024, the address appears to be used directly
+- Example: base=1024 (position=128) reads from LDS[1024] (K data region) instead of LDS[128] (V data region)
+
+**Practical 128-byte window**:
+- ds_read_b64_tr_b8 reliably accesses 8 values × 16-byte stride = 128 bytes total
+- For K=0..7: positions 0..112 (base 0..896) work correctly
+- For K=8..15: positions 128..240 (base 1024..1920) show incorrect behavior
+
+**Workaround for K>7**:
+The current working kernel uses strided `flat_load_ubyte` for V loading (16 loads per thread) with K-inner LDS layout and regular `ds_read_b64` for reading, avoiding the tr_b8 limitation entirely.
