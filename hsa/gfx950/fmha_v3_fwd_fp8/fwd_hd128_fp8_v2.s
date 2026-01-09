@@ -1,249 +1,246 @@
-// SPDX-License-Identifier: MIT
-// FP8 Flash Attention - Clean version without debug stores
-// Optimized for benchmarking
+// FP8 Flash Attention Forward Kernel (Clean Version)
+// Target: gfx950
+// Head dim: 128, Single tile (32x32 QK), Single wave (64 threads)
 
 .amdgcn_target "amdgcn-amd-amdhsa--gfx950"
 
 .text
 .globl _ZN5aiter18fmha_fwd_hd128_fp8E
+.type _ZN5aiter18fmha_fwd_hd128_fp8E, @function
 .p2align 8
-.type _ZN5aiter18fmha_fwd_hd128_fp8E,@function
 
-// Configuration constants
-.set BLOCK_M, 64                // Q tile rows
-.set BLOCK_N, 64                // K/V tile rows  
-.set HEAD_DIM, 128              // Head dimension
-.set THREADS, 256               // Threads per block (4 warps)
-.set LDS_Q_SIZE, 8192           // 64 * 128 FP8 = 8KB for Q
-.set LDS_K_SIZE, 8192           // 64 * 128 FP8 = 8KB for K
-.set LDS_V_SIZE, 8192           // 64 * 128 FP8 = 8KB for V
-.set LDS_TOTAL, 32768           // 32KB total LDS
 .set LDS_Q_OFFSET, 0
-.set LDS_K_OFFSET, 8192
-.set LDS_V_OFFSET, 16384
-.set Q_TILE_SIZE, 8192          // 64 * 128 bytes per Q-tile
+.set LDS_K_OFFSET, 2048
+.set LDS_V_OFFSET, 4096
 
 _ZN5aiter18fmha_fwd_hd128_fp8E:
     // ========================================================================
-    // REGISTER ALLOCATION:
-    // s0-s1:   kernarg base pointer
-    // s8-s9:   ptr_R (output)
-    // s10-s11: ptr_Q
-    // s12-s13: ptr_K
-    // s14-s15: ptr_V
-    // s20:     softmax_scale
-    // s21:     seqlen_q
-    // s22:     seqlen_k
-    // s26:     q_scale
-    // s27:     k_scale
-    // s28:     v_scale
-    // s30:     k_tiles (number of K-tiles to process)
-    // s31:     current k_tile index
-    // s32-s33: offsets
+    // KERNEL ARGUMENTS (loaded from kernarg segment)
+    // ========================================================================
+    // arg0  (offset 0):   output pointer
+    // arg1  (offset 16):  Q pointer
+    // arg2  (offset 32):  K pointer
+    // arg3  (offset 48):  V pointer
+    // arg4  (offset 64):  lse pointer
+    // arg5  (offset 80):  scale (float)
+    // arg6  (offset 88):  seqlen_q (uint32)
+    // arg7  (offset 96):  seqlen_k (uint32)
+    // arg8  (offset 512): q_scale (float)
+    // arg9  (offset 516): k_scale (float)
+    // arg10 (offset 520): v_scale (float)
     // ========================================================================
     
     // Load kernel arguments
-    s_and_b32 s1, s1, 0xffff
-    
-    s_load_dwordx2 s[8:9], s[0:1], 0x00       // ptr_R (output)
-    s_load_dwordx2 s[10:11], s[0:1], 0x10     // ptr_Q
-    s_load_dwordx2 s[12:13], s[0:1], 0x20     // ptr_K
-    s_load_dwordx2 s[14:15], s[0:1], 0x30     // ptr_V
-    s_load_dword s20, s[0:1], 0x50            // softmax_scale
-    s_load_dword s21, s[0:1], 0x58            // seqlen_q
-    s_load_dword s22, s[0:1], 0x60            // seqlen_k
-    s_load_dword s26, s[0:1], 0x200           // q_scale
-    s_load_dword s27, s[0:1], 0x204           // k_scale
-    s_load_dword s28, s[0:1], 0x208           // v_scale
-    
-    // Thread/warp ID extraction
-    v_and_b32_e32 v0, 0xff, v0                // tid (0-255)
-    v_lshrrev_b32_e32 v1, 6, v0               // warp_id (0-3)
-    v_and_b32_e32 v2, 63, v0                  // lane_id (0-63)
+    s_load_dwordx2 s[4:5], s[0:1], 0      // output ptr
+    s_load_dwordx2 s[6:7], s[0:1], 16     // Q ptr
+    s_load_dwordx2 s[10:11], s[0:1], 32   // K ptr
+    s_load_dwordx2 s[14:15], s[0:1], 48   // V ptr
+    s_load_dword s29, s[0:1], 80          // scale
+    s_load_dword s30, s[0:1], 96          // seqlen_k
+    s_load_dword s26, s[0:1], 512         // q_scale
+    s_load_dword s27, s[0:1], 516         // k_scale
+    s_load_dword s28, s[0:1], 520         // v_scale
     
     s_waitcnt lgkmcnt(0)
     
-    // head_stride = seqlen * 128
-    s_lshl_b32 s23, s21, 7                    // s23 = seqlen_q * 128
-    s_lshl_b32 s24, s22, 7                    // s24 = seqlen_k * 128
+    // Store output ptr in s8:s9 for later use
+    s_mov_b32 s8, s4
+    s_mov_b32 s9, s5
     
-    // Combined QK scale = softmax_scale * q_scale * k_scale
-    // For now, just use softmax_scale
-    s_mov_b32 s29, s20
+    // Calculate K loop count: ceil(seqlen_k / 32)
+    s_add_u32 s30, s30, 31
+    s_lshr_b32 s30, s30, 5
     
-    // Simple offsets (single tile for now)
-    s_mov_b32 s32, 0                          // q_offset = 0
-    s_mov_b32 s30, 1                          // k_tiles = 1
+    // Thread ID
+    v_mov_b32_e32 v0, 0
+    v_mbcnt_lo_u32_b32 v0, -1, 0
+    v_mbcnt_hi_u32_b32 v0, -1, v0
     
-    // ========================================================================
-    // INITIALIZE OUTPUT ACCUMULATORS AND SOFTMAX STATE
-    // ========================================================================
-    // v16 = running_max (init to -inf)
-    // v17 = running_sum (init to 0)
-    // v48-v63 = output accumulator (init to 0)
-    v_mov_b32_e32 v16, 0xff800000             // -inf
-    v_mov_b32_e32 v17, 0                      // sum = 0
-    
-    // Initialize output accumulator to 0
-    // Use explicit zero constant
-    s_mov_b32 s37, 0
-    v_mov_b32_e32 v48, s37
-    v_mov_b32_e32 v49, 0
-    v_mov_b32_e32 v50, 0
-    v_mov_b32_e32 v51, 0
-    v_mov_b32_e32 v52, 0
-    v_mov_b32_e32 v53, 0
-    v_mov_b32_e32 v54, 0
-    v_mov_b32_e32 v55, 0
-    v_mov_b32_e32 v56, 0
-    v_mov_b32_e32 v57, 0
-    v_mov_b32_e32 v58, 0
-    v_mov_b32_e32 v59, 0
-    v_mov_b32_e32 v60, 0
-    v_mov_b32_e32 v61, 0
-    v_mov_b32_e32 v62, 0
-    v_mov_b32_e32 v63, 0
+    // Thread offset: tid * 16 bytes (each thread loads 16 FP8 values)
+    v_lshlrev_b32_e32 v6, 4, v0
     
     // ========================================================================
     // LOAD Q TILE TO LDS
     // ========================================================================
-    v_lshlrev_b32_e32 v6, 4, v0               // thread offset = tid * 16
+    v_mov_b32_e32 v2, s6
+    v_mov_b32_e32 v3, s7
+    v_add_co_u32_e32 v2, vcc, v6, v2
+    v_addc_co_u32_e32 v3, vcc, 0, v3, vcc
     
-    // Load first 4KB of Q
-    v_mov_b32_e32 v10, s10                    // Q base low
-    v_mov_b32_e32 v11, s11                    // Q base high
-    v_add_co_u32_e32 v10, vcc, v6, v10        // add thread offset
-    v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
-    flat_load_dwordx4 v[64:67], v[10:11]
-    
-    // Load second 4KB of Q
-    v_add_co_u32_e32 v10, vcc, 4096, v10
-    v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
-    flat_load_dwordx4 v[68:71], v[10:11]
+    flat_load_dwordx4 v[80:83], v[2:3]
+    v_add_co_u32_e32 v2, vcc, 4096, v2
+    v_addc_co_u32_e32 v3, vcc, 0, v3, vcc
+    flat_load_dwordx4 v[84:87], v[2:3]
     
     s_waitcnt vmcnt(0)
     
     // Store Q to LDS
-    ds_write_b128 v6, v[64:67]
-    v_add_u32_e32 v7, 4096, v6
-    ds_write_b128 v7, v[68:71]
+    v_add_u32_e32 v7, LDS_Q_OFFSET, v6
+    ds_write_b128 v7, v[80:83]
+    v_add_u32_e32 v7, LDS_Q_OFFSET + 1024, v6
+    ds_write_b128 v7, v[84:87]
     
+    s_waitcnt lgkmcnt(0)
     s_barrier
     
     // ========================================================================
-    // K-TILE LOOP
+    // INITIALIZE ACCUMULATORS
     // ========================================================================
-    s_mov_b32 s31, 0                          // k_tile_idx = 0
+    s_mov_b32 s37, 0
+    v_mov_b32_e32 v16, 0xff800000         // running_max = -inf
+    v_mov_b32_e32 v17, s37                // running_sum = 0
+    v_mov_b32_e32 v48, s37                // output accumulator v48-v63
+    v_mov_b32_e32 v49, s37
+    v_mov_b32_e32 v50, s37
+    v_mov_b32_e32 v51, s37
+    v_mov_b32_e32 v52, s37
+    v_mov_b32_e32 v53, s37
+    v_mov_b32_e32 v54, s37
+    v_mov_b32_e32 v55, s37
+    v_mov_b32_e32 v56, s37
+    v_mov_b32_e32 v57, s37
+    v_mov_b32_e32 v58, s37
+    v_mov_b32_e32 v59, s37
+    v_mov_b32_e32 v60, s37
+    v_mov_b32_e32 v61, s37
+    v_mov_b32_e32 v62, s37
+    v_mov_b32_e32 v63, s37
     
+    // K loop counter
+    s_mov_b32 s31, 0
+    s_mov_b32 s33, 0                      // k_offset
+    
+    // ========================================================================
+    // K-LOOP START
+    // ========================================================================
 K_LOOP:
     // ========================================================================
     // LOAD K TILE TO LDS
     // ========================================================================
-    s_lshl_b32 s33, s31, 13                   // k_offset = k_tile_idx * 8192
-    v_mov_b32_e32 v10, s12                    // K base low
-    v_mov_b32_e32 v11, s13                    // K base high
+    v_mov_b32_e32 v2, s10
+    v_mov_b32_e32 v3, s11
     v_mov_b32_e32 v7, s33
-    v_add_co_u32_e32 v10, vcc, v7, v10
-    v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
-    v_add_co_u32_e32 v10, vcc, v6, v10
-    v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
+    v_add_co_u32_e32 v2, vcc, v7, v2
+    v_addc_co_u32_e32 v3, vcc, 0, v3, vcc
+    v_add_co_u32_e32 v2, vcc, v6, v2
+    v_addc_co_u32_e32 v3, vcc, 0, v3, vcc
     
-    flat_load_dwordx4 v[72:75], v[10:11]
-    v_add_co_u32_e32 v10, vcc, 4096, v10
-    v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
-    flat_load_dwordx4 v[76:79], v[10:11]
+    flat_load_dwordx4 v[80:83], v[2:3]
+    v_add_co_u32_e32 v2, vcc, 4096, v2
+    v_addc_co_u32_e32 v3, vcc, 0, v3, vcc
+    flat_load_dwordx4 v[84:87], v[2:3]
     
     s_waitcnt vmcnt(0)
     
     // Store K to LDS
     v_add_u32_e32 v7, LDS_K_OFFSET, v6
-    ds_write_b128 v7, v[72:75]
-    v_add_u32_e32 v7, LDS_K_OFFSET + 4096, v6
-    ds_write_b128 v7, v[76:79]
+    ds_write_b128 v7, v[80:83]
+    v_add_u32_e32 v7, LDS_K_OFFSET + 1024, v6
+    ds_write_b128 v7, v[84:87]
     
+    s_waitcnt lgkmcnt(0)
     s_barrier
     
     // ========================================================================
-    // QK MFMA - Initialize accumulator
+    // QK MFMA (Q × K^T for head_dim=128)
     // ========================================================================
-    v_mov_b32_e32 v32, 0
-    v_mov_b32_e32 v33, 0
-    v_mov_b32_e32 v34, 0
-    v_mov_b32_e32 v35, 0
-    v_mov_b32_e32 v36, 0
-    v_mov_b32_e32 v37, 0
-    v_mov_b32_e32 v38, 0
-    v_mov_b32_e32 v39, 0
-    v_mov_b32_e32 v40, 0
-    v_mov_b32_e32 v41, 0
-    v_mov_b32_e32 v42, 0
-    v_mov_b32_e32 v43, 0
-    v_mov_b32_e32 v44, 0
-    v_mov_b32_e32 v45, 0
-    v_mov_b32_e32 v46, 0
-    v_mov_b32_e32 v47, 0
+    // Initialize QK accumulator
+    v_mov_b32_e32 v32, s37
+    v_mov_b32_e32 v33, s37
+    v_mov_b32_e32 v34, s37
+    v_mov_b32_e32 v35, s37
+    v_mov_b32_e32 v36, s37
+    v_mov_b32_e32 v37, s37
+    v_mov_b32_e32 v38, s37
+    v_mov_b32_e32 v39, s37
+    v_mov_b32_e32 v40, s37
+    v_mov_b32_e32 v41, s37
+    v_mov_b32_e32 v42, s37
+    v_mov_b32_e32 v43, s37
+    v_mov_b32_e32 v44, s37
+    v_mov_b32_e32 v45, s37
+    v_mov_b32_e32 v46, s37
+    v_mov_b32_e32 v47, s37
     
-    // LDS read offset for MFMA
-    v_lshlrev_b32_e32 v7, 3, v2           // v7 = lane_id * 8
+    // Thread offset for MFMA operand loading
+    v_and_b32_e32 v7, 31, v0              // lane within 32
+    v_lshlrev_b32_e32 v7, 3, v7           // * 8 bytes
     
-    // ========================================================================
-    // QK MFMAs - 8 iterations for HEAD_DIM=128
-    // ========================================================================
-    // K=0..31
-    ds_read_b64 a[0:1], v7
+    // Load Q K=0..31 into AGPRs
+    v_add_u32_e32 v9, 0, v7
+    ds_read_b64 a[0:1], v9
     v_add_u32_e32 v9, 16, v7
     ds_read_b64 a[2:3], v9
+    
+    // Load K K=0..31
     v_add_u32_e32 v9, LDS_K_OFFSET, v7
     ds_read_b64 v[64:65], v9
-    v_add_u32_e32 v9, LDS_K_OFFSET + 16, v7
+    v_add_u32_e32 v9, 16, v9
     ds_read_b64 v[66:67], v9
+    
     s_waitcnt lgkmcnt(0)
+    
+    // QK MFMAs - K=0..15, K=16..31
     v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[0:1], v[64:65], v[32:47]
     v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[2:3], v[66:67], v[32:47]
     
-    // K=32..63
+    // Load Q K=32..63
     v_add_u32_e32 v9, 32, v7
-    ds_read_b64 a[4:5], v9
-    v_add_u32_e32 v9, 48, v7
-    ds_read_b64 a[6:7], v9
-    v_add_u32_e32 v9, LDS_K_OFFSET + 32, v7
-    ds_read_b64 v[68:69], v9
-    v_add_u32_e32 v9, LDS_K_OFFSET + 48, v7
-    ds_read_b64 v[70:71], v9
-    s_waitcnt lgkmcnt(0)
-    v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[4:5], v[68:69], v[32:47]
-    v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[6:7], v[70:71], v[32:47]
+    ds_read_b64 a[0:1], v9
+    v_add_u32_e32 v9, 16, v9
+    ds_read_b64 a[2:3], v9
     
-    // K=64..95
+    // Load K K=32..63
+    v_add_u32_e32 v9, LDS_K_OFFSET + 32, v7
+    ds_read_b64 v[64:65], v9
+    v_add_u32_e32 v9, 16, v9
+    ds_read_b64 v[66:67], v9
+    
+    s_waitcnt lgkmcnt(0)
+    
+    // QK MFMAs - K=32..47, K=48..63
+    v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[0:1], v[64:65], v[32:47]
+    v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[2:3], v[66:67], v[32:47]
+    
+    // Load Q K=64..95
     v_add_u32_e32 v9, 64, v7
     ds_read_b64 a[0:1], v9
-    v_add_u32_e32 v9, 80, v7
+    v_add_u32_e32 v9, 16, v9
     ds_read_b64 a[2:3], v9
+    
+    // Load K K=64..95
     v_add_u32_e32 v9, LDS_K_OFFSET + 64, v7
     ds_read_b64 v[64:65], v9
-    v_add_u32_e32 v9, LDS_K_OFFSET + 80, v7
+    v_add_u32_e32 v9, 16, v9
     ds_read_b64 v[66:67], v9
+    
     s_waitcnt lgkmcnt(0)
+    
+    // QK MFMAs - K=64..79, K=80..95
     v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[0:1], v[64:65], v[32:47]
     v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[2:3], v[66:67], v[32:47]
     
-    // K=96..127
+    // Load Q K=96..127
     v_add_u32_e32 v9, 96, v7
     ds_read_b64 a[4:5], v9
-    v_add_u32_e32 v9, 112, v7
+    v_add_u32_e32 v9, 16, v9
     ds_read_b64 a[6:7], v9
+    
+    // Load K K=96..127
     v_add_u32_e32 v9, LDS_K_OFFSET + 96, v7
     ds_read_b64 v[68:69], v9
-    v_add_u32_e32 v9, LDS_K_OFFSET + 112, v7
+    v_add_u32_e32 v9, 16, v9
     ds_read_b64 v[70:71], v9
+    
     s_waitcnt lgkmcnt(0)
+    
+    // QK MFMAs - K=96..111, K=112..127
     v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[4:5], v[68:69], v[32:47]
     v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[6:7], v[70:71], v[32:47]
     
     // ========================================================================
-    // ONLINE SOFTMAX
+    // APPLY QK SCALE
     // ========================================================================
-    // Apply scale: QK = QK * softmax_scale
     v_mul_f32_e32 v32, s29, v32
     v_mul_f32_e32 v33, s29, v33
     v_mul_f32_e32 v34, s29, v34
@@ -261,39 +258,39 @@ K_LOOP:
     v_mul_f32_e32 v46, s29, v46
     v_mul_f32_e32 v47, s29, v47
     
-    // Local max reduction
+    // ========================================================================
+    // COMPUTE LOCAL MAX (thread's 16 values -> single max)
+    // ========================================================================
     v_max_f32_e32 v18, v32, v33
-    v_max_f32_e32 v18, v18, v34
-    v_max_f32_e32 v18, v18, v35
-    v_max_f32_e32 v18, v18, v36
-    v_max_f32_e32 v18, v18, v37
-    v_max_f32_e32 v18, v18, v38
-    v_max_f32_e32 v18, v18, v39
-    v_max_f32_e32 v18, v18, v40
-    v_max_f32_e32 v18, v18, v41
-    v_max_f32_e32 v18, v18, v42
-    v_max_f32_e32 v18, v18, v43
-    v_max_f32_e32 v18, v18, v44
-    v_max_f32_e32 v18, v18, v45
-    v_max_f32_e32 v18, v18, v46
-    v_max_f32_e32 v18, v18, v47
+    v_max_f32_e32 v19, v34, v35
+    v_max_f32_e32 v18, v18, v19
+    v_max_f32_e32 v19, v36, v37
+    v_max_f32_e32 v20, v38, v39
+    v_max_f32_e32 v19, v19, v20
+    v_max_f32_e32 v18, v18, v19
+    v_max_f32_e32 v19, v40, v41
+    v_max_f32_e32 v20, v42, v43
+    v_max_f32_e32 v19, v19, v20
+    v_max_f32_e32 v20, v44, v45
+    v_max_f32_e32 v21, v46, v47
+    v_max_f32_e32 v20, v20, v21
+    v_max_f32_e32 v19, v19, v20
+    v_max_f32_e32 v18, v18, v19           // v18 = local_max
     
     // Cross-thread max reduction
     v_mov_b32_e32 v19, v18
     s_nop 0
     s_nop 0
     v_permlane32_swap_b32_e32 v19, v18
-    v_max_f32_e32 v18, v18, v19
+    v_max_f32_e32 v18, v18, v19           // v18 = row max
     
-    // Update running max
-    v_mov_b32_e32 v19, v16               // old_max
-    v_max_f32_e32 v16, v16, v18          // new running_max
-    
-    // Correction factor
+    // Compute new_max and correction factor
+    v_mov_b32_e32 v19, v16                // old_max
+    v_max_f32_e32 v16, v16, v18           // running_max = max(running_max, row_max)
     v_sub_f32_e32 v20, v19, v16
-    v_exp_f32_e32 v19, v20               // correction = exp(old_max - new_max)
+    v_exp_f32_e32 v19, v20                // correction = exp(old_max - new_max)
     
-    // Scale previous accumulators
+    // Scale previous output by correction
     v_mul_f32_e32 v48, v19, v48
     v_mul_f32_e32 v49, v19, v49
     v_mul_f32_e32 v50, v19, v50
@@ -311,10 +308,12 @@ K_LOOP:
     v_mul_f32_e32 v62, v19, v62
     v_mul_f32_e32 v63, v19, v63
     
-    // Scale running sum
+    // Scale running_sum by correction
     v_mul_f32_e32 v17, v19, v17
     
-    // Compute exp(QK - max)
+    // ========================================================================
+    // COMPUTE exp(QK - new_max) 
+    // ========================================================================
     v_sub_f32_e32 v32, v32, v16
     v_exp_f32_e32 v32, v32
     v_sub_f32_e32 v33, v33, v16
@@ -348,7 +347,9 @@ K_LOOP:
     v_sub_f32_e32 v47, v47, v16
     v_exp_f32_e32 v47, v47
     
-    // Local sum
+    // ========================================================================
+    // LOCAL SUM (sum P values)
+    // ========================================================================
     v_add_f32_e32 v20, v32, v33
     v_add_f32_e32 v21, v34, v35
     v_add_f32_e32 v22, v36, v37
@@ -363,101 +364,93 @@ K_LOOP:
     v_add_f32_e32 v21, v21, v22
     v_add_f32_e32 v23, v23, v71
     v_add_f32_e32 v21, v21, v23
-    v_add_f32_e32 v20, v20, v21
+    v_add_f32_e32 v20, v20, v21           // v20 = local_sum
     
     // Cross-thread sum reduction
     v_mov_b32_e32 v21, v20
     s_nop 0
     s_nop 0
     v_permlane32_swap_b32_e32 v21, v20
-    v_add_f32_e32 v20, v20, v21
+    v_add_f32_e32 v20, v20, v21           // v20 = row sum
     
     // Update running sum
     v_add_f32_e32 v17, v17, v20
     
     // ========================================================================
-    // LOAD V AND COMPUTE P×V
+    // LOAD V TILE AND COMPUTE P×V
     // ========================================================================
-    v_mov_b32_e32 v10, s14                // V base low
-    v_mov_b32_e32 v11, s15                // V base high
-    v_mov_b32_e32 v7, s33                 // k_offset
+    v_mov_b32_e32 v10, s14
+    v_mov_b32_e32 v11, s15
+    v_mov_b32_e32 v7, s33
     v_add_co_u32_e32 v10, vcc, v7, v10
     v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
     v_add_co_u32_e32 v10, vcc, v6, v10
     v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
     
-    flat_load_dwordx4 v[72:75], v[10:11]
+    flat_load_dwordx4 v[80:83], v[10:11]
     v_add_co_u32_e32 v10, vcc, 4096, v10
     v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
-    flat_load_dwordx4 v[76:79], v[10:11]
+    flat_load_dwordx4 v[84:87], v[10:11]
     
     s_waitcnt vmcnt(0)
     
     // Store V to LDS
     v_add_u32_e32 v7, LDS_V_OFFSET, v6
-    ds_write_b128 v7, v[72:75]
+    ds_write_b128 v7, v[80:83]
     v_add_u32_e32 v7, LDS_V_OFFSET + 4096, v6
-    ds_write_b128 v7, v[76:79]
+    ds_write_b128 v7, v[84:87]
     
+    s_waitcnt lgkmcnt(0)
     s_barrier
     
-    // Pack P to FP8
-    v_mov_b32_e32 v21, 0
-    v_mov_b32_e32 v70, 0
+    // ========================================================================
+    // PACK P VALUES TO FP8 FOR PV MFMA
+    // ========================================================================
     v_cvt_pk_fp8_f32 v21, v32, v33
     v_cvt_pk_fp8_f32 v70, v34, v35
     v_lshlrev_b32_e32 v70, 16, v70
     v_or_b32_e32 v21, v21, v70
     
-    v_mov_b32_e32 v22, 0
-    v_mov_b32_e32 v70, 0
     v_cvt_pk_fp8_f32 v22, v36, v37
     v_cvt_pk_fp8_f32 v70, v38, v39
     v_lshlrev_b32_e32 v70, 16, v70
     v_or_b32_e32 v22, v22, v70
     
-    v_accvgpr_write_b32 a0, v21
-    v_accvgpr_write_b32 a1, v22
-    
-    v_mov_b32_e32 v23, 0
-    v_mov_b32_e32 v70, 0
     v_cvt_pk_fp8_f32 v23, v40, v41
     v_cvt_pk_fp8_f32 v70, v42, v43
     v_lshlrev_b32_e32 v70, 16, v70
     v_or_b32_e32 v23, v23, v70
     
-    v_mov_b32_e32 v24, 0
-    v_mov_b32_e32 v70, 0
     v_cvt_pk_fp8_f32 v24, v44, v45
     v_cvt_pk_fp8_f32 v70, v46, v47
     v_lshlrev_b32_e32 v70, 16, v70
     v_or_b32_e32 v24, v24, v70
     
+    // Move P to AGPRs
+    v_accvgpr_write_b32 a0, v21
+    v_accvgpr_write_b32 a1, v22
     v_accvgpr_write_b32 a2, v23
     v_accvgpr_write_b32 a3, v24
     
-    // Load V from LDS for PV MFMA
-    v_add_u32_e32 v7, LDS_V_OFFSET, v6
+    // ========================================================================
+    // PV MFMAs
+    // ========================================================================
+    v_and_b32_e32 v7, 31, v0
+    v_lshlrev_b32_e32 v7, 3, v7
+    v_add_u32_e32 v7, LDS_V_OFFSET, v7
+    
     ds_read_b64 v[64:65], v7
     ds_read_b64 v[66:67], v7 offset:128
-    
     s_waitcnt lgkmcnt(0)
-    
-    // PV MFMAs
     v_mfma_f32_32x32x16_fp8_fp8 v[48:63], a[0:1], v[64:65], v[48:63]
     
     ds_read_b64 v[64:65], v7 offset:256
     ds_read_b64 v[66:67], v7 offset:384
     s_waitcnt lgkmcnt(0)
-    
     v_mfma_f32_32x32x16_fp8_fp8 v[48:63], a[2:3], v[64:65], v[48:63]
     
-    // Wait for MFMA to complete
-    s_nop 0
-    s_nop 0
-    s_nop 0
-    s_nop 0
-    s_barrier
+    // Update k_offset for next K iteration
+    s_add_u32 s33, s33, 1024
     
     // ========================================================================
     // K-LOOP INCREMENT
@@ -470,16 +463,26 @@ K_LOOP:
     // FINAL NORMALIZATION
     // ========================================================================
     s_waitcnt vmcnt(0) lgkmcnt(0)
-    // Ensure v17 is not zero to avoid NaN from 1/0
-    v_max_f32_e32 v17, 0x38d1b717, v17   // max(v17, 1e-6)
-    v_rcp_f32_e32 v17, v17               // 1/sum
-    // Wait for rcp to complete
+    s_barrier
+    
+    v_rcp_f32_e32 v17, v17
+    
+    // Wait for rcp result - use ds_nop to create dependency
     s_nop 0
     s_nop 0
     s_nop 0
     s_nop 0
     s_nop 0
     s_nop 0
+    s_nop 0
+    s_nop 0
+    
+    // Store v17 to LDS and read back to ensure it's ready
+    v_lshlrev_b32_e32 v3, 2, v0
+    ds_write_b32 v3, v17
+    s_waitcnt lgkmcnt(0)
+    ds_read_b32 v17, v3
+    s_waitcnt lgkmcnt(0)
     
     v_mul_f32_e32 v48, v17, v48
     v_mul_f32_e32 v49, v17, v49
@@ -521,7 +524,7 @@ K_LOOP:
     // ========================================================================
     v_mov_b32_e32 v10, s8
     v_mov_b32_e32 v11, s9
-    v_lshlrev_b32_e32 v3, 6, v0           // offset = tid * 64
+    v_lshlrev_b32_e32 v3, 6, v0
     v_add_co_u32_e32 v10, vcc, v3, v10
     v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
     
@@ -541,9 +544,6 @@ K_LOOP:
 
 .size _ZN5aiter18fmha_fwd_hd128_fp8E, .-_ZN5aiter18fmha_fwd_hd128_fp8E
 
-// ========================================================================
-// KERNEL DESCRIPTOR
-// ========================================================================
 .rodata
 .p2align 6
 .amdhsa_kernel _ZN5aiter18fmha_fwd_hd128_fp8E
@@ -556,14 +556,16 @@ K_LOOP:
     .amdhsa_system_sgpr_workgroup_id_y 1
     .amdhsa_system_sgpr_workgroup_id_z 1
     .amdhsa_system_vgpr_workitem_id 0
-    .amdhsa_next_free_vgpr 88
+    .amdhsa_next_free_vgpr 120
     .amdhsa_next_free_sgpr 48
-    .amdhsa_accum_offset 80
+    .amdhsa_accum_offset 104
     .amdhsa_float_round_mode_32 0
     .amdhsa_float_round_mode_16_64 0
     .amdhsa_float_denorm_mode_32 3
     .amdhsa_float_denorm_mode_16_64 3
 .end_amdhsa_kernel
+
+.section .note.GNU-stack
 
 .amdgpu_metadata
 ---
@@ -577,7 +579,7 @@ amdhsa.kernels:
     .kernarg_segment_align: 8
     .wavefront_size: 64
     .sgpr_count: 48
-    .vgpr_count: 88
+    .vgpr_count: 120
     .agpr_count: 8
     .max_flat_workgroup_size: 256
     .args:
