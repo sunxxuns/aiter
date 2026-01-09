@@ -554,127 +554,29 @@ K_LOOP:
     s_waitcnt vmcnt(0)
     
     // ========================================================================
-    // LOAD V TILE WITH TRANSPOSED LDS LAYOUT (K-inner)
+    // LOAD V TILE AND COMPUTE P×V
     // ========================================================================
-    // For PV MFMA B operand: each lane n needs V[K=0..7, D=n]
-    // We store V transposed in LDS: V[D, K] at offset D*32 + K
-    // Then ds_read_b64 at base=D*32 gives 8 K values for lane's D position
-    //
-    // Loading strategy: 64 threads load 32 K rows × 32 D cols = 1024 bytes
-    // Each thread handles 2 D positions and loads 16 bytes total (8K * 2D / thread)
-    //
-    // Thread tid: D_base = tid % 32, K_half = tid / 32 (0 or 1)
-    // Loads V[K=K_half*16..(K_half*16+15), D=D_base] (one column, 16 K rows)
-    // But global load is 16 consecutive bytes, which is 16 D values (wrong)
-    //
-    // Alternative: Load 16 consecutive D values, then scatter to transposed LDS
-    // This requires 16 separate ds_write_b8 calls - too slow
-    //
-    // SIMPLE APPROACH: Each thread loads 4 bytes (4 K values) from 4 K rows at one D
-    // Thread tid: D = tid % 32, K_group = tid / 32 (0..1 → K=0..15 or K=16..31)
-    // Load V[K_group*16 + 0, D] through V[K_group*16 + 15, D]
-    //
-    // Actually, use the original row-major load then ds_read with stride
-    // Global V[K, D] stored at LDS[K*128 + D] (head_dim=128)
-    // To read 8 K values at D position: need strided read
-    //
-    // SIMPLEST FIX: Store V with K as inner dimension in LDS
-    // Load row-major, store column-major using register shuffle
-    
-    // === V loading with in-register transpose ===
-    // Load 16 consecutive D values at one K row (original pattern)
-    // Then use permlane to exchange D values between threads
-    // Store with K contiguous
-    
-    // Thread tid (0..63): handles K_row = tid
-    // For first pass: load 8 consecutive D values from V[K=tid, D=0..7]
-    // NOTE: Need to load full 32 D values per K row, so multiple passes
-    
-    // For now, use strided global load (slow but correct):
-    // Thread d (d=0..31) loads V[K=0..31, D=d] using 32 strided loads
-    // Each thread gets 32 bytes (32 K values at one D position)
-    // Store at LDS[d*32..d*32+31]
-    
-    v_and_b32_e32 v80, 31, v0             // d = tid % 32 (D position)
-    v_lshrrev_b32_e32 v81, 5, v0          // K_half = tid / 32 (0 or 1)
-    
-    // Global V base + k_offset + D
+    // Load V tile (same offset as K)
     v_mov_b32_e32 v10, s14                // V base low
     v_mov_b32_e32 v11, s15                // V base high
     v_mov_b32_e32 v7, s33                 // k_offset
     v_add_co_u32_e32 v10, vcc, v7, v10
     v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
-    v_add_co_u32_e32 v10, vcc, v80, v10   // + D position
+    v_add_co_u32_e32 v10, vcc, v6, v10
     v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
     
-    // K_half=0: K=0..15, K_half=1: K=16..31
-    v_lshlrev_b32_e32 v7, 11, v81         // K_half * 2048 (16 * 128)
-    v_add_co_u32_e32 v10, vcc, v7, v10
+    flat_load_dwordx4 v[72:75], v[10:11]
+    v_add_co_u32_e32 v10, vcc, 4096, v10
     v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
-    
-    // Load 16 K values with stride 128 (head_dim)
-    // Each load gets 1 byte, need 16 loads - use flat_load_ubyte
-    flat_load_ubyte v72, v[10:11]                    // V[K=0 or 16, D=d]
-    flat_load_ubyte v73, v[10:11] offset:128        // V[K=1 or 17, D=d]
-    flat_load_ubyte v74, v[10:11] offset:256        // V[K=2 or 18, D=d]
-    flat_load_ubyte v75, v[10:11] offset:384        // V[K=3 or 19, D=d]
-    flat_load_ubyte v76, v[10:11] offset:512        // V[K=4 or 20, D=d]
-    flat_load_ubyte v77, v[10:11] offset:640        // V[K=5 or 21, D=d]
-    flat_load_ubyte v78, v[10:11] offset:768        // V[K=6 or 22, D=d]
-    flat_load_ubyte v79, v[10:11] offset:896        // V[K=7 or 23, D=d]
+    flat_load_dwordx4 v[76:79], v[10:11]
     
     s_waitcnt vmcnt(0)
     
-    // Pack 8 bytes into 2 dwords: v64 = K[0..3], v65 = K[4..7]
-    v_lshlrev_b32_e32 v73, 8, v73
-    v_or_b32_e32 v72, v72, v73
-    v_lshlrev_b32_e32 v74, 16, v74
-    v_or_b32_e32 v72, v72, v74
-    v_lshlrev_b32_e32 v75, 24, v75
-    v_or_b32_e32 v64, v72, v75            // v64 = V[K=0..3 or 16..19, D=d]
-    
-    v_lshlrev_b32_e32 v77, 8, v77
-    v_or_b32_e32 v76, v76, v77
-    v_lshlrev_b32_e32 v78, 16, v78
-    v_or_b32_e32 v76, v76, v78
-    v_lshlrev_b32_e32 v79, 24, v79
-    v_or_b32_e32 v65, v76, v79            // v65 = V[K=4..7 or 20..23, D=d]
-    
-    // Load K=8..15 or K=24..31
-    flat_load_ubyte v72, v[10:11] offset:1024       // V[K=8 or 24, D=d]
-    flat_load_ubyte v73, v[10:11] offset:1152       // V[K=9 or 25, D=d]
-    flat_load_ubyte v74, v[10:11] offset:1280       // V[K=10 or 26, D=d]
-    flat_load_ubyte v75, v[10:11] offset:1408       // V[K=11 or 27, D=d]
-    flat_load_ubyte v76, v[10:11] offset:1536       // V[K=12 or 28, D=d]
-    flat_load_ubyte v77, v[10:11] offset:1664       // V[K=13 or 29, D=d]
-    flat_load_ubyte v78, v[10:11] offset:1792       // V[K=14 or 30, D=d]
-    flat_load_ubyte v79, v[10:11] offset:1920       // V[K=15 or 31, D=d]
-    
-    s_waitcnt vmcnt(0)
-    
-    // Pack into v66, v67
-    v_lshlrev_b32_e32 v73, 8, v73
-    v_or_b32_e32 v72, v72, v73
-    v_lshlrev_b32_e32 v74, 16, v74
-    v_or_b32_e32 v72, v72, v74
-    v_lshlrev_b32_e32 v75, 24, v75
-    v_or_b32_e32 v66, v72, v75            // v66 = V[K=8..11 or 24..27, D=d]
-    
-    v_lshlrev_b32_e32 v77, 8, v77
-    v_or_b32_e32 v76, v76, v77
-    v_lshlrev_b32_e32 v78, 16, v78
-    v_or_b32_e32 v76, v76, v78
-    v_lshlrev_b32_e32 v79, 24, v79
-    v_or_b32_e32 v67, v76, v79            // v67 = V[K=12..15 or 28..31, D=d]
-    
-    // Store to LDS: V[D, K] at offset D*32 + K_half*16
-    // Lanes 0-31: store at D*32 + 0
-    // Lanes 32-63: store at (D%32)*32 + 16 = D*32 + 16 (but D=tid%32)
-    v_lshlrev_b32_e32 v7, 5, v80          // D * 32
-    v_lshlrev_b32_e32 v8, 4, v81          // K_half * 16
-    v_add_u32_e32 v7, v8, v7              // D*32 + K_half*16
-    v_add_u32_e32 v7, LDS_V_OFFSET, v7    // + LDS base
-    ds_write_b128 v7, v[64:67]            // Store 16 K values (4 dwords)
+    // Store V to LDS at LDS_V_OFFSET
+    v_add_u32_e32 v7, LDS_V_OFFSET, v6
+    ds_write_b128 v7, v[72:75]
+    v_add_u32_e32 v7, LDS_V_OFFSET + 4096, v6
+    ds_write_b128 v7, v[76:79]
     
     s_barrier
     
@@ -756,26 +658,16 @@ K_LOOP:
     // - Each thread has 16 P values for specific (row, col) positions
     // - We do 2 MFMAs to cover K=0..31 reduction for one D tile (D=0..31)
     
-    // Load V from transposed LDS layout: V[D, K] at offset D*32 + K
-    // Each lane n (n=0..31) reads V[D=n, K=0..15] = 16 K values
-    // Lanes 0-31: read K=0..15, Lanes 32-63: read K=0..15 at different D? No.
-    //
-    // MFMA B operand needs:
-    //   Lanes 0-31: V[K=0..7, D=lane]  (8 bytes = 64 bits)
-    //   Lanes 32-63: V[K=8..15, D=lane-32]
-    //
-    // With LDS V[D, K] at D*32 + K:
-    //   Lane n reads from D=n, base = n*32
-    //   ds_read_b64 at base=n*32 gives V[D=n, K=0..7]
-    //   For lanes 32-63: D = n-32, read K=8..15 at base=(n-32)*32 + 8
-    
-    v_and_b32_e32 v7, 31, v0              // D = lane % 32
-    v_lshlrev_b32_e32 v7, 5, v7           // D * 32 (LDS stride)
-    v_lshrrev_b32_e32 v8, 5, v0           // K_group = lane / 32 (0 or 1)
-    v_lshlrev_b32_e32 v8, 3, v8           // K_group * 8
-    v_add_u32_e32 v7, v8, v7              // D*32 + K_group*8
-    v_add_u32_e32 v7, LDS_V_OFFSET, v7    // + LDS base
-    ds_read_b64 v[64:65], v7               // V[D=lane%32, K=0..7 or 8..15]
+    // Load V for K=0..31, D=0..31 (first D tile)
+    // V[k,d] at LDS offset = k * 128 + d (row-major, head_dim=128)
+    // For MFMA B operand: need V[16×32] data
+    // Each thread reads 8 bytes = 8 FP8 values
+    // IMPORTANT: Use (lane % 32) * 8 for B operand, not tid * 16
+    v_and_b32_e32 v7, 31, v0              // lane within 32
+    v_lshlrev_b32_e32 v7, 3, v7           // * 8 bytes
+    v_add_u32_e32 v7, LDS_V_OFFSET, v7    // base + lane offset
+    ds_read_b64 v[64:65], v7               // V[K=0..7, D=lane*8..(lane*8+7)]
+    ds_read_b64 v[66:67], v7 offset:128    // V[K=8..15, D=same] (stride_K=128)
     
     s_waitcnt lgkmcnt(0)
     
@@ -790,21 +682,13 @@ K_LOOP:
     s_waitcnt vmcnt(0)
     
     // P×V MFMAs for D=0..31 tile, K=0..31 reduction
-    // MFMA 1: P[0..7] × V[K=0..15, D=0..31] → accumulate into O
-    // MFMA 2: P[8..15] × V[K=16..31, D=0..31] → accumulate into O
+    // MFMA 1: P[0:7] × V[K=0..15] → accumulate into O
+    // MFMA 2: P[8:15] × V[K=16..31] → accumulate into O
     v_mfma_f32_32x32x16_fp8_fp8 v[48:63], a[0:1], v[64:65], v[48:63]
     
-    // Load V for K=16..31 from transposed LDS: V[D, K] at D*32 + K
-    // Lanes 0-31: read V[D=lane, K=16..23] at D*32 + 16
-    // Lanes 32-63: read V[D=lane-32, K=24..31] at D*32 + 24
-    v_and_b32_e32 v7, 31, v0              // D = lane % 32
-    v_lshlrev_b32_e32 v7, 5, v7           // D * 32
-    v_lshrrev_b32_e32 v8, 5, v0           // K_group = lane / 32 (0 or 1)
-    v_lshlrev_b32_e32 v8, 3, v8           // K_group * 8 
-    v_add_u32_e32 v8, 16, v8              // + 16 (K offset for second block)
-    v_add_u32_e32 v7, v8, v7              // D*32 + K_group*8 + 16
-    v_add_u32_e32 v7, LDS_V_OFFSET, v7
-    ds_read_b64 v[64:65], v7               // V[D=lane%32, K=16..23 or 24..31]
+    // Load V for K=16..31
+    ds_read_b64 v[64:65], v7 offset:256    // V[K=16..23]
+    ds_read_b64 v[66:67], v7 offset:384    // V[K=24..31]
     
     s_waitcnt lgkmcnt(0)
     
