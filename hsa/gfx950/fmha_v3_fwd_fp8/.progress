@@ -59,11 +59,27 @@
 - All 4 D-tiles: ✓ Controlled pattern 15.5
 - PyTorch reference per D-tile: max_err 0.33-0.48, mean_err ~0.10
 
+8. ✅ **4-wave multi-wave implementation** (v5)
+   - 256 threads = 4 waves × 64 threads
+   - Each wave processes 32 Q rows independently
+   - Total: 128 Q rows per workgroup (4× current)
+   - Cooperative Q/K loading: all waves contribute to LDS
+   - Wave-specific Q LDS offset: wave_id * 4096
+   - Performance: 16.16 us for 128×64 vs 17.22 us for 64×64 (v4)
+   - NUMERICAL VALIDATION NEEDED
+
+### Current Kernel Performance
+
+| Kernel | Q rows | Time | Notes |
+|--------|--------|------|-------|
+| fwd_hd128_fp8_v4.s | 64 | 17.22 us | Single-wave reference |
+| fwd_hd128_fp8_v5.s | 128 | 16.16 us | 4-wave, 2× throughput |
+
 ### Next Steps
 
-1. **Multi-wave support** (ANALYZING)
-   - Currently single wave (64 threads)
-   - Need multiple waves for larger sequences
+1. **Numerical validation** (IN PROGRESS)
+   - v5 produces output but D-tile mapping needs verification
+   - Compare with PyTorch reference
 
 2. **Performance optimization**
    - Coalesced V loading (replace strided loads)
@@ -159,7 +175,8 @@ s5 is always 0-3, so the branch is NEVER taken. All 4 waves execute same path.
 fwd_hd128_fp8_v2.s       - Working kernel with debug stores (reference)
 fwd_hd128_fp8_v3.s       - Working kernel with debug stores (copy of v2)
 fwd_hd128_fp8_v3_clean.s - D=0..31 only, no debug stores
-fwd_hd128_fp8_v4.s       - Full head_dim=128 with D-tile loop
+fwd_hd128_fp8_v4.s       - Full head_dim=128 with D-tile loop (64 Q rows)
+fwd_hd128_fp8_v5.s       - 4-wave implementation (128 Q rows, 256 threads)
 ```
 
 ### Key Learnings
