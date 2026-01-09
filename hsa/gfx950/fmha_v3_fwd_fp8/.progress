@@ -1,6 +1,6 @@
 # FP8 Flash Attention Kernel Progress
 
-## Current Status: D=0..31 WORKING, Ready for D-tile Loop
+## Current Status: FULL HEAD_DIM=128 WORKING (v4)
 
 ### Completed Steps
 
@@ -34,32 +34,38 @@
    - Removed all debug stores
    - Performance: 4.58us → 3.11us (32% faster)
 
+7. ✅ **D-tile loop for full head_dim=128** (v4)
+   - Loops 4x to process D=0..31, 32..63, 64..95, 96..127
+   - P→FP8 conversion done once before loop (reused)
+   - Performance: 5.15us for full head_dim (better than expected 4×3.11=12.4us)
+
 ### Current Kernel Performance
 
 | Kernel | Time | Notes |
 |--------|------|-------|
-| fwd_hd128_fp8_v3.s | 4.58 us | With debug stores |
-| fwd_hd128_fp8_v3_clean.s | 3.11 us | No debug stores |
+| fwd_hd128_fp8_v3.s | 4.58 us | With debug stores, D=0..31 only |
+| fwd_hd128_fp8_v3_clean.s | 3.11 us | No debug stores, D=0..31 only |
+| fwd_hd128_fp8_v4.s | 5.15 us | Full head_dim=128, D-tile loop |
 
 ### Numerical Accuracy (Verified)
 
+**v3_clean (D=0..31):**
 - Controlled V pattern: ✓ Expected 15.5, Got 15.5
 - All zeros V: ✓ Expected 0.0, Got 0.0  
 - Constant V=1: ✓ Expected 1.0, Got 1.0
 - PyTorch reference: ✓ Max error 0.36
 
+**v4 (full head_dim=128):**
+- All 4 D-tiles: ✓ Controlled pattern 15.5
+- PyTorch reference per D-tile: max_err 0.33-0.48, mean_err ~0.10
+
 ### Next Steps
 
-1. **D-tile loop** (CURRENT)
-   - Currently only processes D=0..31 (32 elements)
-   - Need to loop 4 times for full head_dim=128
-   - Each iteration: different V slice, different output slice
-
-2. **Multi-wave support**
+1. **Multi-wave support** (NEXT)
    - Currently single wave (64 threads)
    - Need multiple waves for larger sequences
 
-3. **Performance optimization**
+2. **Performance optimization**
    - Coalesced V loading (replace strided loads)
    - Better LDS utilization
    - Instruction scheduling
@@ -69,7 +75,8 @@
 ```
 fwd_hd128_fp8_v2.s       - Working kernel with debug stores (reference)
 fwd_hd128_fp8_v3.s       - Working kernel with debug stores (copy of v2)
-fwd_hd128_fp8_v3_clean.s - Optimized kernel without debug stores
+fwd_hd128_fp8_v3_clean.s - D=0..31 only, no debug stores
+fwd_hd128_fp8_v4.s       - Full head_dim=128 with D-tile loop
 ```
 
 ### Key Learnings
