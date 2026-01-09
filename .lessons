@@ -1,0 +1,92 @@
+# Lessons Learned
+
+## ds_read_b64_tr_b8 / ds_read_b64_tr_b16 Transpose Read Instructions (GFX950)
+
+### Key Discovery: Base Address Scaling
+
+The transpose read instructions use **scaled base addresses**:
+
+| Instruction | Element Size | Base Scaling | Stride |
+|------------|--------------|--------------|--------|
+| `ds_read_b64_tr_b8` (FP8) | 1 byte | base/8 = byte position | 16 bytes |
+| `ds_read_b64_tr_b16` (BF16) | 2 bytes | base/8 = element position | 32 bytes |
+
+**Critical**: `base = D * 8` to read from byte/element position D
+
+### FP8 ds_read_b64_tr_b8 Pattern
+
+```
+base = n * 8  →  reads from byte position n with stride 16
+```
+
+**Example with LDS[i] = i:**
+```
+base=0   → reads positions 0, 16, 32, 48, 64, 80, 96, 112  → values [0, 16, 32, ...]
+base=8   → reads positions 1, 17, 33, 49, 65, 81, 97, 113  → values [1, 17, 33, ...]
+base=16  → reads positions 2, 18, 34, 50, 66, 82, 98, 114  → values [2, 18, 34, ...]
+```
+
+### Required LDS Layout for MFMA V Operand
+
+**For FP8 (16-byte rows):**
+```
+LDS[K*16 + D] = V[K, D]   where K=row, D=column (0..15)
+```
+
+**Reading pattern:**
+```assembly
+v_and_b32_e32 v6, 15, v0           // D = lane % 16
+v_lshlrev_b32_e32 v6, 3, v6        // base = D * 8 (REQUIRED SCALING!)
+ds_read_b64_tr_b8 v[result], v6    // Lane n gets V[K=0..7, D=n]
+```
+
+### Common Mistakes to Avoid
+
+1. **Forgetting base scaling**: `base = D` does NOT work, must use `base = D * 8`
+2. **Wrong LDS row size**: Must match stride (16 bytes for FP8, 32 bytes for BF16)
+3. **Assuming per-lane addressing**: With same base for all lanes, only reads from ONE row repeatedly
+4. **Confusing with regular ds_read**: tr_b8/tr_b16 have fixed stride, not configurable
+
+### BF16 ds_read_b64_tr_b16 Pattern
+
+Similar but with 32-byte stride and 2-byte elements:
+```
+base = n * 8  →  reads from BF16 element n with stride 16 elements (32 bytes)
+```
+
+**LDS Layout:**
+```
+LDS[K*32 + D*2] = V[K, D]   where K=row, D=column (0..15), 2 bytes per BF16
+```
+
+### Test Files Reference
+
+- `hsa/gfx950/fmha_v3_fwd_fp8/test_tr_fp8.s` - FP8 transpose read test
+- `hsa/gfx950/fmha_v3_fwd_fp8/test_tr_base.s` - BF16 transpose read test  
+- `hsa/gfx950/fmha_v3_fwd_fp8/test_v_load_fp8.s` - Working FP8 V loading with tr_b8
+- `hsa/gfx950/fmha_v3_fwd_fp8/TR_INVESTIGATION.md` - Detailed investigation notes
+
+### Verified Working Code
+
+```assembly
+// FP8 V Loading with ds_read_b64_tr_b8
+// LDS layout: 16-byte rows, V[K, D] at LDS[K*16 + D]
+
+// Load V to LDS (16-byte rows)
+v_lshrrev_b32_e32 v1, 1, v0           // K = tid / 2
+v_and_b32_e32 v2, 1, v0               // d_half = tid % 2
+v_lshlrev_b32_e32 v3, 3, v2           // d_offset = d_half * 8
+// ... load from global to v[20:21] ...
+v_lshlrev_b32_e32 v5, 4, v1           // K * 16
+v_add_u32_e32 v5, v3, v5              // K*16 + d_offset
+ds_write_b64 v5, v[20:21]
+
+s_barrier
+
+// Read with transpose - CRITICAL: base = D * 8
+v_and_b32_e32 v6, 15, v0              // D = lane % 16
+v_lshlrev_b32_e32 v6, 3, v6           // base = D * 8 (SCALING!)
+ds_read_b64_tr_b8 v[30:31], v6        // Gets V[K=0..7, D=lane%16]
+```
+
+**Result**: Each lane correctly gets 8 K values at its D position!
