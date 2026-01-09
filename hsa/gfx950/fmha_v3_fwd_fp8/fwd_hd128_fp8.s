@@ -638,15 +638,33 @@ K_LOOP:
     flat_store_dwordx4 v[10:11], v[80:83]
     s_waitcnt vmcnt(0)
     
-    // Load V from LDS for MFMA
-    v_add_u32_e32 v7, LDS_V_OFFSET, v6
-    ds_read_b64 v[64:65], v7
-    v_add_u32_e32 v7, 8, v7
-    ds_read_b64 v[66:67], v7
-    v_add_u32_e32 v7, 8, v7
-    ds_read_b64 v[68:69], v7
-    v_add_u32_e32 v7, 8, v7
-    ds_read_b64 v[70:71], v7
+    // ========================================================================
+    // P×V COMPUTATION
+    // V layout in LDS: V[K, D] where K=seq_k (32), D=head_dim (128)
+    // V stored row-major: stride_D = 1 byte (FP8), stride_K = 128 bytes
+    // 
+    // For PV MFMA 32x32x16:
+    //   A = P[32×16] (32 Q rows, 16 K cols to reduce)
+    //   B = V[16×32] (16 K rows, 32 D cols)
+    //   C = O[32×32] (32 Q rows, 32 D cols)
+    //
+    // Need 2 MFMAs for K reduction (32/16=2) per D tile
+    // Need 4 D tiles for head_dim=128 (128/32=4)
+    // Total: 2 * 4 = 8 MFMAs, but all use SAME P with different V D-slices
+    // ========================================================================
+    
+    // For this simplified test with seq_k=32:
+    // - P is 32×32 (but only 32 K cols are valid after our QK tile)
+    // - Each thread has 16 P values for specific (row, col) positions
+    // - We do 2 MFMAs to cover K=0..31 reduction for one D tile (D=0..31)
+    
+    // Load V for K=0..31, D=0..31 (first D tile)
+    // V[k,d] at LDS offset = k * 128 + d (row-major, head_dim=128)
+    // For MFMA B operand: need V[16×32] data
+    // Each thread reads 8 bytes = 8 FP8 values
+    v_add_u32_e32 v7, LDS_V_OFFSET, v6     // base + thread offset
+    ds_read_b64 v[64:65], v7               // V[K=0..7, D=tid*8..(tid*8+7)]
+    ds_read_b64 v[66:67], v7 offset:128    // V[K=8..15, D=same] (stride_K=128)
     
     s_waitcnt lgkmcnt(0)
     
@@ -660,55 +678,18 @@ K_LOOP:
     flat_store_dword v[10:11], v48
     s_waitcnt vmcnt(0)
     
-    // P×V MFMAs
+    // P×V MFMAs for D=0..31 tile, K=0..31 reduction
+    // MFMA 1: P[0:7] × V[K=0..15] → accumulate into O
+    // MFMA 2: P[8:15] × V[K=16..31] → accumulate into O
     v_mfma_f32_32x32x16_fp8_fp8 v[48:63], a[0:1], v[64:65], v[48:63]
-    v_mfma_f32_32x32x16_fp8_fp8 v[48:63], a[2:3], v[66:67], v[48:63]
     
-    // Load more V for K=32..63
-    v_add_u32_e32 v7, LDS_V_OFFSET + 32, v6
-    ds_read_b64 v[64:65], v7
-    v_add_u32_e32 v7, 8, v7
-    ds_read_b64 v[66:67], v7
-    v_add_u32_e32 v7, 8, v7
-    ds_read_b64 v[68:69], v7
-    v_add_u32_e32 v7, 8, v7
-    ds_read_b64 v[70:71], v7
-    
-    // Convert P[8:15] to FP8 (already done above in a[2:3])
-    // Reuse the same packed values
-    // a[4:5] = P[8:15] (same as a[2:3])
-    v_accvgpr_write_b32 a4, v23
-    v_accvgpr_write_b32 a5, v24
-    // a[6:7] - repack P[8:15] for the next MFMA
-    v_accvgpr_write_b32 a6, v23
-    v_accvgpr_write_b32 a7, v24
+    // Load V for K=16..31
+    ds_read_b64 v[64:65], v7 offset:256    // V[K=16..23]
+    ds_read_b64 v[66:67], v7 offset:384    // V[K=24..31]
     
     s_waitcnt lgkmcnt(0)
     
-    v_mfma_f32_32x32x16_fp8_fp8 v[48:63], a[4:5], v[64:65], v[48:63]
-    v_mfma_f32_32x32x16_fp8_fp8 v[48:63], a[6:7], v[66:67], v[48:63]
-    
-    // Load V for K=64..95
-    v_add_u32_e32 v7, LDS_V_OFFSET + 64, v6
-    ds_read_b64 v[64:65], v7
-    v_add_u32_e32 v7, 8, v7
-    ds_read_b64 v[66:67], v7
-    
-    s_waitcnt lgkmcnt(0)
-    
-    v_mfma_f32_32x32x16_fp8_fp8 v[48:63], a[0:1], v[64:65], v[48:63]
-    v_mfma_f32_32x32x16_fp8_fp8 v[48:63], a[2:3], v[66:67], v[48:63]
-    
-    // Load V for K=96..127
-    v_add_u32_e32 v7, LDS_V_OFFSET + 80, v6
-    ds_read_b64 v[64:65], v7
-    v_add_u32_e32 v7, 8, v7
-    ds_read_b64 v[66:67], v7
-    
-    s_waitcnt lgkmcnt(0)
-    
-    v_mfma_f32_32x32x16_fp8_fp8 v[48:63], a[4:5], v[64:65], v[48:63]
-    v_mfma_f32_32x32x16_fp8_fp8 v[48:63], a[6:7], v[66:67], v[48:63]
+    v_mfma_f32_32x32x16_fp8_fp8 v[48:63], a[2:3], v[64:65], v[48:63]
     
     // DEBUG: Store PV output BEFORE normalization at offset 0x18000
     v_mov_b32_e32 v10, s8
@@ -740,6 +721,16 @@ K_LOOP:
     // FINAL NORMALIZATION (divide by running_sum)
     // ========================================================================
     v_rcp_f32_e32 v17, v17               // 1/sum
+    
+    // DEBUG: Store 1/sum (v17) at offset 0x30000
+    v_mov_b32_e32 v10, s8
+    v_mov_b32_e32 v11, s9
+    v_lshlrev_b32_e32 v14, 2, v0
+    v_add_u32_e32 v14, 0x30000, v14
+    v_add_co_u32_e32 v10, vcc, v14, v10
+    v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
+    flat_store_dword v[10:11], v17
+    s_waitcnt vmcnt(0)
     
     v_mul_f32_e32 v48, v17, v48
     v_mul_f32_e32 v49, v17, v49
@@ -775,6 +766,16 @@ K_LOOP:
     v_mul_f32_e32 v61, s28, v61
     v_mul_f32_e32 v62, s28, v62
     v_mul_f32_e32 v63, s28, v63
+    
+    // DEBUG: Store v48 after normalization at offset 0x2C000
+    v_mov_b32_e32 v10, s8
+    v_mov_b32_e32 v11, s9
+    v_lshlrev_b32_e32 v14, 2, v0          // tid * 4 bytes
+    v_add_u32_e32 v14, 0x2C000, v14
+    v_add_co_u32_e32 v10, vcc, v14, v10
+    v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
+    flat_store_dword v[10:11], v48
+    s_waitcnt vmcnt(0)
     
     // ========================================================================
     // DEBUG: Store output accumulators v[48:63] at tid * 64 bytes
