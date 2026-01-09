@@ -2,7 +2,7 @@
 // FP8 Flash Attention - Full K-loop implementation with online softmax
 // Properly handles workgroup IDs for Q-tile and head/batch offsets
 
-.amdgcn_target "amdgcn-amd-amdhsa--gfx950:xnack-"
+.amdgcn_target "amdgcn-amd-amdhsa--gfx950"
 
 .text
 .globl _ZN5aiter18fmha_fwd_hd128_fp8E
@@ -662,8 +662,11 @@ K_LOOP:
     // V[k,d] at LDS offset = k * 128 + d (row-major, head_dim=128)
     // For MFMA B operand: need V[16×32] data
     // Each thread reads 8 bytes = 8 FP8 values
-    v_add_u32_e32 v7, LDS_V_OFFSET, v6     // base + thread offset
-    ds_read_b64 v[64:65], v7               // V[K=0..7, D=tid*8..(tid*8+7)]
+    // IMPORTANT: Use (lane % 32) * 8 for B operand, not tid * 16
+    v_and_b32_e32 v7, 31, v0              // lane within 32
+    v_lshlrev_b32_e32 v7, 3, v7           // * 8 bytes
+    v_add_u32_e32 v7, LDS_V_OFFSET, v7    // base + lane offset
+    ds_read_b64 v[64:65], v7               // V[K=0..7, D=lane*8..(lane*8+7)]
     ds_read_b64 v[66:67], v7 offset:128    // V[K=8..15, D=same] (stride_K=128)
     
     s_waitcnt lgkmcnt(0)
