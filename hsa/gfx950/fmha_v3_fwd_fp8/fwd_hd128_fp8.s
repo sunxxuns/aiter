@@ -407,11 +407,19 @@ K_LOOP:
     v_max_f32_e32 v18, v18, v44
     v_max_f32_e32 v18, v18, v45
     v_max_f32_e32 v18, v18, v46
-    v_max_f32_e32 v18, v18, v47         // v18 = local_max
+    v_max_f32_e32 v18, v18, v47         // v18 = local_max (this thread's 16 values)
+    
+    // Cross-thread max reduction: share max between lanes 0-31 and 32-63
+    // This gives row-wise max across all 32 columns computed by this wave
+    v_mov_b32_e32 v19, v18
+    s_nop 0
+    s_nop 0
+    v_permlane32_swap_b32_e32 v19, v18   // swap between lane halves
+    v_max_f32_e32 v18, v18, v19          // v18 = max across both halves = row max
     
     // Compute new_max = max(running_max, local_max)
     v_mov_b32_e32 v19, v16               // old_max = running_max
-    v_max_f32_e32 v16, v16, v18          // running_max = max(running_max, local_max)
+    v_max_f32_e32 v16, v16, v18          // running_max = max(running_max, row_max)
     
     // Compute correction factor = exp(old_max - new_max)
     v_sub_f32_e32 v20, v19, v16
@@ -506,7 +514,14 @@ K_LOOP:
     v_add_f32_e32 v21, v21, v22
     v_add_f32_e32 v23, v23, v71
     v_add_f32_e32 v21, v21, v23
-    v_add_f32_e32 v20, v20, v21           // v20 = local_sum (should be 16.0)
+    v_add_f32_e32 v20, v20, v21           // v20 = local_sum (this thread's 16 values)
+    
+    // Cross-thread sum reduction: share sum between lanes 0-31 and 32-63
+    v_mov_b32_e32 v21, v20
+    s_nop 0
+    s_nop 0
+    v_permlane32_swap_b32_e32 v21, v20   // swap between lane halves
+    v_add_f32_e32 v20, v20, v21          // v20 = sum across both halves = row sum
     
     // Update running sum
     v_add_f32_e32 v17, v17, v20
