@@ -58,28 +58,31 @@ But PV MFMA needs: `A[M, K=0..15]` (K dimension)
 
 **This packs M as if it were K, causing wrong computation!**
 
-### Fix Required
+### Fix Found (from BF16 kernel analysis)
 
-**Option A: Cross-thread P gather**
-- Use LDS to redistribute P values
-- Each thread writes P[M_range, K=own] to LDS[M_range * 32 + K=own]
-- Then reads P[M=own, K_range] from LDS[M=own * 32 + K_range]
-- Requires barrier and extra LDS space
+**BF16 computes V × P (not P × V):**
+- A operand = V^T (transposed V, read with ds_read_b64_tr_b16)
+- B operand = P^T (QK MFMA output is ALREADY in correct layout!)
+- Output = O^T[D, Q] which is transposed in final store
 
-**Option B: Restructure QK MFMA output**
-- Store QK to LDS in a layout where rows are contiguous
-- Read back with each thread getting one row's K values
-- Then softmax and PV work on correct data
+**Why this works:**
+After QK MFMA, thread t has P[Q_base:Q_base+16, K=t%32]:
+- For P×V (current FP8): A needs P[single_M, K_range] - WRONG layout
+- For V×P (BF16 style): B needs P^T[K, Q_range] = P[Q_range, single_K] - CORRECT!
 
-**Option C: Study BF16 kernel**
-- The BF16 kernel must handle this correctly
-- Analyze how it transforms QK output before PV
+**FP8 kernel changes needed:**
+1. Swap PV MFMA operand order: V as A operand, P as B operand
+2. Keep V reading with transpose (ds_read_b64_tr_b8)
+3. Fix output store: O[Q=t%32, D_base:D_base+16] (transpose from O^T)
+
+No P redistribution needed!
 
 ### Next Steps
 
-1. Study BF16 kernel's P handling between QK and PV MFMAs
-2. Implement P redistribution via LDS
-3. Verify with controlled tests
+1. Create minimal test verifying V×P approach with FP8 MFMA
+2. Modify fwd_hd128_fp8_v3_clean.s to use V×P order
+3. Fix output store pattern for transposed output
+4. Verify numerics with random data
 
 ## BF16 Multi-Wave Architecture Analysis (CORRECTED)
 

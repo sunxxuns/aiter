@@ -284,10 +284,23 @@ This explains:
 - Why V[k,:]=k gives 31 instead of 15.5: only the largest K value (31) dominates
 - Why both K ranges (K=0..15 and K=16..31) give full output
 
-**Fix Required**: Cross-thread gather operation before PV MFMA
-- Each thread needs to collect P values from threads that own K=0..15 for its M row
-- This requires LDS or permlane operations to redistribute P values
-- The BF16 kernel likely handles this correctly - need to study its approach
+**THE CORRECT FIX** (discovered from BF16 kernel analysis):
+
+BF16 kernel solves this by computing **V × P** instead of P × V:
+- A operand = V^T (read with ds_read_b64_tr_b16)
+- B operand = P^T (QK MFMA output is ALREADY in correct layout!)
+- Output = O^T[D, Q] which is transposed in final store
+
+After QK MFMA, thread t has P[Q_base:Q_base+16, K=t%32]:
+- For P×V: A needs P[single_M, K_range] - WRONG, we have P[M_range, single_K]
+- For V×P: B needs P^T[K, Q_range] = P[Q_range, single_K] - CORRECT!
+
+FP8 kernel FIX:
+1. Change PV MFMA order: use V as A operand, P as B operand
+2. Read V transposed (ds_read_b64_tr_b8 for FP8)
+3. Transpose output store: O[Q=t%32, D_base:D_base+16]
+
+No P redistribution needed - P values are already in correct B operand layout!
 
 ### Lessons
 
