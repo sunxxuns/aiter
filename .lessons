@@ -324,6 +324,15 @@ v_mfma_f32_32x32x16_fp8_fp8 vdst, src_a, src_b, vsrc_c
 
 No P redistribution needed - P values are already in correct B operand layout!
 
+**BF16 Kernel Verification (Jan 9, 2026)**:
+Tested BF16 kernel with non-uniform inputs to confirm V×P approach:
+- uniform_v (V=1): Output exactly 1.0 ✓
+- v_by_k (V[k,:]=k): K-weighted average works (correlation 0.9999) ✓  
+- v_by_d (V[:,d]=d): D position perfectly preserved (correlation 1.0) ✓
+- random: Very high correlation (0.999998) ✓
+
+The v_by_d test is critical - proves D dimension is correctly mapped through V×P.
+
 ### Lessons
 
 1. **Never trust commit messages** about numerical correctness without running actual tests
