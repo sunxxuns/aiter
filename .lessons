@@ -260,9 +260,39 @@ Use these tests to verify numerical correctness:
 # Test 4: Random V comparison with PyTorch reference (correlation)
 ```
 
+### ROOT CAUSE IDENTIFIED (Jan 9, 2026)
+
+**The 2× factor is caused by incorrect P operand packing for PV MFMA!**
+
+After QK MFMA, each thread's v[32:47] contains:
+- 16 P values for 16 different M (Q-row) positions
+- At ONE K (attention) column: K = tid % 32
+
+The current kernel packs these directly:
+```assembly
+a[0] = pack(v32, v33, v34, v35)  // P[M=0..3, K=tid%32]
+a[1] = pack(v36, v37, v38, v39)  // P[M=4..7, K=tid%32]
+```
+
+But PV MFMA A operand needs:
+- P[one_M_row, K=0..15] - the same M row, varying K columns
+
+**The kernel is packing the M dimension as if it were K dimension!**
+
+This explains:
+- Why V=1 gives 2×: the "wrong K" packing still sums correctly with uniform values
+- Why V[k,:]=k gives 31 instead of 15.5: only the largest K value (31) dominates
+- Why both K ranges (K=0..15 and K=16..31) give full output
+
+**Fix Required**: Cross-thread gather operation before PV MFMA
+- Each thread needs to collect P values from threads that own K=0..15 for its M row
+- This requires LDS or permlane operations to redistribute P values
+- The BF16 kernel likely handles this correctly - need to study its approach
+
 ### Lessons
 
 1. **Never trust commit messages** about numerical correctness without running actual tests
 2. **Test with controlled patterns** (uniform, varying by K, varying by D) before random
 3. **Understand MFMA output layout** before implementing output store
 4. **Cross-verify K reduction**: test with K-dependent V values
+5. **MFMA operand layout mismatch**: QK output gives P[M_range, single_K], but PV needs P[single_M, K_range]
