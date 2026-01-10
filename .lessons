@@ -295,10 +295,32 @@ After QK MFMA, thread t has P[Q_base:Q_base+16, K=t%32]:
 - For P×V: A needs P[single_M, K_range] - WRONG, we have P[M_range, single_K]
 - For V×P: B needs P^T[K, Q_range] = P[Q_range, single_K] - CORRECT!
 
-FP8 kernel FIX:
-1. Change PV MFMA order: use V as A operand, P as B operand
-2. Read V transposed (ds_read_b64_tr_b8 for FP8)
-3. Transpose output store: O[Q=t%32, D_base:D_base+16]
+**FP8 MFMA Instruction Format:**
+```
+v_mfma_f32_32x32x16_fp8_fp8 vdst, src_a, src_b, vsrc_c
+- src_a: AGPRs a[N:N+1] (2 dwords = 8 FP8 values)
+- src_b: VGPRs v[M:M+1] (2 dwords = 8 FP8 values)
+```
+
+**FP8 kernel FIX steps:**
+1. **Read V → AGPRs** (instead of VGPRs):
+   - Load V from LDS with transpose pattern
+   - Pack V FP8 values into 2 dwords
+   - Use `v_accvgpr_write_b32` to move to AGPRs
+   
+2. **Keep P in VGPRs** (don't move to AGPRs):
+   - After softmax, P is in v[32:47]
+   - Pack P FP8 values and keep in VGPRs
+   - Use as B operand directly
+
+3. **Fix MFMA operand order:**
+   - Current: `v_mfma a[P], v[V]` = P × V (WRONG)
+   - Fixed: `v_mfma a[V], v[P]` = V × P (CORRECT)
+
+4. **Fix output store (transpose):**
+   - Thread t owns O^T[D_base:D_base+16, Q=t%32]
+   - After transpose: O[Q=t%32, D_base:D_base+16]
+   - Offset = (t%32)*512 + (t//32)*64 (for head_dim=128)
 
 No P redistribution needed - P values are already in correct B operand layout!
 
