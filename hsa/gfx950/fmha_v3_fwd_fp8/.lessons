@@ -97,20 +97,34 @@ v_or_b32_e32 v48, v48, v49
 |------|-------------|
 | `integrate_step1_qk.s` | QK MFMA kernel (verified) |
 | `integrate_step2_softmax.s` | QK + Softmax kernel (verified) |
-| `integrate_step3_hd32.s` | **Full FP8 attention, head_dim=32** (verified) |
+| `integrate_step3_hd32.s` | Full FP8 attention, head_dim=32 (verified) |
+| `integrate_step4_hd128.s` | **Full FP8 attention, head_dim=128** (verified) |
 | `test_fp8_attention.py` | Main numerical verification test |
-| `test_integrate_step{1,2,3}.py` | Step-by-step integration tests |
+| `test_integrate_step{1,2,3,4}.py` | Step-by-step integration tests |
 | `test_components.py` | Component-level tests |
+
+## head_dim=128 Implementation Details
+
+- **QK MFMA**: 8 passes to sum over head_dim=128 (128/16=8)
+- **PV MFMA**: 4 D-tiles × 2 K-passes = 8 MFMAs for output O[32,128]
+- **VGPRs**: 168 total (64 for 4 accumulator sets + working registers)
+- **V stride**: 128 bytes (row stride for head_dim=128)
 
 ## Numerical Verification Results
 
-All tests pass with:
+head_dim=32 (all tests pass):
 - Max error: < 0.015
 - Mean error: < 0.003
 - Correlation: > 0.9999
 
+head_dim=128 (all tests pass):
+- Max error: < 0.05
+- Mean error: < 0.005
+- Correlation: > 0.999
+
 ## Next Steps
-1. Scale to head_dim=128 (use 16x16x32 MFMA for larger K)
-2. Add causal masking
-3. Performance optimization
-4. Benchmark vs BF16 (target: >30% improvement)
+1. ✅ Scale to head_dim=128
+2. Support variable seq_len (K/V tiling with online softmax)
+3. Add causal masking
+4. Performance optimization
+5. Benchmark vs BF16 (target: >30% improvement)
