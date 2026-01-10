@@ -91,17 +91,26 @@ v_or_b32_e32 v48, v48, v49
 - 16x16x32 FP8 MFMA processes K=32 (double the K dimension)
 - For head_dim=128: can potentially do larger D-tiles
 
-## Test Pattern Summary
+## Current Milestone Files
 
-| Test | Status | Description |
-|------|--------|-------------|
-| step1_qk_mfma | ✓ | QK MFMA only |
-| integrate_step1_qk | ✓ | QK MFMA with global Q/K (8 random tests) |
-| integrate_step2_softmax | ✓ | QK + Softmax (6 tests) |
-| integrate_step3_hd32 | ✓ | Full attention hd=32 (5 tests) |
+| File | Description |
+|------|-------------|
+| `integrate_step1_qk.s` | QK MFMA kernel (verified) |
+| `integrate_step2_softmax.s` | QK + Softmax kernel (verified) |
+| `integrate_step3_hd32.s` | **Full FP8 attention, head_dim=32** (verified) |
+| `test_fp8_attention.py` | Main numerical verification test |
+| `test_integrate_step{1,2,3}.py` | Step-by-step integration tests |
+| `test_components.py` | Component-level tests |
+
+## Numerical Verification Results
+
+All tests pass with:
+- Max error: < 0.015
+- Mean error: < 0.003
+- Correlation: > 0.9999
 
 ## Next Steps
-1. Scale to head_dim=128
+1. Scale to head_dim=128 (use 16x16x32 MFMA for larger K)
 2. Add causal masking
-3. Optimize for performance
-4. Benchmark vs BF16
+3. Performance optimization
+4. Benchmark vs BF16 (target: >30% improvement)
