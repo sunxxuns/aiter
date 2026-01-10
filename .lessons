@@ -361,6 +361,44 @@ The v_by_d test is critical - proves D dimension is correctly mapped through V×
    When all P values are identical, the transposed read gives same values.
    This is why minimal tests with P=1 passed.
 
+5. **Rigorous MFMA Testing (Jan 9, 2026)**:
+   Created tests with non-uniform inputs to reveal bugs:
+   
+   a) K-sum test (A=1, B=K) → Output = 120 ✓
+      - Confirms K reduction works correctly
+      - Confirms FP8 values 0-15 are exact
+   
+   b) M-index test (A=M, B=1) → Reveals FP8 precision
+      - M values 17,19,21,23,25,27,29,31 round to even in FP8 e4m3
+      - MFMA output interleaving confirmed: 0,1,2,3,8,9,10,11,...
+   
+   c) P×V attention test (P=1/16, V=d) → Output = d ✓
+      - D values correctly propagated through MFMA
+      - Basic P×V mechanics work
+
+6. **MFMA 32x32x16 Complete Layout**:
+   
+   A operand (32M × 16K):
+   - Thread t provides A[M=t%32, K=(t/32)*8:(t/32)*8+8]
+   - Threads 0-31: K=0..7 for M rows 0-31
+   - Threads 32-63: K=8..15 for M rows 0-31
+   
+   B operand (16K × 32N):
+   - Thread t provides B[K=(t/32)*8:(t/32)*8+8, N=t%32]
+   - Threads 0-31: K=0..7 for N cols 0-31
+   - Threads 32-63: K=8..15 for N cols 0-31
+   
+   Output (32M × 32N):
+   - Thread t owns C[(t/32)*16:(t/32)*16+16 INTERLEAVED, N=t%32]
+   - Interleaved rows: 0,1,2,3,8,9,10,11,16,17,18,19,24,25,26,27 for threads 0-31
+   
+   **The Critical Mismatch**:
+   After QK MFMA, thread t has P[Q_rows (interleaved), K=t%32]
+   For PV MFMA A operand, thread 0 needs P[Q=0, K=0..7]
+   But P[Q=0, K=0..7] is spread across threads 0,1,2,3,4,5,6,7's position 0!
+   
+   **Redistribution IS required** - no way around it.
+
 ### Lessons
 
 1. **Never trust commit messages** about numerical correctness without running actual tests
