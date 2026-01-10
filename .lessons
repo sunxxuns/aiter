@@ -399,6 +399,26 @@ The v_by_d test is critical - proves D dimension is correctly mapped through V×
    
    **Redistribution IS required** - no way around it.
 
+7. **CRITICAL: FP8 FORMAT FOR MFMA (Jan 9, 2026)**:
+   
+   **THE MFMA USES e4m3fn (OCP FORMAT), NOT e4m3fnuz!**
+   
+   Byte value comparison:
+   | Value    | e4m3fnuz byte | e4m3fn (OCP) byte |
+   |----------|---------------|-------------------|
+   | 0.015625 | 16            | 8                 |
+   | 0.03125  | 24            | 16                |
+   | 0.0625   | 32            | 24                |
+   | 0.125    | 40            | 32                |
+   
+   If you use e4m3fnuz bytes in MFMA, you get 2× output values!
+   
+   The `v_cvt_pk_fp8_f32` instruction produces OCP format bytes.
+   When loading FP8 from global memory:
+   - If data is stored as e4m3fnuz, convert to OCP before MFMA
+   - Or store data as e4m3fn from the start
+   - In torch: use `torch.float8_e4m3fn` not `torch.float8_e4m3fnuz`
+
 ### Lessons
 
 1. **Never trust commit messages** about numerical correctness without running actual tests
