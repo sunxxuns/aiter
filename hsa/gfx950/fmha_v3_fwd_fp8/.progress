@@ -123,6 +123,24 @@ Store pattern:
 - Threads 0-31: O[Q=t, D=0..7]
 - Threads 32-63: O[Q=t-32, D=8..15]
 
+### P Redistribution Verified (Jan 9, 2026)
+
+**test_p_redistrib.s PASSED!**
+- P[q,k] = (k+1)/16 written to LDS
+- Each thread reads P[Q=tid%32, K_range]
+- V[k,d] = 1
+- Expected: O = sum((k+1)/16 for k=0..15) = 8.5
+- Actual: All 8.5 ✓
+
+**Working P Redistribution Pattern:**
+1. Write P to LDS: `P[Q_row, K_col]` at `Q_row * 32 + K_col`
+2. Barrier
+3. Read for PV A operand: `P[Q=tid%32, K=(tid/32)*8:(tid/32)*8+8]`
+   - LDS address: `(tid%32) * 32 + (tid/32) * 8`
+   - Read 8 bytes with `ds_read_b64`
+
+**Remaining: Apply this to full kernel with correct output interleaving**
+
 ## BF16 Multi-Wave Architecture Analysis (CORRECTED)
 
 ### Actual Configuration (from fmha_fwd.csv)
