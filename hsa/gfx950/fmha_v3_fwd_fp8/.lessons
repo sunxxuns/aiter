@@ -1,0 +1,107 @@
+# FP8 Flash Attention Assembly Kernel - Lessons Learned
+
+## Critical Discoveries
+
+### 1. v_exp_f32 computes 2^x, NOT e^x
+**Impact**: Softmax requires natural exponential e^x
+**Solution**: Multiply input by log2(e) = 0x3fb8aa3b before calling v_exp_f32
+```asm
+s_mov_b32 s14, 0x3fb8aa3b            // log2(e)
+v_mul_f32_e32 v48, v48, s14          // scale by log2(e)
+v_exp_f32_e32 v48, v48               // 2^(x*log2e) = e^x
+```
+**Verified in**: BF16 kernel uses same pattern
+
+### 2. FP8 Format: Use e4m3fn (OCP), NOT e4m3fnuz
+**Impact**: MFMA hardware expects OCP FP8 format
+**Solution**: Use torch.float8_e4m3fn for test inputs
+```python
+# Correct
+x.to(torch.float8_e4m3fn).view(torch.uint8)
+# Wrong - causes 2x scaling error
+x.to(torch.float8_e4m3fnuz).view(torch.uint8)
+```
+
+### 3. v_rcp_f32 Pipeline Hazard
+**Impact**: Reciprocal result not ready immediately
+**Solution**: Add NOPs after v_rcp_f32 before using result
+```asm
+v_rcp_f32_e32 v81, v81
+s_nop 7
+s_nop 7
+v_mul_f32_e32 v48, v48, v81          // Safe to use v81 now
+```
+
+### 4. MFMA Output Scatter Pattern
+For v_mfma_f32_32x32x16_fp8_fp8 with 64 threads:
+- Thread t produces 16 output values in accumulators
+- Output row = M_base + interleaved offset
+  - M_base = (tid/32) * 4
+  - Rows: M_base+0,1,2,3 / M_base+8,9,10,11 / M_base+16,17,18,19 / M_base+24,25,26,27
+- Column N = tid % 32
+
+### 5. V Loading with Stride for PV MFMA
+V[K,D] stored row-major needs strided byte loads for MFMA B operand:
+```asm
+// Load V[k, d] for k=k_start..k_start+8 at column d=tid%32
+flat_load_ubyte v48, v[10:11]
+flat_load_ubyte v49, v[10:11] offset:32   // stride = head_dim
+flat_load_ubyte v50, v[10:11] offset:64
+...
+// Then pack into dwords
+v_lshlrev_b32_e32 v49, 8, v49
+v_or_b32_e32 v48, v48, v49
+...
+```
+
+## Working Integration (head_dim=32)
+
+### integrate_step3_hd32.s - Full Pipeline
+1. **QK MFMA** (2 passes for K_dim=32)
+   - Load Q/K from global memory
+   - MFMA: S = Q @ K^T
+
+2. **Store S to LDS**
+   - Scatter pattern matches MFMA output layout
+
+3. **Softmax**
+   - Load S row from LDS (thread t handles row t%32)
+   - Find max, subtract, scale by log2(e), exp, sum, reciprocal, normalize
+
+4. **P to FP8 and LDS**
+   - v_cvt_pk_fp8_f32 to convert F32 pairs to FP8
+   - Pack and store to LDS_P
+
+5. **PV MFMA** (2 passes for K_dim=32)
+   - Load P from LDS (redistributed for MFMA A operand)
+   - Load V from global with stride (for MFMA B operand)
+   - MFMA: O = P @ V
+
+6. **Store O**
+   - Same scatter pattern as S
+
+## Available MFMA Instructions (gfx950)
+- `v_mfma_f32_32x32x16_fp8_fp8` - K=16 per instruction, A[2 dwords], B[2 dwords]
+- `v_mfma_f32_16x16x32_fp8_fp8` - K=32 per instruction (2x data per instruction!)
+- `v_mfma_f32_32x32x16_bf16` - BF16 reference
+
+## FP8 Data Density Advantage
+- FP8 is 1 byte vs BF16's 2 bytes
+- Same registers hold 2x more elements
+- 16x16x32 FP8 MFMA processes K=32 (double the K dimension)
+- For head_dim=128: can potentially do larger D-tiles
+
+## Test Pattern Summary
+
+| Test | Status | Description |
+|------|--------|-------------|
+| step1_qk_mfma | ✓ | QK MFMA only |
+| integrate_step1_qk | ✓ | QK MFMA with global Q/K (8 random tests) |
+| integrate_step2_softmax | ✓ | QK + Softmax (6 tests) |
+| integrate_step3_hd32 | ✓ | Full attention hd=32 (5 tests) |
+
+## Next Steps
+1. Scale to head_dim=128
+2. Add causal masking
+3. Optimize for performance
+4. Benchmark vs BF16
