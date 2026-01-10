@@ -141,6 +141,28 @@ Store pattern:
 
 **Remaining: Apply this to full kernel with correct output interleaving**
 
+### Full Attention Tests PASSED (Jan 9, 2026)
+
+**test_full_attn_v2.s with e4m3fn format:**
+- P=1/16 uniform, V[k,d]=d/32 (e4m3fn format)
+- Expected: O[q,d] = d/32
+- Result: ✓ All outputs match (within FP8 quantization)
+
+**test_nonuniform_p.s:**
+- P[q,k] = (k+1)/136 (non-uniform, varies by K)
+- V = 1.0
+- Expected: O = sum_k((k+1)/136) = 0.9805 (with FP8 quantization)
+- Result: ✓ All outputs exactly 0.9805, zero error
+
+**All Building Blocks Verified:**
+1. ✓ MFMA K reduction works correctly
+2. ✓ P redistribution via LDS works
+3. ✓ FP8 format must be e4m3fn (OCP), not e4m3fnuz
+4. ✓ Scatter stores for interleaved MFMA output
+5. ✓ Non-uniform P values handled correctly
+
+**Ready to integrate into full FP8 flash attention kernel**
+
 ## BF16 Multi-Wave Architecture Analysis (CORRECTED)
 
 ### Actual Configuration (from fmha_fwd.csv)
