@@ -197,3 +197,72 @@ When removing debug stores, be VERY careful not to remove:
 
 **Workaround for K>7**:
 The current working kernel uses strided `flat_load_ubyte` for V loading (16 loads per thread) with K-inner LDS layout and regular `ds_read_b64` for reading, avoiding the tr_b8 limitation entirely.
+
+## FP8 Flash Attention: Known Numerical Issues (Jan 9, 2026)
+
+**CRITICAL**: All FP8 kernels (v2, v3, v4) have fundamental numerical bugs. Previous commit claims of "numerically correct" were NOT verified properly.
+
+### Issue 1: 2× Output Factor
+
+**Symptom**: Output is consistently 2× expected value
+- V = 1 (uniform): output = 2.0 (expected 1.0)
+- V[k,:] = k: output = 31.0 (expected 15.5)
+
+**Root Cause Analysis** (in progress):
+- Both PV MFMAs (K=0..15 and K=16..31) produce full output instead of half each
+- Test: V[k<16,:]=1, V[k>=16,:]=0 gives 1.0 (should be 0.5)
+- Test: V[k<16,:]=0, V[k>=16,:]=1 gives 1.0 (should be 0.5)
+- This confirms both K ranges contribute full (not half) output
+
+**Possible Causes**:
+1. P values (softmax) are not split correctly for K=0..15 vs K=16..31
+2. Each MFMA uses the same P values instead of different K slices
+3. Softmax sum is computed incorrectly (sum=16 instead of 32)
+
+### Issue 2: Wrong D-Position Mapping
+
+**Symptom**: V[:,d]=d does not produce output[:,d]=d
+- D=0 → 0.0 (correct)
+- D=15 → 0.0 (expected 15.0)
+- D=31 → 2.0 (expected 31.0)
+
+**Root Cause**:
+The MFMA 32×32 output distribution differs from assumed layout:
+- Each thread's 16 outputs are NOT at consecutive N columns
+- Output store pattern assumes wrong thread-to-position mapping
+
+**MFMA 32×32×16 Output Distribution** (needs verification):
+```
+tid 0: M=0..15, N=0 (single column, 16 rows)
+tid 1: M=0..15, N=1
+...
+tid 31: M=0..15, N=31
+tid 32: M=16..31, N=0
+...
+tid 63: M=16..31, N=31
+```
+
+This means each thread writes ONE column (16 M rows), not a row segment.
+
+### Issue 3: Incomplete Output Coverage
+
+**Observed**:
+- v2/v3: 1024/8192 nonzero (12.5%) - single 32×32 D-tile
+- v4: 4096/8192 nonzero (50%) - full head_dim but wrong values
+
+### Test Methodology
+
+Use these tests to verify numerical correctness:
+```python
+# Test 1: V=1 should give output=1.0
+# Test 2: V[k,:]=k should give output=15.5 (mean of 0..31)
+# Test 3: V[:,d]=d should give output[:,d]=d
+# Test 4: Random V comparison with PyTorch reference (correlation)
+```
+
+### Lessons
+
+1. **Never trust commit messages** about numerical correctness without running actual tests
+2. **Test with controlled patterns** (uniform, varying by K, varying by D) before random
+3. **Understand MFMA output layout** before implementing output store
+4. **Cross-verify K reduction**: test with K-dependent V values
