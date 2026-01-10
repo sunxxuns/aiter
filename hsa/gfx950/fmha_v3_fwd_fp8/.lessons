@@ -123,8 +123,44 @@ head_dim=128 (all tests pass):
 - Correlation: > 0.999
 
 ## Next Steps
-1. ✅ Scale to head_dim=128
+1. ✅ Scale to head_dim=128 (DONE - 4/4 tests pass)
 2. Support variable seq_len (K/V tiling with online softmax)
 3. Add causal masking
 4. Performance optimization
 5. Benchmark vs BF16 (target: >30% improvement)
+
+## Online Softmax Algorithm for Tiling
+
+When seq_len > 32, we need to process K/V in tiles and use the online softmax algorithm:
+
+```python
+# Initialize
+m = -inf           # Running max
+l = 0              # Running sum of exp values
+O = zeros(32, 128) # Accumulator
+
+# For each K/V tile j (tile_size = 32):
+for j in range(num_tiles):
+    S_j = Q @ K_j.T                    # [32, 32] attention scores
+    m_j = max(S_j, dim=-1)             # New tile max
+    m_new = max(m, m_j)                # Combined max
+    
+    # Rescale previous accumulator
+    O = O * exp(m - m_new)             # Rescale by exp difference
+    l = l * exp(m - m_new)             # Rescale sum
+    
+    # Process new tile
+    P_j = exp(S_j - m_new)             # New attention probs (unnormalized)
+    l = l + sum(P_j, dim=-1)           # Update sum
+    O = O + P_j @ V_j                  # Accumulate output
+    
+    m = m_new                          # Update running max
+
+# Final normalization
+O = O / l
+```
+
+Key registers needed:
+- `m[32]`: Running max per row (32 F32 values = 128 bytes)
+- `l[32]`: Running sum per row (32 F32 values = 128 bytes)  
+- `O[32,128]`: Accumulator (kept in VGPRs)
