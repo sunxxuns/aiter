@@ -327,11 +327,39 @@ No P redistribution needed - P values are already in correct B operand layout!
 **BF16 Kernel Verification (Jan 9, 2026)**:
 Tested BF16 kernel with non-uniform inputs to confirm V×P approach:
 - uniform_v (V=1): Output exactly 1.0 ✓
-- v_by_k (V[k,:]=k): K-weighted average works (correlation 0.9999) ✓  
+- v_by_k (V[k,:]=k): K-weighted average works (correlation 0.9999) ✓
 - v_by_d (V[:,d]=d): D position perfectly preserved (correlation 1.0) ✓
 - random: Very high correlation (0.999998) ✓
 
 The v_by_d test is critical - proves D dimension is correctly mapped through V×P.
+
+**FP8 V×P Implementation Findings (Jan 9, 2026)**:
+
+1. **Minimal V×P Test PASSED**: With V=1, P=1, K=16 → Output = 16.0 ✓
+   - The basic V×P MFMA mechanics work correctly
+   - FP8 packing/MFMA/output fundamentals are sound
+
+2. **MFMA Output Interleaving Discovered**:
+   - MFMA 32×32×16 output is NOT contiguous M-rows
+   - Threads 0-31: M rows 0,1,2,3, 8,9,10,11, 16,17,18,19, 24,25,26,27
+   - Threads 32-63: M rows 4,5,6,7, 12,13,14,15, 20,21,22,23, 28,29,30,31
+   - Solution: Use v_permlane32_swap_b32_e32 to reorder before storing
+
+3. **P REDISTRIBUTION REQUIRED for non-uniform attention**:
+   After QK MFMA: Thread t has P[Q_base:Q_base+16, K=t%32]
+   For V×P B operand: Thread t needs P[Q=t%32, K_range=(t/32)*8:+8]
+   
+   The layouts are TRANSPOSED:
+   - Have: 16 Q values at single K column
+   - Need: 8 K values at single Q row
+   
+   Must write P to LDS and re-read with transposed access pattern:
+   - Write: P[Q_row, K_col] at LDS_P_OFFSET + Q_row*32 + K_col
+   - Read: P[Q=t%32, K_range] at LDS_P_OFFSET + (t%32)*32 + (t/32)*8
+
+4. **Why uniform P works without redistribution**:
+   When all P values are identical, the transposed read gives same values.
+   This is why minimal tests with P=1 passed.
 
 ### Lessons
 

@@ -79,10 +79,49 @@ No P redistribution needed!
 
 ### Next Steps
 
-1. Create minimal test verifying V×P approach with FP8 MFMA
+1. ~~Create minimal test verifying V×P approach with FP8 MFMA~~ ✓
 2. Modify fwd_hd128_fp8_v3_clean.s to use V×P order
 3. Fix output store pattern for transposed output
 4. Verify numerics with random data
+
+### Key Discovery: MFMA Output Interleaving (Jan 9, 2026)
+
+**Minimal V×P Test Results:**
+- With V=1, P=1, K=16: Output = 16.0 (correct!)
+- V×P MFMA itself works correctly
+
+**MFMA 32×32×16 Output Distribution:**
+Thread t (t < 64) owns 16 output M-rows at N column t%32.
+The M-rows are NOT contiguous! They are interleaved:
+
+- Threads 0-31: M rows 0,1,2,3, 8,9,10,11, ... (even 4-groups)
+- Threads 32-63: M rows 4,5,6,7, 12,13,14,15, ... (odd 4-groups)
+
+**V-by-D Test Results:**
+- V=D/32, P=1, K=16 → Expected O[Q,D] = D/2
+- Position 0-3: Got D/2 for D=0,1,2,3 ✓
+- Position 4-7: Got D/2 for D=8,9,10,11 ✗ (should be D=4,5,6,7)
+
+**Solution: permlane32_swap**
+BF16 kernel uses v_permlane32_swap_b32_e32 to exchange values between
+threads 0-31 and 32-63, reordering the interleaved output before storing.
+
+For FP8 kernel, need:
+```asm
+v_permlane32_swap_b32_e32 v48, v52  // Swap rows 0-3↔8-11 between lane groups
+v_permlane32_swap_b32_e32 v49, v53
+v_permlane32_swap_b32_e32 v50, v54
+v_permlane32_swap_b32_e32 v51, v55
+// Similar for remaining 8 values
+```
+
+After swap:
+- Threads 0-31 have D=0-7 (consecutive) in v48-v55
+- Threads 32-63 have D=8-15 (consecutive) in v48-v55
+
+Store pattern:
+- Threads 0-31: O[Q=t, D=0..7]
+- Threads 32-63: O[Q=t-32, D=8..15]
 
 ## BF16 Multi-Wave Architecture Analysis (CORRECTED)
 
