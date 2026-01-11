@@ -1,498 +1,64 @@
-# FP8 vs BF16 Flash Attention Kernel Comparison
+# FP8 Flash Attention - BF16 Reference Comparison
 
-This document compares our FP8 kernel (`fwd_fp8_integrated.s`) with the production 
-BF16 kernel (`fwd_hd128_bf16.s`) section by section to ensure we follow the same 
-architecture and only change what's necessary for FP8.
+## Key Discovery
 
----
-
-## Executive Summary
-
-| Aspect | BF16 Reference | FP8 Current | Status |
-|--------|---------------|-------------|--------|
-| head_dim | 128 | 32 | ⚠️ Need to scale |
-| MFMA type | `v_mfma_f32_32x32x16_bf16` | `v_mfma_f32_32x32x16_fp8_fp8` | ✅ Correct |
-| **Memory arch** | **buffer_load → LDS → VGPR** | **flat_load → VGPR** | ❌ **NOT SCALABLE** |
-| Softmax | **Online** (running max) | **Standard** (full matrix) | ❌ MUST FIX |
-| K-tile loop | Yes (multiple iterations) | No (single pass) | ❌ MUST ADD |
-| Output rescaling | Yes (`v_mul_f32 v16`) | No | ❌ MUST ADD |
-| Constants | Same | Same | ✅ Correct |
-
-### Critical Issues Status
-1. ~~**Memory Architecture**: flat_load doesn't scale~~ ✅ SOLVED (buffer_load→LDS proven)
-2. **HD=128**: Need 8 MFMA passes instead of 2 - 🔄 IN PROGRESS
-3. **Online Softmax**: Standard softmax can't handle seq_len > 32 - ⬜ DEFERRED (OK for S=32)
-4. **K-tile Loop**: No loop structure - ⬜ DEFERRED (requires online softmax)
+BF16 reference kernel computes **S^T = K @ Q^T**, not S = Q @ K^T.
 
 ---
 
-## Section 1: Kernel Prologue & Arguments
+## Why S^T?
 
-### BF16 (lines 12-75)
-```assembly
-// 512-byte kernel args with many parameters
-s_load_dwordx2 s[20:21], s[0:1], 0x0   // ptr_R (output)
-s_load_dwordx2 s[8:9], s[0:1], 0x10    // ptr_Q
-s_load_dwordx2 s[12:13], s[0:1], 0x20  // ptr_K  
-s_load_dwordx2 s[16:17], s[0:1], 0x30  // ptr_V
-s_load_dwordx2 s[24:25], s[0:1], 0x40  // ptr_LSE
-s_load_dword s28, s[0:1], 0x50         // scalar (scale)
-s_load_dword s30, s[0:1], 0x60         // seq_len
-// ... many stride parameters
+### MFMA Output Layout
+
+Thread t, VGPR v holds C[M, N] where:
+- M = (t/32)*4 + (v%4) + (v/4)*8
+- N = t % 32
+
+### With S = Q @ K^T
+```
+Thread holds S[row_interleaved, query=t%32]
+VGPRs hold different queries → summing mixes queries (WRONG)
 ```
 
-### FP8 (lines 19-23)
-```assembly
-// Simplified 32-byte kernel args
-s_load_dwordx2 s[8:9], s[0:1], 0x00    // ptr_O
-s_load_dwordx2 s[10:11], s[0:1], 0x08  // ptr_Q
-s_load_dwordx2 s[12:13], s[0:1], 0x10  // ptr_K
-s_load_dwordx2 s[14:15], s[0:1], 0x18  // ptr_V
+### With S^T = K @ Q^T
 ```
-
-### Comparison
-| Parameter | BF16 | FP8 | Action |
-|-----------|------|-----|--------|
-| Output ptr | s[20:21] @ 0x00 | s[8:9] @ 0x00 | ✅ Similar |
-| Q ptr | s[8:9] @ 0x10 | s[10:11] @ 0x08 | ✅ Similar |
-| K ptr | s[12:13] @ 0x20 | s[12:13] @ 0x10 | ✅ Similar |
-| V ptr | s[16:17] @ 0x30 | s[14:15] @ 0x18 | ✅ Similar |
-| Scale | s28 @ 0x50 | **MISSING** | ❌ Add in Phase 2 |
-| seq_len | s30 @ 0x60 | **MISSING** | ❌ Add in Phase 3 |
-| Strides | Multiple | **MISSING** | ❌ Add in Phase 3 |
-| LSE ptr | s[24:25] @ 0x40 | **MISSING** | ❌ Add later |
-
----
-
-## Section 2: Constants
-
-### BF16 (lines 139-152)
-```assembly
-s_mov_b32 s29, 0x3fb8aa3b     // log2(e) = 1.4426950408889634
-v_mov_b32_e32 v27, 0xff800000 // -infinity (for max init)
-v_mov_b32_e32 v24, 0xff7fffff // -max_float (running max init)
-```
-
-### FP8 (line 109)
-```assembly
-s_mov_b32 s2, 0x3fb8aa3b      // log2(e) ✅ Same constant
-// MISSING: -infinity for max init
-// MISSING: Running max tracker
-```
-
-### Comparison
-| Constant | BF16 | FP8 | Action |
-|----------|------|-----|--------|
-| log2(e) | 0x3fb8aa3b | 0x3fb8aa3b | ✅ Same |
-| -infinity | 0xff800000 | **MISSING** | ❌ Add for online softmax |
-| running_max | v24 init -max | **MISSING** | ❌ Add for online softmax |
-
----
-
-## Section 3: Q/K/V Data Loading - CRITICAL FOR SCALING ❌
-
-### BF16 Pattern (lines 184-426)
-```assembly
-// STEP 1: Async buffer load directly to LDS (bypasses VGPRs!)
-s_mov_b32 m0, s63                              // Set LDS write offset
-buffer_load_dwordx4 v4, s[8:11], 0 offen lds   // Global → LDS directly
-s_add_u32 m0, 0x2040, m0                       // Advance LDS offset
-buffer_load_dwordx4 v5, s[8:11], 0 offen lds   // Next chunk
-// ... continues for all Q data
-
-// STEP 2: After barrier, read from LDS to VGPRs for MFMA
-ds_read_b64 v[160:161], v2                     // K data
-ds_read_b64 v[162:163], v2 offset:8
-ds_read_b64 v[164:165], v2 offset:32
-// ... 16 reads for K (8 pairs for HD=128)
-
-ds_read_b128 v[192:195], v8                    // Q data (4 BF16 = 8 bytes)
-ds_read_b128 v[196:199], v8 offset:32
-// ... 8 reads for Q
-```
-
-### FP8 Pattern (lines 57-69) - NOT SCALABLE
-```assembly
-// Direct flat_load to VGPRs - SYNCHRONOUS, NO DATA SHARING
-v_mov_b32_e32 v10, s10                         // Build address manually
-v_mov_b32_e32 v11, s11
-v_add_co_u32_e32 v10, vcc, v4, v10
-v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
-flat_load_dwordx2 v[20:21], v[10:11]           // Q: 8 FP8 values
-flat_load_dwordx2 v[22:23], v[10:11]           // K: 8 FP8 values
-```
-
-### Why BF16 Pattern is Superior
-| Aspect | BF16 (buffer→LDS) | FP8 (flat→VGPR) | Impact |
-|--------|-------------------|-----------------|--------|
-| **Async** | Yes (overlaps compute) | No (blocks) | **Critical for perf** |
-| **Data sharing** | All threads share LDS | Each thread loads own | **Memory BW waste** |
-| **Address calc** | Hardware (descriptor) | Manual (VGPR ops) | **Instruction overhead** |
-| **Double buffer** | Easy (swap LDS banks) | Hard (VGPR pressure) | **Latency hiding** |
-| **Scalability** | O(1) loads per wavefront | O(threads) loads | **Does not scale** |
-
-### BF16 Buffer Descriptor Setup (lines 8-11)
-```assembly
-// s[8:11] = buffer descriptor for Q
-// s[8:9]   = base address (64-bit)
-// s[10]    = num_records (size)
-// s[11]    = stride/format flags (0x20000 = stride enable)
-s_mov_b32 s11, 0x20000
-```
-
-### Comparison
-| Aspect | BF16 | FP8 | Action |
-|--------|------|-----|--------|
-| Load method | buffer_load→LDS | flat_load→VGPR | ❌ **MUST CHANGE** |
-| Address mode | Buffer descriptor | Manual 64-bit | ❌ **MUST CHANGE** |
-| Data width | dwordx4 (16B) | dwordx2 (8B) | ✅ OK (FP8 half size) |
-| Async/overlap | Yes | No | ❌ **MUST CHANGE** |
-| LDS usage | 64KB structured | 4KB (P only) | ❌ **MUST EXPAND** |
-
----
-
-## Section 4: QK MFMA
-
-### BF16 Pattern (lines 432-456)
-```assembly
-// 8 MFMA passes for HD=128 (128/16=8)
-v_mfma_f32_32x32x16_bf16 v[32:47], v[192:195], v[160:163], 0
-v_mfma_f32_32x32x16_bf16 v[32:47], v[196:199], v[164:167], v[32:47]
-v_mfma_f32_32x32x16_bf16 v[32:47], v[200:203], v[168:171], v[32:47]
-// ... 8 total for first S tile, 8 more for second
-```
-
-### FP8 Pattern (lines 75-97)
-```assembly
-// 2 MFMA passes for HD=32 (32/16=2)
-v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[0:1], v[22:23], v[32:47]
-// ... second pass
-v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[0:1], v[22:23], v[32:47]
-```
-
-### Comparison
-| Aspect | BF16 | FP8 | Action |
-|--------|------|-----|--------|
-| MFMA instruction | `v_mfma_f32_32x32x16_bf16` | `v_mfma_f32_32x32x16_fp8_fp8` | ✅ Correct |
-| Passes per tile | 8 (HD=128) | 2 (HD=32) | ⚠️ Scale to 8 |
-| A operand | VGPRs v[192:195] | AGPRs a[0:1] | ✅ Both valid |
-| B operand | VGPRs v[160:163] | VGPRs v[22:23] | ✅ Same |
-| Output | v[32:47] | v[32:47] | ✅ Same |
-
----
-
-## Section 5: SOFTMAX - CRITICAL DIFFERENCE ❌
-
-### BF16 Pattern - ONLINE SOFTMAX (lines 544-552, 911-914)
-```assembly
-// Step 1: Cross-lane max reduction
-v_permlane32_swap_b32_e32 v20, v21
-v_max_f32_e32 v21, v20, v21           // New tile max
-
-// Step 2: Compute correction factor
-v_sub_f32_e32 v16, v24, v21           // correction = old_max - new_max
-v_mov_b32_e32 v24, v21                // Update running max
-
-// Step 3: Rescale previous output with correction
-v_mul_f32_e32 v96, v16, v96           // O = O * exp(correction)
-v_mul_f32_e32 v97, v16, v97
-// ... rescale all O accumulators
-
-// Step 4: Exp and accumulate
-v_exp_f32_e32 v50, v50
-v_add_f32_e32 v19, v33, v32           // Sum for normalization
-```
-
-### FP8 Pattern - STANDARD SOFTMAX (lines 118-160)
-```assembly
-// Step 1: Find max (single tile only, no running max!)
-ds_swizzle_b32 v51, v50 offset:swizzle(SWAP,16)
-v_max_f32_e32 v50, v50, v51
-// ... butterfly reduction
-
-// Step 2: Compute exp (no correction factor!)
-v_sub_f32_e32 v60, v32, v50           // S - max
-v_mul_f32_e32 v60, v60, v61           // * log2(e)
-v_exp_f32_e32 v60, v60
-
-// Step 3: Sum and normalize (no rescaling!)
-v_rcp_f32_e32 v54, v52
-v_mul_f32_e32 v32, v60, v54           // P = exp / sum
-```
-
-### Comparison - THIS IS THE KEY DIFFERENCE
-| Aspect | BF16 (Online) | FP8 (Standard) | Action |
-|--------|---------------|----------------|--------|
-| Running max | v24 tracks across tiles | None | ❌ **MUST ADD** |
-| Correction factor | v16 = exp(old - new) | None | ❌ **MUST ADD** |
-| Output rescaling | O *= correction | None | ❌ **MUST ADD** |
-| Running sum | v18/v19 accumulate | Per-tile only | ❌ **MUST ADD** |
-| Max reduction | v_permlane32_swap | ds_swizzle | ⚠️ Both work |
-
----
-
-## Section 6: PV MFMA
-
-### BF16 Pattern (lines 671-706)
-```assembly
-// PV MFMA interleaved with softmax computation!
-v_mfma_f32_32x32x16_bf16 v[64:79], v[192:195], v[160:163], 0
-v_exp_f32_e32 v50, v50                 // Softmax exp concurrent
-v_exp_f32_e32 v51, v51
-v_mfma_f32_32x32x16_bf16 v[64:79], v[196:199], v[164:167], v[64:79]
-// Output goes to v[64:79], v[80:95], etc. (4 D-tiles for HD=128)
-```
-
-### FP8 Pattern (lines 909-935)
-```assembly
-// Sequential: softmax complete, then PV
-v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[0:1], v[22:23], v[32:47]
-// Output reuses v[32:47] (only 1 D-tile for HD=32)
-```
-
-### Comparison
-| Aspect | BF16 | FP8 | Action |
-|--------|------|-----|--------|
-| Output regs | v[64:79], v[80:95]... | v[32:47] | ⚠️ Need more for HD=128 |
-| D-tiles | 4 (HD=128/32) | 1 (HD=32/32) | ⚠️ Scale to 4 |
-| Interleaving | MFMA + softmax | Sequential | ⚠️ Optimize later |
-| P format | BF16 in VGPRs | FP8 converted | ✅ Correct |
-
----
-
-## Section 7: K-tile Loop
-
-### BF16 Pattern (lines 460, 814, etc.)
-```assembly
-// Loop over K tiles
-s_cmp_lt_i32 s52, s54                  // Compare tile counter
-s_cbranch_scc1 label_02DE              // Loop back if more tiles
-
-// Inside loop:
-// 1. Load next K/V tile
-// 2. Compute S_tile = Q @ K_tile^T
-// 3. Online softmax update
-// 4. O += P_tile @ V_tile
-```
-
-### FP8 Pattern
-```assembly
-// NO LOOP - single pass only
-// All K processed in one shot
-```
-
-### Comparison
-| Aspect | BF16 | FP8 | Action |
-|--------|------|-----|--------|
-| K-tile loop | Yes | No | ❌ **MUST ADD** |
-| Loop counter | s52, s54 | None | ❌ Add |
-| Branch | s_cbranch_scc1 | None | ❌ Add |
-| Multiple tiles | Yes | No | ❌ Add |
-
----
-
-## Section 8: Output Storage
-
-### BF16 Pattern (lines 2425+)
-```assembly
-// Scatter store with interleaved rows (same as MFMA output)
-// Also stores LSE (log-sum-exp) for backward pass
-```
-
-### FP8 Pattern (lines 1020-1067)
-```assembly
-// Scatter store (same pattern)
-flat_store_dword v[12:13], v32
-flat_store_dword v[12:13], v33 offset:128
-// No LSE storage
-```
-
-### Comparison
-| Aspect | BF16 | FP8 | Action |
-|--------|------|-----|--------|
-| Store pattern | Scatter (interleaved) | Scatter (interleaved) | ✅ Same |
-| LSE output | Yes | No | ⚠️ Add later |
-
----
-
-## Section 9: Resource Usage
-
-### BF16 Metadata
-```
-.amdhsa_group_segment_fixed_size 65536  // 64KB LDS
-.amdhsa_next_free_vgpr 256
-.amdhsa_next_free_sgpr 96
-.amdhsa_accum_offset 160                // 96 AGPRs
-.vgpr_count: 256
-.agpr_count: 96
-```
-
-### FP8 Metadata
-```
-.amdhsa_group_segment_fixed_size 4096   // 4KB LDS
-.amdhsa_next_free_vgpr 88
-.amdhsa_next_free_sgpr 16
-.amdhsa_accum_offset 84                 // 4 AGPRs
-.vgpr_count: 88
-.agpr_count: 4
-```
-
-### Comparison
-| Resource | BF16 | FP8 | Action |
-|----------|------|-----|--------|
-| LDS | 64KB | 4KB | ⚠️ May need more |
-| VGPRs | 256 | 88 | ⚠️ Need more for HD=128 |
-| SGPRs | 96 | 16 | ⚠️ Need more for args |
-| AGPRs | 96 | 4 | ⚠️ May need more |
-
----
-
-## Action Items for Phase 2
-
-### CRITICAL - Memory Architecture (BLOCKING) - ✅ SOLVED
-1. **Switch to buffer_load→LDS pattern** ✅ DONE
-   - Set up buffer descriptors for Q, K, V
-   - Use `buffer_load_dwordx4 ... lds` for async global→LDS
-   - Use `ds_read_b64/b128` for LDS→VGPR
-   - **KEY FIX**: Store pattern must match MFMA output layout:
-     ```
-     row = ((vreg-32) % 4) + (tid//32)*4 + ((vreg-32)//4)*8
-     col = tid % 32
-     ```
-2. Implement double buffering (load next tile while computing current)
-
-### CRITICAL - Online Softmax (BLOCKING)
-3. Add running max tracker (v24 equivalent)
-4. Add correction factor computation (v16 = exp(m_old - m_new))
-5. Add output rescaling (O *= correction)
-6. Add running sum tracker
-
-### MUST DO (HD=128)
-7. Increase QK MFMA passes from 2 to 8
-8. Add 4 D-tiles for PV output
-9. Add scale factor argument and application
-
-### MUST DO (K-tile Loop)
-10. Add K-tile loop structure
-11. Add seq_len argument
-12. Add stride arguments
-
-### SHOULD DO (Optimization)
-13. Interleave MFMA with softmax (see BF16 lines 432-448)
-14. Optimize LDS bank conflicts
-
----
-
-## Code Pattern Templates
-
-### Online Softmax (from BF16 reference)
-```assembly
-// Initialize running max
-v_mov_b32_e32 v24, 0xff7fffff          // -max_float
-
-// For each K-tile:
-    // 1. Compute S_tile max
-    v_permlane32_swap_b32_e32 v20, v21
-    v_max_f32_e32 v21, v20, v21        // tile_max
-    
-    // 2. Update running max
-    v_max_f32_e32 v_new_max, v24, v21
-    
-    // 3. Compute correction
-    v_sub_f32_e32 v16, v24, v_new_max  // old - new (negative)
-    v_mul_f32_e32 v16, s29, v16        // * log2(e)
-    v_exp_f32_e32 v16, v16             // exp(old - new)
-    
-    // 4. Rescale O
-    v_mul_f32_e32 v_O[0], v16, v_O[0]
-    // ... all O accumulators
-    
-    // 5. Update state
-    v_mov_b32_e32 v24, v_new_max
+Thread holds S^T[key_interleaved, query=t%32]
+VGPRs hold different keys for SAME query → summing is row-wise (CORRECT)
 ```
 
 ---
 
-## Verification Checklist
+## Implementation Match
 
-Before claiming Phase 2 complete:
-- [ ] Memory architecture uses buffer_load→LDS (not flat_load)
-- [ ] Online softmax matches BF16 pattern
-- [ ] Running max correctly initialized and updated
-- [ ] Output correctly rescaled on max change
-- [ ] HD=128 produces correct results
-- [ ] Scale factor applied correctly
-- [ ] Numerical accuracy within FP8 tolerance
-
----
-
-## Quick Reference: Memory Patterns
-
-### BF16 Buffer Descriptor Setup
-```assembly
-// Set up buffer descriptor in s[8:11]
-// s[8:9]  = 64-bit base address
-// s[10]   = num_records (buffer size in bytes)
-// s[11]   = flags: 0x20000 enables stride mode
-s_mov_b32 s11, 0x20000
-s_and_b32 s9, s9, 0xffff    // Clear high bits of address
-```
-
-### BF16 Async Load Pattern
-```assembly
-// Set LDS write offset in m0
-s_mov_b32 m0, lds_offset
-
-// Async load: global memory → LDS directly (bypasses VGPRs!)
-// v_offset = per-thread offset, s[8:11] = descriptor, soffset = scalar offset
-buffer_load_dwordx4 v_offset, s[8:11], soffset offen lds
-
-// Advance m0 for next load
-s_add_u32 m0, 0x2040, m0
-buffer_load_dwordx4 v_offset, s[8:11], soffset offen lds
-// ... more loads
-
-// Wait for loads to complete
-s_waitcnt lgkmcnt(0)
-s_barrier               // Ensure all wavefronts see the data
-```
-
-### BF16 LDS Read Pattern
-```assembly
-// Read from LDS to VGPRs for MFMA
-// v_lds_addr computed based on thread ID and tile position
-ds_read_b64 v[160:161], v_lds_addr              // 8 bytes
-ds_read_b64 v[162:163], v_lds_addr offset:8     // Next 8 bytes
-ds_read_b128 v[192:195], v_lds_addr             // 16 bytes for Q
-
-s_waitcnt lgkmcnt(0)    // Wait for LDS reads
-```
-
-### FP8 Current Pattern (TO BE REPLACED)
-```assembly
-// Manual address calculation (wastes VGPRs and instructions)
-v_mov_b32_e32 v10, s10
-v_mov_b32_e32 v11, s11
-v_add_co_u32_e32 v10, vcc, v4, v10
-v_addc_co_u32_e32 v11, vcc, 0, v11, vcc
-
-// Synchronous flat load (blocks, no overlap)
-flat_load_dwordx2 v[20:21], v[10:11]
-s_waitcnt vmcnt(0)      // Must wait before use
-```
+| Component | BF16 | FP8 |
+|-----------|------|-----|
+| QK: K @ Q^T | ✅ | ✅ |
+| Max: VGPR + permlane32_swap | ✅ | ✅ |
+| Sum: VGPR + permlane32_swap | ✅ | ✅ |
+| No ds_swizzle for softmax | ✅ | ✅ |
+| P normalize before PV | ✅ | ✅ |
 
 ---
 
-## LDS Layout Reference (from BF16)
+## Softmax Pattern
 
-BF16 uses 64KB LDS with structure:
-- Q tiles: offset 0x0000 - 0x2000 (8KB)
-- K tiles: offset 0x2000 - 0x4000 (8KB)  
-- V tiles: offset 0x4000 - 0x8000 (16KB, double buffered)
-- Scratch: remaining
+```asm
+// VGPR reduction (16 keys per thread)
+v_add_f32_e32 v20, v32, v33
+...
 
-FP8 will use less (half data size):
-- Q tiles: ~4KB
-- K tiles: ~4KB
-- V tiles: ~8KB (double buffered)
-- Total: ~16KB
+// Combine thread pairs (same query, different key halves)
+v_permlane32_swap_b32_e32 v22, v20
+v_add_f32_e32 v18, v20, v22
+```
+
+**No ds_swizzle** - that would mix different queries.
+
+---
+
+## Reference Files
+
+| File | Location |
+|------|----------|
+| BF16 kernel | `hsa/gfx950/fmha_v3_fwd/fwd_hd128_bf16.s` |
+| FP8 kernel | `hsa/gfx950/fmha_v3_fwd_fp8/test_full_hd128.s` |

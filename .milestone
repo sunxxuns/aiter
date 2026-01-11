@@ -1,267 +1,55 @@
-# FP8 Flash Attention Assembly Kernel - Roadmap & Milestones
+# FP8 Flash Attention - Milestones
 
-## Overview
-Target: FP8 flash attention kernel achieving 30%+ TF/s improvement over BF16 (~1000 TF/s)
-Reference: `/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd/fwd_hd128_bf16.s`
+## Goal
+FP8 kernel with >30% TF/s improvement over BF16 (~1000 → >1300 TF/s)
 
 ---
 
-## Phase 1: Single-Tile HD=32 Foundation
+## Status: Phase 2 Complete ✅
 
-### ✅ Milestone 1.1: QK MFMA
-- **Status**: PASSED (Jan 2026)
-- **File**: `fwd_fp8_integrated.s`
-- **Description**: S[32×32] = Q[32×32] @ K^T[32×32]
-- **Implementation**:
-  - `v_mfma_f32_32x32x16_fp8_fp8` × 2 passes (D=32, K=16 per pass)
-  - Q/K loaded from global memory as FP8
-  - S output in v[32:47] (16 VGPRs, interleaved rows)
-- **Accuracy**: max_err < 1e-5 vs FP32 reference
+### Completed
 
-### ✅ Milestone 1.2: Softmax
-- **Status**: PASSED (Jan 2026)
-- **File**: `fwd_fp8_integrated.s`
-- **Description**: P[32×32] = softmax(S) row-wise
-- **Implementation**:
-  - `ds_swizzle SWAP,{16,8,4,2,1}` for cross-thread max reduction
-  - `v_exp_f32` with log2(e) scaling (0x3fb8aa3b)
-  - `ds_swizzle SWAP,{16,8,4,2,1}` for sum reduction
-  - `v_rcp_f32` for normalization
-  - **Critical**: `s_nop 7` after transcendental ops!
-- **Accuracy**: row sums = 1.0, max_err < 1e-5, all positive
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 1 | HD=32 foundation | ✅ |
+| 2 | HD=128 correctness | ✅ |
 
-### ✅ Milestone 1.3: PV MFMA
-- **Status**: PASSED (Jan 2026)
-- **File**: `fwd_fp8_integrated.s`
-- **Description**: O[32×32] = P[32×32] @ V[32×32]
-- **Implementation**:
-  - P redistribution via LDS (QK output → PV input layout)
-  - Convert P from F32 → FP8 using `v_cvt_pk_fp8_f32`
-  - **Critical fix**: Mask high 16 bits after conversion (contains garbage!)
-  - Load V from global memory, pack into FP8 DWORDs
-  - Execute PV MFMA × 2 passes (K=0..15, K=16..31)
-  - Store O with scatter pattern (interleaved rows)
-- **Accuracy**: max_err ~0.01 (FP8 precision), all tests pass
-- **Key lesson**: `v_cvt_pk_fp8_f32` leaves garbage in high 16 bits - must mask with `v_and_b32 0xFFFF`
+### Phase 2 Details
+- S^T = K @ Q^T computation
+- Row-wise softmax (VGPR sum + permlane32_swap)
+- P transpose store
+- 7 rigorous tests passing
 
-### ⚠️ Phase 1 Limitation: Standard Softmax (NOT Flash Attention)
+---
 
-Phase 1 uses **standard softmax** (compute full S, then softmax, then PV):
+## Next: Phase 3 (K-loop)
+
+| Task | Status |
+|------|--------|
+| Kernel arg for seq_len | ⬜ |
+| K-tile loop structure | ⬜ |
+| Online softmax (running max/sum) | ⬜ |
+| Output rescaling between tiles | ⬜ |
+
+---
+
+## Phase 4 (Optimization)
+
+| Task | Status |
+|------|--------|
+| LDS bank conflict reduction | ⬜ |
+| Instruction scheduling | ⬜ |
+| Performance benchmarking | ⬜ |
+
+---
+
+## Files
+
 ```
-S = Q @ K^T         // Full 32x32 - stored in VGPRs
-P = softmax(S)      // Full softmax on 32x32
-O = P @ V           // Full 32x32 multiply
+hsa/gfx950/fmha_v3_fwd_fp8/
+├── test_full_hd128.s       # Production kernel
+├── test_rigorous.py        # Main test suite
+├── test_softmax_check.py   # Quick check
+├── test_rowwise_softmax.py # Row-wise verify
+└── test_transpose_theory.py # S^T proof
 ```
-
-This works for single-tile but does **NOT scale** to large sequences because:
-1. Requires O(N²) memory to store full attention matrix
-2. Cannot process K/V incrementally
-
-**Phase 2 MUST implement online softmax** to be a true Flash Attention kernel.
-
----
-
-## Phase 2: Scalable Architecture (CRITICAL - BLOCKING)
-
-**⚠️ IMPORTANT**: Phase 1 has TWO blocking architectural issues that prevent scaling:
-
-### Blocking Issue 1: Memory Architecture (from `.comp` analysis)
-Phase 1 uses `flat_load → VGPR` which is:
-- **Synchronous** (blocks on memory, no overlap with compute)
-- **No data sharing** (each thread loads independently - O(threads) bandwidth)
-- **Manual addressing** (wastes VGPRs for address calculation)
-
-BF16 reference uses `buffer_load → LDS → VGPR` which is:
-- **Asynchronous** (overlaps with compute via `m0` register)
-- **Shared loading** (one wavefront loads for all - O(1) bandwidth)
-- **Hardware addressing** (buffer descriptors handle addressing)
-
-**Must fix BEFORE adding K-tile loop.**
-
-### Blocking Issue 2: Standard Softmax (not Flash Attention)
-Phase 1 computes full S[32×32], softmax, then PV. This requires O(N²) memory.
-Flash Attention uses ONLINE SOFTMAX to process K-tiles incrementally.
-
-**Must fix BEFORE supporting seq_len > 32.**
-
----
-
-### ✅ Milestone 2.0: Memory Architecture Refactor
-- **Status**: PROVEN (Jan 2026)
-- **Description**: Switch from flat_load to buffer_load→LDS pattern
-- **Key Finding**: **MFMA output layout must be decoded correctly for store!**
-  - Discovered via `decode_mfma_layout.py`
-  - Output S[row,col] mapping:
-    ```
-    col = tid % 32
-    row = ((vreg-32) % 4) + (tid//32)*4 + ((vreg-32)//4)*8
-    ```
-- **Test files**:
-  - `test_buffer_lds.s/py`: Basic buffer_load→LDS roundtrip ✓
-  - `test_qk_fixed.s/py`: QK MFMA with buffer_load + correct store ✓
-  - `decode_mfma_layout.py`: Automated MFMA output layout analysis
-- **Implementation proven**:
-  1. Buffer descriptor setup: `s[8:11]` with `s[11]=0x20000`
-  2. Async load: `buffer_load_dwordx4 v_offset, s[8:11], 0 offen lds`
-  3. LDS read: `ds_read_b64` with calculated offsets
-  4. **Correct store**: Use decoded row/col mapping
-- **Will integrate fully for HD=128 (Milestone 2.2)**
-
-### ⬜ Milestone 2.1: Online Softmax (Single K-tile)
-- **Status**: PENDING
-- **Description**: Implement Flash Attention's online softmax algorithm
-- **Algorithm**:
-  ```
-  // Initialize
-  m = -inf (running max per row)
-  l = 0    (running sum per row)
-  O = 0    (accumulator)
-  
-  // For each K-tile:
-  S_tile = Q @ K_tile^T
-  m_new = max(m, rowmax(S_tile))
-  P_tile = exp((S_tile - m_new) * log2e)
-  correction = exp((m - m_new) * log2e)
-  l = l * correction + rowsum(P_tile)
-  O = O * correction + P_tile @ V_tile
-  m = m_new
-  
-  // Final normalization
-  O = O / l
-  ```
-- **Key registers**:
-  - `v_m[0:15]`: Running max per row (16 rows per thread group)
-  - `v_l[0:15]`: Running sum per row
-  - `v_O[0:63]`: Accumulated output (4 D-tiles for HD=128)
-- **Reference**: BF16 kernel lines 911-914 show the pattern
-
-### ⬜ Milestone 2.2: QK for HD=128
-- **Status**: PENDING
-- **Description**: Q[32×128] @ K^T[128×32] → S[32×32]
-- **Implementation**:
-  - 8 MFMA passes (128/16 = 8) instead of 2
-  - S stays in v[32:47] (same as Phase 1)
-
-### ⬜ Milestone 2.3: PV for HD=128
-- **Status**: PENDING
-- **Description**: P[32×32] @ V[32×128] → O[32×128]
-- **Implementation**:
-  - 4 D-tiles, 8 MFMA passes per D-tile
-  - Must integrate with online softmax (rescale O before adding)
-
-### ⬜ Milestone 2.4: Add Scaling
-- **Status**: PENDING
-- **Description**: S = S * scale before softmax (1/sqrt(d))
-- **Implementation**: `v_mul_f32` with scale from kernel args
-
----
-
-## Phase 3: Multi-Tile K-loop
-
-### ⬜ Milestone 3.1: K-tile Loop Structure
-- **Status**: PENDING
-- **Description**: Handle seq_len > 32 with tiled K/V loading
-- **Implementation**:
-  ```
-  for k_tile in range(0, seq_len, 32):
-      load K[k_tile:k_tile+32], V[k_tile:k_tile+32] to LDS
-      S_tile = Q @ K_tile^T
-      online_softmax_update(S_tile, m, l, O)
-  O = O / l  // Final normalization
-  ```
-- **Memory pattern**: Double-buffer K/V to hide latency
-
-### ⬜ Milestone 3.2: Workgroup Indexing
-- **Status**: PENDING
-- **Description**: Map workgroup IDs to batch/head/Q-tile indices
-- **Reference**: BF16 kernel argument parsing
-
-### ⬜ Milestone 3.3: Cross-wavefront Reduction
-- **Status**: PENDING
-- **Description**: Use `v_permlane32_swap` for 64-thread reductions
-- **Reference**: BF16 kernel lines 547, 731, 910, etc.
-
----
-
-## Phase 4: Optimization
-
-### ⬜ Milestone 4.1: Double Buffering
-- **Description**: Prefetch next K/V tile while computing current
-- **Target**: Hide global memory latency
-- **Note**: Requires buffer_load→LDS from Milestone 2.0
-
-### ⬜ Milestone 4.2: LDS Bank Conflict Optimization
-- **Description**: Optimize LDS layout to minimize bank conflicts
-- **Target**: Maximize LDS bandwidth utilization
-
-### ⬜ Milestone 4.3: Instruction Scheduling
-- **Description**: Interleave MFMA with softmax and memory ops (like BF16)
-- **Reference**: BF16 lines 432-448 show MFMA + buffer_load interleaving
-- **Target**: Maximize ALU utilization while hiding memory latency
-
----
-
-## Phase 5: Benchmark & Ship
-
-### ⬜ Milestone 5.1: Numerical Validation
-- **Command**: `python test_integrated.py`
-- **Criteria**: Match PyTorch reference within FP8 precision
-
-### ⬜ Milestone 5.2: Performance Benchmark
-- **Command**: `python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 32130`
-- **Target**: > 1300 TF/s (30% above BF16's ~1000 TF/s)
-
-### ⬜ Milestone 5.3: Integration
-- **Description**: Register kernel in aiter package
-- **Deliverable**: Production-ready FP8 flash attention
-
----
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `hsa/gfx950/fmha_v3_fwd_fp8/fwd_fp8_integrated.s` | Main kernel (evolving) |
-| `hsa/gfx950/fmha_v3_fwd_fp8/test_integrated.py` | Rigorous test harness |
-| `hsa/gfx950/fmha_v3_fwd/fwd_hd128_bf16.s` | BF16 reference (disassembled) |
-| `.lessons` | Critical lessons learned |
-| `.milestone` | This file - progress tracking |
-
----
-
-## Critical Lessons (Summary)
-
-1. **FP8 Format**: Use `e4m3fn` (OCP), NOT `e4m3fnuz` - wrong format causes 2× error
-2. **P Redistribution**: QK output is transposed relative to PV input - must use LDS
-3. **MFMA Output**: Interleaved row pattern, not contiguous
-4. **Transcendentals**: `s_nop 7` required after `v_exp_f32` and `v_rcp_f32`
-5. **ELF Format**: Must link `.o` → `.co` (not just compile) for HIP to load
-
----
-
-## Current Focus
-
-**Phase 1**: ✅ COMPLETE - Single-tile HD=32 with standard softmax works
-**Milestone 2.0**: ✅ COMPLETE - buffer_load→LDS pattern proven with correct store
-
-**REORDERED PLAN** (based on BF16 ASM analysis):
-
-**Next Step**: Milestone 2.2 - HD=128 with Standard Softmax (PLACEHOLDER)
-- Scale QK from 2 to 8 MFMA passes (D=128, each covers 16)
-- Use standard softmax (OK for single K-tile, S=32)
-- Scale PV from 2 to 8 MFMA passes
-- Integrate buffer_load→LDS pattern
-- **Goal**: Measure real FP8 TF/s at production head_dim
-
-**Why HD=128 first?**
-1. HD=128 is orthogonal to softmax type
-2. Standard softmax works for single K-tile (S=32)
-3. Enables TF/s measurement before loop complexity
-4. Online softmax only needed when K-loop is added
-
-**After HD=128**: Milestone 2.1 - Online Softmax
-- Required only when implementing K-tile loop (seq_len > 32)
-- Implement running max/sum tracking
-- Add output rescaling on max change
-
-**Reference**: See `.comp` for BF16 comparison, `.scale` for scaling issues

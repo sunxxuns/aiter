@@ -1,288 +1,64 @@
-# FP8 Flash Attention Benchmark Guide
+# FP8 Flash Attention - Performance Benchmarks
 
-## Overview
-
-This document provides benchmarking procedures for the FP8 flash attention assembly kernel,
-comparing against the **production BF16 ASM kernel** for fair comparison.
-
----
-
-## Current Capability
-
-| Parameter | FP8 Kernel | BF16 ASM Kernel |
-|-----------|------------|-----------------|
-| head_dim  | 32 ✅, **128 QK ✅** | 128 only |
-| seq_len   | 32 (Phase 1) | variable |
-| batch     | 1 | variable |
-| heads     | 1 | variable |
-| Memory    | buffer_load→LDS ✅ | buffer_load→LDS |
-
-**Progress**: HD=128 QK MFMA verified (8 passes, max_err=0.00007)
-
----
-
-## BF16 ASM Baseline Benchmark
-
-### Run BF16 ASM Kernel
+## Benchmark Command
 
 ```bash
-# Production benchmark command
-python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 32130
-
-# Smaller shapes for development testing
-python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 1024
+# BF16 baseline (reference)
 python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 4096
-```
 
-### BF16 ASM Measured Results (Jan 2026)
-
-| Shape (B×S×H×D) | Time (ms) | TF/s | Peak % |
-|-----------------|-----------|------|--------|
-| 1×1024×40×128 | 0.054 | 396 | 16.5% |
-| 1×4096×40×128 | 0.440 | 781 | 32.5% |
-| 1×8192×40×128 | 1.402 | 980 | 40.8% |
-| 1×32130×40×128 | ~20 | ~1000 | ~42% |
-
-**Observation**: TF/s increases with seq_len (more compute per kernel launch)
-
-### Record Your BF16 Baseline
-
-```bash
-python3 << 'EOF'
-"""BF16 ASM Baseline - Record for FP8 comparison"""
-import subprocess
-import sys
-
-print("=" * 70)
-print("BF16 ASM BASELINE BENCHMARK")
-print("=" * 70)
-
-for seq_len in [1024, 4096, 8192]:
-    print(f"\n--- SeqLen = {seq_len} ---")
-    result = subprocess.run([
-        sys.executable,
-        "/sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py",
-        "--seq-len", str(seq_len),
-        "--warmup", "5",
-        "--iters", "20"
-    ], capture_output=True, text=True)
-    
-    for line in result.stdout.split('\n'):
-        if 'TFLOPS' in line or 'Time:' in line:
-            print(f"  {line.strip()}")
-
-print("\n" + "=" * 70)
-print("Record these as FP8 targets (expect 30%+ improvement)")
-print("=" * 70)
-EOF
+# FP8 kernel (when K-loop implemented)
+cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
+python bench_fp8_attention.py
 ```
 
 ---
 
-## FP8 vs BF16 Theoretical Advantage
+## Target Performance
 
-### Why FP8 Should Be Faster
-
-| Factor | BF16 | FP8 | FP8 Advantage |
-|--------|------|-----|---------------|
-| Data size | 2 bytes | 1 byte | 2× less memory |
-| MFMA throughput | 1× | 2× | 2× compute |
-| Memory BW | 1× | 2× effective | 2× bandwidth |
-
-**Theoretical speedup: 1.5-2×** (depends on compute vs memory bound)
-
-### Target Performance
-
-| Metric | BF16 ASM | FP8 Target | Improvement |
-|--------|----------|------------|-------------|
-| TF/s @ 32130 | ~1000 | >1300 | +30% minimum |
-| TF/s @ 4096 | ~380 | >500 | +30% minimum |
+| Seq Len | BF16 TF/s | FP8 Target | Speedup |
+|---------|-----------|------------|---------|
+| 1024 | ~400 | >520 | >30% |
+| 4096 | ~780 | >1000 | >30% |
+| 32130 | ~1000 | >1300 | >30% |
 
 ---
 
-## FP8 ASM Current Results
+## Current Status
 
-### Phase 1: HD=32, S=32 (Single Tile)
-
-```bash
-cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
-# Run benchmark
-python3 -c "
-import torch, subprocess, ctypes, time
-subprocess.run(['/opt/rocm/llvm/bin/clang++', '-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcpu=gfx950', '-mwavefrontsize64', '-c', 'fwd_fp8_integrated.s', '-o', 'fwd_fp8_integrated.o'], check=True, capture_output=True)
-subprocess.run(['/opt/rocm/llvm/bin/clang++', '-target', 'amdgcn-amd-amdhsa', '-mcpu=gfx950', '-mwavefrontsize64', 'fwd_fp8_integrated.o', '-o', 'fwd_fp8_integrated.co'], check=True, capture_output=True)
-hip = ctypes.CDLL('libamdhip64.so')
-mod = ctypes.c_void_p(); hip.hipModuleLoad(ctypes.byref(mod), b'fwd_fp8_integrated.co')
-func = ctypes.c_void_p(); hip.hipModuleGetFunction(ctypes.byref(func), mod, b'_ZN5aiter17fwd_fp8_integratedE')
-Q = (torch.randn(32, 32) * 0.3).to(torch.float8_e4m3fn).view(torch.uint8).cuda()
-K = (torch.randn(32, 32) * 0.3).to(torch.float8_e4m3fn).view(torch.uint8).cuda()
-V = (torch.randn(32, 32) * 0.5).to(torch.float8_e4m3fn).view(torch.uint8).cuda()
-O = torch.zeros(32, 32, dtype=torch.float32, device='cuda')
-args = (ctypes.c_void_p * 4)(ctypes.cast(ctypes.pointer(ctypes.c_uint64(O.data_ptr())), ctypes.c_void_p), ctypes.cast(ctypes.pointer(ctypes.c_uint64(Q.data_ptr())), ctypes.c_void_p), ctypes.cast(ctypes.pointer(ctypes.c_uint64(K.data_ptr())), ctypes.c_void_p), ctypes.cast(ctypes.pointer(ctypes.c_uint64(V.data_ptr())), ctypes.c_void_p))
-for _ in range(100): hip.hipModuleLaunchKernel(func, 1, 1, 1, 64, 1, 1, 4096, None, args, None)
-hip.hipDeviceSynchronize()
-iters = 10000; start = time.perf_counter()
-for _ in range(iters): hip.hipModuleLaunchKernel(func, 1, 1, 1, 64, 1, 1, 4096, None, args, None)
-hip.hipDeviceSynchronize(); total = time.perf_counter() - start
-print(f'FP8 HD=32 S=32: {(total/iters)*1e6:.2f} μs, {4*32*32*32*iters/total/1e9:.3f} GFLOP/s')
-hip.hipModuleUnload(mod)
-"
-```
-
-### FP8 Phase 1 Measured Results (Jan 2026)
-
-| Shape (S×D) | Time (μs) | GFLOP/s | TF/s | Notes |
-|-------------|-----------|---------|------|-------|
-| 32×32 | 7.58 | 17.3 | 0.017 | Launch overhead dominated |
-
-**Why so low?**
-- Kernel launch overhead (~5-10 μs) dominates tiny 32×32 shape
-- Only 131K FLOPs per call - not enough to amortize overhead
-- BF16 ASM at 1024×128 has 21M FLOPs - 160× more work
-
-**Extrapolation** (when HD=128 + K-loop implemented):
-- If kernel efficiency scales, FP8 should reach >1300 TF/s at production shapes
-- FP8 has 2× MFMA throughput + 2× memory efficiency
+| Metric | Value |
+|--------|-------|
+| Shape | 32×128 (single tile) |
+| Correctness | ✅ All tests pass |
+| K-loop | ⬜ Not implemented |
+| Benchmark | ⬜ Pending K-loop |
 
 ---
 
-## Phase-by-Phase Benchmarking
+## Compute Analysis
 
-### Phase 1: HD=32 (Current) - NOT DIRECTLY COMPARABLE
+### FP8 vs BF16 MFMA Throughput
 
-BF16 ASM only supports HD=128, so Phase 1 FP8 (HD=32) cannot be directly compared.
-Use Phase 1 for **numerical correctness only**:
+| Instruction | Throughput (ops/cycle) |
+|-------------|------------------------|
+| v_mfma_f32_32x32x16_bf16 | 512 |
+| v_mfma_f32_32x32x16_fp8_fp8 | 1024 |
 
-```bash
-cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
-python test_integrated.py  # Correctness test, not benchmark
-```
+FP8 has 2× MFMA throughput → theoretical 2× speedup.
+Practical target: 30-50% due to memory/LDS overhead.
 
-### Phase 2.2: HD=128 - FIRST COMPARABLE BENCHMARK (IN PROGRESS)
+### Memory Bandwidth
 
-Once HD=128 is implemented (current work):
-
-```bash
-# FP8 kernel at HD=128, S=32
-cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
-python test_fp8_hd128.py  # Numerical + timing
-
-# Compare to BF16 baseline at similar compute
-# Note: BF16 uses larger seq_len to get comparable FLOPs
-python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 1024
-```
-
-**Expected FP8 HD=128 S=32 metrics**:
-- FLOPs: 4 × 32 × 32 × 128 = 524K (vs 131K for HD=32)
-- Target time: ~10 μs (kernel overhead still significant)
-- TF/s: Will be low due to small shape, but validates HD=128 correctness
-
-### Phase 5: Production - FINAL BENCHMARK
-
-```bash
-# Target: >1300 TF/s (vs BF16 ~1000 TF/s)
-python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 32130
-```
-
----
-
-## Milestone 2.0: Memory Architecture (Proven)
-
-### buffer_load→LDS Pattern Verified (HD=32)
-
-```bash
-cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
-python test_qk_fixed.py   # buffer_load→LDS QK MFMA HD=32
-```
-
-**Results**: Max error 0.000137, pattern matches BF16 ASM
-
----
-
-## Milestone 2.2: HD=128 QK MFMA (Proven)
-
-### 8-Pass QK MFMA Verified
-
-```bash
-cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
-python test_qk_hd128.py   # S[32×32] = Q[32×128] @ K^T[128×32]
-```
-
-**Results (Jan 2026)**:
-| Seed | Max Error | Status |
+| Data | Size/tile | Access |
 |------|-----------|--------|
-| 0 | 0.000046 | ✅ PASS |
-| 1 | 0.000053 | ✅ PASS |
-| 2 | 0.000061 | ✅ PASS |
-| 3 | 0.000046 | ✅ PASS |
-| 4 | 0.000053 | ✅ PASS |
-
-**Key Implementation**:
-```assembly
-# 4KB load with 4 wavefront passes
-v_lshlrev_b32_e32 v1, 4, v0        # voffset = tid * 16
-s_mov_b32 s20, 0                    # soffset must be SGPR
-buffer_load_dwordx4 v1, s[8:11], s20 offen lds
-# ... m0 and s20 advance by 1024 each pass
-
-# MFMA read: row * 128 + half * 8 + pass * 16
-```
-
-**Remaining for full HD=128**: Softmax + PV MFMA (8 passes)
-
-**MFMA Output Layout** (same for HD=32 and HD=128):
-```
-col = tid % 32
-row = ((vreg-32) % 4) + (tid//32)*4 + ((vreg-32)//4)*8
-```
+| Q | 32×128×1B = 4KB | Once, reused across K-tiles |
+| K | 32×128×1B = 4KB | Once per K-tile |
+| V | 32×128×1B = 4KB | Once per K-tile |
+| O | 32×128×4B = 16KB | Write once |
 
 ---
 
-## TF/s Calculation
+## Next Steps
 
-```python
-# FLOPs for attention
-FLOPs = 4 * B * H * S * S * D
-
-# Example: B=1, H=40, S=32130, D=128
-FLOPs = 4 * 1 * 40 * 32130 * 32130 * 128 = 21.2e15
-
-# TF/s = FLOPs / time_seconds / 1e12
-# At 1000 TF/s: time = 21.2 seconds
-```
-
----
-
-## Profiling Commands
-
-### ROCm Profiler
-
-```bash
-# Profile kernel
-rocprof --stats python3 test_integrated.py
-
-# Detailed trace
-rocprof --hip-trace python3 test_integrated.py
-```
-
-### Key Metrics
-
-1. **Kernel execution time** (μs)
-2. **MFMA utilization** (%)
-3. **LDS bandwidth** (GB/s)
-4. **Global memory bandwidth** (GB/s)
-
----
-
-## Benchmark Validation Checklist
-
-Before claiming a performance result:
-
-- [ ] Numerical accuracy verified (see `.numerics`)
-- [ ] Warmup iterations completed (≥10)
-- [ ] Multiple iterations averaged (≥100)
-- [ ] Standard deviation < 10% of mean
-- [ ] No NaN/Inf in output
-- [ ] **Compare against BF16 ASM, not PyTorch**
-- [ ] **Same shape (B, S, H, D) for both kernels**
-- [ ] Report both time (ms) and TF/s
+1. Implement K-tile loop (seq > 32)
+2. Run `bench_mi350_fmha_asm.py` with FP8 kernel
+3. Profile with rocprof for bottleneck analysis
