@@ -1,0 +1,283 @@
+# FP8 Flash Attention Scaling Issues Tracker
+
+## Overview
+
+This document tracks scaling-related issues that must be resolved to go from
+Phase 1 (HD=32, S=32) to production (HD=128, S=32130).
+
+---
+
+## Scaling Dimensions
+
+| Dimension | Current | Target | Scaling Factor | Status |
+|-----------|---------|--------|----------------|--------|
+| head_dim | 32 | 128 | 4× | ⬜ Phase 2.2 |
+| seq_len | 32 | 32130 | ~1000× | ⬜ Phase 3 |
+| batch | 1 | 1+ | variable | ⬜ Phase 4 |
+| heads | 1 | 40 | 40× | ⬜ Phase 4 |
+
+---
+
+## CRITICAL SCALING ISSUES
+
+### 1. Memory Architecture ✅ SOLVED
+
+**Issue**: `flat_load` doesn't scale
+- flat_load requires explicit per-thread address calculation
+- Not efficient for large tensors with complex access patterns
+- BF16 ASM uses `buffer_load→LDS` for scalability
+
+**Solution**: Implemented `buffer_load_dwordx4 ... lds` pattern
+- Proven in `test_qk_fixed.s`
+- Async global→LDS transfer
+- Buffer descriptor handles address calculation
+
+**Files**:
+- `test_qk_fixed.s` - working implementation
+- `.comp` Section 3 - detailed comparison
+
+---
+
+### 2. Online Softmax ⬜ DEFERRED (Phase 2.1)
+
+**Issue**: Standard softmax doesn't scale to large seq_len
+- Current: `P = softmax(S)` requires full S matrix in memory
+- Memory: O(S²) - impossible for S=32130
+- BF16 ASM uses online softmax with running max/sum
+
+**Status**: DEFERRED until K-tile loop implementation
+- Standard softmax works for single K-tile (S=32)
+- HD=128 can be tested with standard softmax
+- Online softmax only needed when seq_len > 32
+
+**Required Changes** (for Phase 3):
+```
+// Current (Standard) - S=32 only
+max_row = max(S[row,:])
+sum_row = sum(exp(S[row,:] - max_row))
+P[row,:] = exp(S[row,:] - max_row) / sum_row
+
+// Needed (Online) - scales to any S
+for each K-tile:
+    S_tile = Q @ K_tile^T
+    new_max = max(old_max, max(S_tile))
+    correction = exp(old_max - new_max)
+    old_sum = old_sum * correction
+    P_tile = exp(S_tile - new_max)
+    new_sum = old_sum + sum(P_tile)
+    O = O * correction + P_tile @ V_tile
+```
+
+**Impact**: Cannot process seq_len > 32 without this
+
+**Reference**: BF16 ASM `fwd_hd128_bf16.s` lines with `v_max_f32`, running sum
+
+---
+
+### 3. K-tile Loop ❌ MISSING (Phase 3)
+
+**Issue**: No loop over K/V tiles
+- Current: Single 32×32 tile
+- Needed: Loop over ceil(seq_len/32) tiles
+
+**Required Structure**:
+```assembly
+// Pseudo-code
+s_mov_b32 s_k_tiles, (seq_len + 31) / 32
+s_mov_b32 s_k_idx, 0
+
+LOOP_K:
+    // Load K_tile, V_tile
+    // Compute S_tile = Q @ K_tile^T
+    // Online softmax update
+    // Accumulate O += P_tile @ V_tile
+    
+    s_add_u32 s_k_idx, s_k_idx, 1
+    s_cmp_lt_u32 s_k_idx, s_k_tiles
+    s_cbranch_scc1 LOOP_K
+```
+
+**Dependencies**: Requires online softmax first
+
+---
+
+### 4. HD=128 Scaling 🔄 IN PROGRESS (Phase 2.2) - CURRENT FOCUS
+
+**QK MFMA HD=128**: ✅ VERIFIED (max_err=0.00007)
+- 8 MFMA passes accumulating into S[32×32]
+- buffer_load→LDS with correct soffset pattern
+- Test: `test_qk_hd128.py`
+
+**Remaining**:
+- PV: 8 passes (output dimension: 128/16 = 8)
+
+**MFMA Passes for HD=128**:
+```
+QK MFMA (S = Q @ K^T):
+  - Q is 32×128, K is 32×128, S is 32×32
+  - MFMA 32×32×16 covers 16 elements of K-dim
+  - Need 128/16 = 8 MFMA calls, accumulating into same S[32×32]
+  
+PV MFMA (O = P @ V):
+  - P is 32×32, V is 32×128, O is 32×128
+  - MFMA 32×32×16: P[32×32] @ V_tile[32×16] → O_tile[32×16]
+  - Need 128/16 = 8 MFMA calls for full O[32×128]
+```
+
+**Register Allocation**:
+- S matrix: 16 VGPRs (32×32 F32 output, same as HD=32)
+- O matrix: 16 VGPRs × 8 tiles = 128 VGPRs? No - compute 1 tile at a time, store, reuse
+- Actually: S=16, O_tile=16, temps~20 = ~52 VGPRs (manageable)
+
+**LDS Requirements**:
+- HD=32: Q(1KB) + K(1KB) = 2KB
+- HD=128: Q(4KB) + K(4KB) + V(4KB) = 12KB (fits in 64KB LDS)
+
+**Implementation Plan**:
+1. Load Q[32×128] to LDS (4KB)
+2. Load K[32×128] to LDS (4KB)
+3. QK: 8 MFMA passes → S[32×32] in VGPRs
+4. Softmax S → P (standard, in VGPRs)
+5. P redistribution via LDS
+6. For each output tile (8 tiles):
+   a. Load V_tile[32×16] to LDS
+   b. PV MFMA: P @ V_tile → O_tile
+   c. Store O_tile to global
+
+---
+
+### 5. Output Rescaling ❌ MISSING (Part of Online Softmax)
+
+**Issue**: When max changes, previous output must be rescaled
+- O_new = O_old * exp(max_old - max_new) + P_new @ V
+- Requires tracking per-row max values
+- Must apply correction before accumulating new tile
+
+**Register Requirements**:
+- `v_max[0:31]` - per-row running max (32 VGPRs, one per row)
+- `v_sum[0:31]` - per-row running sum (32 VGPRs)
+- Or use fewer with cross-thread sharing
+
+---
+
+### 6. Scaling Factor ⬜ PENDING (Phase 2.4)
+
+**Issue**: Attention needs 1/sqrt(d) scaling
+- Current: No scaling applied
+- Needed: S = (Q @ K^T) / sqrt(head_dim)
+
+**Implementation Options**:
+1. Pre-scale Q by 1/sqrt(d) before kernel
+2. Scale S after QK MFMA: `v_mul_f32 s[i], s[i], scale`
+3. Fuse into softmax: adjust max by log(scale)
+
+**Recommendation**: Option 2 (simplest, matches BF16 ASM)
+
+---
+
+## SCALING ROADMAP (REORDERED)
+
+```
+Phase 1 (DONE): HD=32, S=32
+    ↓
+Phase 2.0 (DONE): buffer_load→LDS proven
+    ↓
+Phase 2.2: HD=128 + buffer_load (CURRENT) ← Standard softmax OK for S=32
+    ↓
+Phase 2.4: Add 1/sqrt(d) scaling
+    ↓
+Phase 2.1: Online softmax ← Only needed for K-loop
+    ↓
+Phase 3: K-tile loop (seq_len scaling)
+    ↓
+Phase 4: Multi-batch, multi-head
+    ↓
+Phase 5: Optimization & ship
+```
+
+**Why reorder?**
+- HD=128 is orthogonal to softmax type
+- Standard softmax works for single K-tile (S=32)
+- Can measure real TF/s at production head_dim
+- Online softmax complexity deferred until needed
+
+---
+
+## RESOURCE SCALING
+
+### LDS Usage
+
+| Phase | Q | K | V | P | Total |
+|-------|---|---|---|---|-------|
+| HD=32, S=32 | 1KB | 1KB | 1KB | 4KB | 7KB |
+| HD=128, S=32 | 4KB | 4KB | 4KB | 4KB | 16KB |
+| HD=128, S=32 (tiled) | 4KB | 4KB | 4KB | 4KB | 16KB |
+
+*Note: P is 32×32 F32 = 4KB regardless of HD*
+
+### VGPR Usage
+
+| Component | HD=32 | HD=128 |
+|-----------|-------|--------|
+| S accumulator | 16 | 16 (same, 32×32 output) |
+| O accumulator | 16 | 64 (32×128 output) |
+| MFMA inputs | 4 | 4 |
+| Softmax temps | 8 | 8 |
+| Addresses | 8 | 8 |
+| **Total** | ~52 | ~100 |
+
+*gfx950 has 256 VGPRs per thread - sufficient*
+
+### SGPR Usage
+
+| Component | Count |
+|-----------|-------|
+| Pointers (Q,K,V,O) | 8 |
+| Buffer descriptors | 16 |
+| Loop counters | 4 |
+| Constants | 8 |
+| **Total** | ~36 |
+
+*gfx950 has 108 SGPRs per wavefront - sufficient*
+
+---
+
+## PERFORMANCE SCALING EXPECTATIONS
+
+| Shape | FLOPs | Expected Time | Expected TF/s |
+|-------|-------|---------------|---------------|
+| HD=32, S=32 | 131K | 7.6μs | 0.017 (overhead) |
+| HD=128, S=32 | 2.1M | ~10μs | ~0.2 |
+| HD=128, S=1024 | 2.1B | ~2ms | ~1000 |
+| HD=128, S=32130 | 21T | ~16ms | ~1300 |
+
+*FP8 target: 30%+ over BF16 ASM (~1000 TF/s)*
+
+---
+
+## FILES TO WATCH
+
+| File | Scaling Relevance |
+|------|-------------------|
+| `fwd_fp8_integrated.s` | Current HD=32 kernel |
+| `test_qk_fixed.s` | buffer_load pattern template |
+| `fwd_hd128_bf16.s` | Reference for online softmax, K-loop |
+| `.comp` | BF16 vs FP8 comparison |
+| `.milestone` | Phase tracking |
+
+---
+
+## NEXT ACTION
+
+**Milestone 2.2: HD=128 with Standard Softmax**
+1. Create `fwd_fp8_hd128.s` kernel
+2. Implement 8× QK MFMA passes with buffer_load→LDS
+3. Use existing standard softmax (works for S=32)
+4. Implement 8× PV MFMA passes
+5. Test numerical accuracy
+6. Benchmark TF/s at HD=128
+
+**Key Reference**:
+- BF16 ASM lines 450-456: 8 consecutive MFMA accumulating into v[48:63]
+- Buffer descriptor setup from `test_qk_fixed.s`
+- MFMA output layout from `.lessons`

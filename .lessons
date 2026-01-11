@@ -154,3 +154,159 @@ hsa/gfx950/fmha_v3_fwd_fp8/
 ├── test_mfma_layouts.py    # Python reference patterns
 └── .progress               # Development progress tracking
 ```
+
+---
+
+### 7. v_cvt_pk_fp8_f32 Leaves Garbage in High 16 Bits
+
+**THE BUG**: `v_cvt_pk_fp8_f32 v_dst, v_src0, v_src1` only writes to the low 16 bits. The high 16 bits contain undefined garbage!
+
+**Symptom**: NaN outputs from MFMA when using converted FP8 values
+
+**Fix**: Always mask after conversion before combining:
+```assembly
+v_cvt_pk_fp8_f32 v72, v64, v65        // Low 16 bits = valid FP8
+v_and_b32_e32 v72, 0xFFFF, v72        // REQUIRED: Clear garbage
+v_cvt_pk_fp8_f32 v73, v66, v67
+v_lshlrev_b32_e32 v73, 16, v73        // Shift to high 16 bits
+v_or_b32_e32 v20, v72, v73            // Safe to combine now
+```
+
+**Without mask**: The garbage in v72's high bits gets OR'd with the shifted data.
+
+---
+
+### 8. MFMA Output Layout - DECODED
+
+**For v_mfma_f32_32x32x16_fp8_fp8, the output S[row, col] maps to:**
+
+```
+Thread tid, VGPR v:
+  col = tid % 32
+  row = ((v - 32) % 4) + ((tid // 32) * 4) + ((v - 32) // 4) * 8
+```
+
+**Visual Layout (first 16 rows):**
+```
+row  | col 0-7 threads            | vreg
+-----|----------------------------|------
+0-3  | threads 0-7 (tid//32=0)    | v32-v35
+4-7  | threads 32-39 (tid//32=1)  | v32-v35  
+8-11 | threads 0-7 (tid//32=0)    | v36-v39
+12-15| threads 32-39 (tid//32=1)  | v36-v39
+16-19| threads 0-7                | v40-v43
+20-23| threads 32-39              | v40-v43
+24-27| threads 0-7                | v44-v47
+28-31| threads 32-39              | v44-v47
+```
+
+**CORRECT Store Pattern:**
+```assembly
+// col = tid % 32, row_half = tid // 32
+.macro STORE_VREG vreg, row_mod4, row_8_group
+    v_mov_b32_e32 v7, \row_mod4
+    v_add_u32_e32 v7, v7, v_row_half_x4   // + (tid//32)*4
+    v_add_u32_e32 v7, \row_8_group * 8, v7
+    v_lshlrev_b32_e32 v7, 5, v7           // row * 32
+    v_add_u32_e32 v7, v7, v_col           // + col
+    v_lshlrev_b32_e32 v7, 2, v7           // × 4 (byte offset)
+    flat_store_dword [ptr_S + v7], vreg
+.endm
+```
+
+---
+
+### 9. buffer_load→LDS Pattern (Scalable Memory)
+
+**buffer_load_dwordx4 ... lds** writes directly to LDS, bypassing VGPRs:
+
+```assembly
+// Setup buffer descriptor s[8:11]
+// s[8:9] = base addr, s[10] = size, s[11] = 0x20000 (flags)
+s_mov_b32 s11, 0x20000
+
+// Each thread loads 16 bytes from buffer[voffset] to LDS[m0 + tid*16]
+v_lshlrev_b32_e32 v1, 4, v0     // voffset = tid * 16
+s_mov_b32 m0, LDS_BASE
+buffer_load_dwordx4 v1, s[8:11], 0 offen lds
+
+// 64 threads × 16 bytes = 1024 bytes loaded in ONE instruction
+s_waitcnt vmcnt(0)
+s_barrier
+
+// Read from LDS to VGPRs for MFMA
+ds_read_b64 v[20:21], v_lds_addr
+```
+
+**Advantages over flat_load:**
+- Asynchronous (overlaps with compute)
+- Shared loading (one wavefront loads for all threads)
+- Hardware addressing (no VGPR address calculation)
+- Double-buffer ready
+
+---
+
+### 10. HD=128 Loading: Multiple buffer_load with soffset
+
+For Q[32×128] = 4KB, need 4 wavefront loads (each 1KB):
+
+```assembly
+// Setup: voffset fixed at tid*16, use soffset to advance global address
+v_lshlrev_b32_e32 v1, 4, v0    // voffset = tid * 16 (fixed)
+
+// Load 0: global[0:1024] → LDS[0:1024]
+s_mov_b32 m0, 0
+s_mov_b32 s20, 0
+buffer_load_dwordx4 v1, s[8:11], s20 offen lds
+
+// Load 1: global[1024:2048] → LDS[1024:2048]
+s_mov_b32 m0, 1024
+s_mov_b32 s20, 1024
+buffer_load_dwordx4 v1, s[8:11], s20 offen lds
+
+// Load 2: global[2048:3072] → LDS[2048:3072]
+s_mov_b32 m0, 2048
+s_mov_b32 s20, 2048
+buffer_load_dwordx4 v1, s[8:11], s20 offen lds
+
+// Load 3: global[3072:4096] → LDS[3072:4096]
+s_mov_b32 m0, 3072
+s_mov_b32 s20, 3072
+buffer_load_dwordx4 v1, s[8:11], s20 offen lds
+```
+
+**Key insight**: soffset must be an SGPR, not an immediate constant!
+
+**Result**: Row-major Q[32×128] contiguously in LDS[0:4096]
+
+---
+
+### 11. QK MFMA for HD=128: 8 Passes with Correct Addressing
+
+For S = Q @ K^T with Q[32×128], K[32×128], S[32×32]:
+
+```assembly
+// Thread mapping: row = tid % 32, half = tid / 32
+v_and_b32_e32 v2, 31, v0              // row = tid % 32
+v_lshrrev_b32_e32 v3, 5, v0           // half = tid / 32
+
+// Q base offset: row * 128 (row stride) + half * 8 (k sub-offset)
+v_lshlrev_b32_e32 v5, 7, v2           // row * 128
+v_lshlrev_b32_e32 v4, 3, v3           // half * 8
+v_add_u32_e32 v5, v5, v4              // Q base
+
+// K base offset: same pattern, at LDS offset 4096
+v_add_u32_e32 v6, 4096, v5
+
+// 8 MFMA passes, advancing by 16 bytes each (16 FP8 = one K-chunk)
+ds_read_b64 v[20:21], v5              // Q[row, 0:8] or Q[row, 8:16]
+ds_read_b64 v[22:23], v6              // K[row, 0:8] or K[row, 8:16]
+v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[0:1], v[22:23], v[32:47]
+
+v_add_u32 v7, 16, v5                  // next k-chunk
+v_add_u32 v8, 16, v6
+// ... repeat for 8 total passes
+```
+
+**Tested**: max_err = 0.00007 (test_qk_hd128.py)
+
