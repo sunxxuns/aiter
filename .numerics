@@ -1,67 +1,58 @@
-# FP8 Flash Attention - Numerical Validation
+# FP8 Flash Attention - Numerics
 
-## Test Command
+## Status: Phase 2 Complete ✅
 
-```bash
-cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
-python test_rigorous.py
+### Single-Tile Tests (SEQ=32)
+All 7 rigorous tests passing:
+
+| Test | Max Error | Status |
+|------|-----------|--------|
+| Transformer embeddings | 0.086 | ✅ |
+| Peaked attention | 0.004 | ✅ |
+| Position patterns | 0.005 | ✅ |
+| Numerical edge cases | 0.047 | ✅ |
+| Row/column confusion | 0.000 | ✅ |
+| Accumulation order | 0.000 | ✅ |
+| Specific patterns | 0.006 | ✅ |
+
+### FP8 Precision Characteristics
+- Expected max error: ~0.05-0.1 for normalized inputs
+- Higher error in peaked distributions due to quantization
+- Error comes from `v_cvt_pk_fp8_f32` conversion, not kernel logic
+
+### Verified Behaviors
+1. **Row-wise softmax**: Confirmed via test_softmax_check.py
+2. **S^T = K @ Q^T**: Matches BF16 reference pattern
+3. **P transpose**: Correct reordering for PV MFMA
+
+---
+
+## Phase 3: K-tile Loop (In Progress)
+
+### buffer_load Validation ✅
+Debug kernel verified:
+- `buffer_load_dword v, voff, s[8:11], soff offen` works
+- Scalar offset (soff) can be used for tile advancement
+- Buffer descriptor: s[8:9]=addr, s10=size, s11=0x20000
+
+### Required: `.args` Metadata
+Kernel must include `.args:` section in `.amdgpu_metadata`:
+```yaml
+.args:
+  - {.name: ptr_O, .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global}
+  - {.name: ptr_K, .size: 8, .offset: 8, .value_kind: global_buffer, .address_space: global}
 ```
 
----
-
-## Max Error Results
-
-| Test | Description | Max Error | Threshold | Status |
-|------|-------------|-----------|-----------|--------|
-| Transformer Embeddings | Normalized LayerNorm inputs | 0.086 | 0.10 | ✅ |
-| Peaked Attention | One dominant key per query | 0.004 | 0.05 | ✅ |
-| Position Patterns | Recency bias, start token | 0.005 | 0.05 | ✅ |
-| Numerical Edge Cases | Large magnitudes, alternating | 0.047 | 0.05 | ✅ |
-| Row/Column Confusion | Softmax dimension check | 0.000 | - | ✅ |
-| Accumulation Order | FP ordering sensitivity | 0.000 | 0.10 | ✅ |
-| Specific Patterns | Diagonal, block, copy | 0.006 | 0.05 | ✅ |
+Without this, kernel launch causes memory fault at address (nil).
 
 ---
 
-## Error Analysis
-
-### FP8 Quantization Error Sources
-
-| Source | Typical Max Error |
-|--------|-------------------|
-| Q/K/V input quantization | ~0.12 |
-| P (softmax) quantization | ~0.02 |
-| P sum drift | ~0.02 |
-
-### Why Transformer Embeddings Has 0.086 Error
-
-Row 19 (seed 42) has peaked attention distribution:
-- P[19] max = 0.266 (concentrated attention)
-- After FP8: P sum = 1.016 (1.6% drift)
-- This is inherent FP8 limitation, not kernel bug
-
----
-
-## Quick Validation
+## Test Commands
 
 ```bash
-# Full test (7 scenarios)
+# Main test suite
 python test_rigorous.py
 
-# Quick row-wise check
-python test_softmax_check.py
-
-# Row vs block softmax
-python test_rowwise_softmax.py
+# buffer_load debug
+python debug_bufload.py
 ```
-
----
-
-## Test Files
-
-| File | Purpose |
-|------|---------|
-| `test_rigorous.py` | Full 7-test suite |
-| `test_softmax_check.py` | Quick sanity check |
-| `test_rowwise_softmax.py` | Row-wise verification |
-| `test_transpose_theory.py` | S^T math proof |

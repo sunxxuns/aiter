@@ -1,69 +1,75 @@
-# FP8 Flash Attention - Resource & Scaling
+# FP8 Flash Attention - Scalability Analysis
 
 ## Current Implementation
 
-| Parameter | Value |
-|-----------|-------|
-| Head Dim | 128 |
-| Seq Len | 32 (single tile) |
-| Data Type | FP8 e4m3 input, F32 accum |
+### Resource Usage (test_full_hd128.s)
+- VGPRs: 68 (plenty of headroom)
+- SGPRs: 24
+- LDS: 8192 bytes
+- AGPRs: 4 (for MFMA accumulator)
+
+### Tile Configuration
+- Q tile: 32 queries × 128 head_dim
+- K tile: 32 keys × 128 head_dim
+- V tile: 32 values × 128 head_dim
+- S tile: 32 × 32 attention scores
 
 ---
 
-## Resource Usage
+## Scalability to Long Sequences
 
-### VGPRs (68 / 256)
+### K-tile Loop (Phase 3)
+- Each tile: 32 keys
+- seq_len=32130 → 1005 tiles
+- Must maintain online softmax state across tiles
 
-| Range | Purpose |
-|-------|---------|
-| v0-v19 | Addresses, temps, softmax state |
-| v32-v47 | S/P matrix |
-| v48-v63 | O accumulator |
-| v64-v67 | MFMA operands |
+### Memory Pattern
+```
+Per tile:
+- Load K: 32 × 128 × 1 = 4KB (FP8)
+- Load V: 32 × 128 × 1 = 4KB (FP8)
+- QK MFMA: 32×32 F32 = 4KB
+- PV MFMA: accumulate to O
 
-### SGPRs (24 / 102)
+Total per tile: ~12KB new data + LDS reuse
+```
 
-| Range | Purpose |
-|-------|---------|
-| s0-s1 | Kernel args |
-| s2-s3 | Constants (log2e, -inf) |
-| s4-s23 | Pointers, descriptors |
+### Compute Pattern
+```
+Per tile:
+- QK: 32 × 32 × 128 × 2 = 262K ops (FP8 MFMA)
+- Softmax: 32 × 32 × ~10 = 10K ops (F32)
+- PV: 32 × 128 × 32 × 2 = 262K ops (FP8 MFMA)
 
-### LDS (8KB / 64KB)
-
-| Offset | Size | Content |
-|--------|------|---------|
-| 0x0000 | 4KB | P[32×32] F32 |
-| 0x1000 | 4KB | V[32×128] FP8 |
+Total: ~524K FP8 ops + 10K F32 ops per tile
+```
 
 ---
 
-## Scaling to Longer Sequences
+## Projected Performance
 
-### K-tile Loop Requirements
+### Hardware Limits (gfx950)
+- FP8 MFMA: ~2000 TF/s theoretical peak
+- Memory BW: ~3.2 TB/s HBM
 
-For seq > 32, loop over K in tiles:
-```
-for k_tile in range(0, seq_len, 32):
-    S_tile = K_tile @ Q^T
-    # Online softmax with running max/sum
-    O = O * exp(old_max - new_max) + P_tile @ V_tile
-```
+### Kernel Efficiency
+- BF16 achieves ~1000 TF/s (50% of BF16 peak)
+- FP8 target: 1300 TF/s (~65% of FP8 peak)
 
-### Additional Resources
-
-| Resource | +Required |
-|----------|-----------|
-| VGPRs | +4 (running max/sum) |
-| SGPRs | +5 (loop counter, bounds) |
-| LDS | Same (reuse per tile) |
+### Bottleneck Analysis
+- Short sequences (seq<1024): Memory bound
+- Long sequences (seq>4096): Compute bound
+- Sweet spot: seq=32130 should be compute bound
 
 ---
 
 ## Occupancy
 
-| Metric | Value |
-|--------|-------|
-| VGPRs/wave | 68 |
-| Waves/CU | 4 (limited by VGPRs) |
-| LDS/wave | 8KB |
+### Current (single tile)
+- 1 workgroup × 64 threads
+- Low occupancy acceptable for debugging
+
+### Production Target
+- Multiple Q-blocks per workgroup
+- 4 waves for latency hiding
+- LDS double-buffering for K/V loads

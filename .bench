@@ -1,64 +1,47 @@
-# FP8 Flash Attention - Performance Benchmarks
+# FP8 Flash Attention - Benchmarks
+
+## Status: Phase 2 Correctness Only
+
+Performance benchmarking not yet started.
+Current focus: K-tile loop implementation for seq_len > 32.
+
+---
 
 ## Benchmark Command
 
 ```bash
-# BF16 baseline (reference)
-python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 4096
-
-# FP8 kernel (when K-loop implemented)
-cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
-python bench_fp8_attention.py
+python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 32130
 ```
 
 ---
 
 ## Target Performance
 
-| Seq Len | BF16 TF/s | FP8 Target | Speedup |
-|---------|-----------|------------|---------|
-| 1024 | ~400 | >520 | >30% |
-| 4096 | ~780 | >1000 | >30% |
-| 32130 | ~1000 | >1300 | >30% |
+| Config | BF16 Baseline | FP8 Target | Improvement |
+|--------|---------------|------------|-------------|
+| seq=32130 | ~1000 TF/s | >1300 TF/s | +30% |
 
 ---
 
-## Current Status
+## Current Kernel Capabilities
 
-| Metric | Value |
-|--------|-------|
-| Shape | 32×128 (single tile) |
-| Correctness | ✅ All tests pass |
-| K-loop | ⬜ Not implemented |
-| Benchmark | ⬜ Pending K-loop |
-
----
-
-## Compute Analysis
-
-### FP8 vs BF16 MFMA Throughput
-
-| Instruction | Throughput (ops/cycle) |
-|-------------|------------------------|
-| v_mfma_f32_32x32x16_bf16 | 512 |
-| v_mfma_f32_32x32x16_fp8_fp8 | 1024 |
-
-FP8 has 2× MFMA throughput → theoretical 2× speedup.
-Practical target: 30-50% due to memory/LDS overhead.
-
-### Memory Bandwidth
-
-| Data | Size/tile | Access |
-|------|-----------|--------|
-| Q | 32×128×1B = 4KB | Once, reused across K-tiles |
-| K | 32×128×1B = 4KB | Once per K-tile |
-| V | 32×128×1B = 4KB | Once per K-tile |
-| O | 32×128×4B = 16KB | Write once |
+| Feature | Status |
+|---------|--------|
+| head_dim=128 | ✅ |
+| seq_len=32 (single tile) | ✅ |
+| seq_len>32 (K-loop) | 🔄 In Progress |
+| Batch/heads | Not yet |
 
 ---
 
-## Next Steps
+## Performance Expectations
 
-1. Implement K-tile loop (seq > 32)
-2. Run `bench_mi350_fmha_asm.py` with FP8 kernel
-3. Profile with rocprof for bottleneck analysis
+FP8 benefits:
+1. 2x throughput on FP8 MFMA vs BF16 MFMA
+2. 2x memory bandwidth (half element size)
+
+Overhead:
+1. FP8 conversion (`v_cvt_pk_fp8_f32`)
+2. F32 softmax maintained (same as BF16)
+
+Net expected: 30-50% TF/s improvement

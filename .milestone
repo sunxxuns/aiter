@@ -5,33 +5,46 @@ FP8 kernel with >30% TF/s improvement over BF16 (~1000 → >1300 TF/s)
 
 ---
 
-## Current Status: Phase 2 Complete ✅
+## Phase 2: Single-Tile HD=128 ✅ COMPLETE
 
-### Phase 2: HD=128 Single-tile Correctness ✅
-- S^T = K @ Q^T computation (matches BF16 reference)
+- S^T = K @ Q^T computation
 - Row-wise softmax via VGPR sum + permlane32_swap
-- P transpose store for correct PV input
+- P transpose store for PV MFMA
 - All 7 rigorous tests passing
-- Shape: 32 queries × 32 keys × 128 head_dim
-
-### Phase 3: K-tile Loop (TODO)
-
-| Task | Status |
-|------|--------|
-| Study BF16 buffer_load patterns | ⬜ |
-| Add seq_len kernel argument | ⬜ |
-| Implement K-tile loop | ⬜ |
-| Online softmax (running max/sum) | ⬜ |
-| Output rescaling between tiles | ⬜ |
-| Test seq_len > 32 | ⬜ |
 
 ---
 
-## Test Command
+## Phase 3: K-tile Loop 🔄 IN PROGRESS
 
-```bash
-cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
-python test_rigorous.py
+### Completed ✅
+- [x] buffer_load with scalar offset verified (debug_bufload.py)
+- [x] Discovered `.args` metadata requirement
+- [x] Documented BF16 K-loop patterns in .comp
+
+### Next Steps
+- [ ] Add seq_len kernel argument to test_full_hd128.s
+- [ ] Add K-tile loop with scalar offset advancement
+- [ ] Implement online softmax (running max/sum)
+- [ ] Implement O rescaling between tiles
+- [ ] Test with seq_len = 64, 128, 256
+
+---
+
+## BF16 K-Loop Reference
+
+```asm
+// Offset management
+s_mov_b32 s34, 0                       // K offset = 0
+s_mul_i32 s43, 64, s47                 // K stride
+
+// Loop body
+buffer_load_dwordx4 v4, s[12:15], s34 offen lds
+s_add_i32 s34, s43, s34                // Advance offset
+
+// Loop control
+s_add_i32 s52, s52, s53                // tile_idx += tile_size
+s_cmp_lt_i32 s52, s54                  // if tile_idx < seq_len
+s_cbranch_scc1 LOOP_START
 ```
 
 ---
@@ -40,11 +53,10 @@ python test_rigorous.py
 
 ```
 hsa/gfx950/fmha_v3_fwd_fp8/
-├── test_full_hd128.s       # Production kernel (HD=128, SEQ=32)
-├── test_rigorous.py        # Main test suite (7 tests)
-├── test_softmax_check.py   # Quick sanity check
-├── test_rowwise_softmax.py # Row-wise verification
-├── test_transpose_theory.py # S^T math proof
+├── test_full_hd128.s       # Production single-tile kernel
+├── debug_bufload.s         # buffer_load offset test ✅
+├── debug_bufload.py        # Test script ✅
+├── test_rigorous.py        # Phase 2 test suite
 ```
 
 ---

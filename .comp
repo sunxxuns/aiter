@@ -1,64 +1,76 @@
-# FP8 Flash Attention - BF16 Reference Comparison
+# FP8 Flash Attention - BF16 Comparison
 
-## Key Discovery
-
-BF16 reference kernel computes **S^T = K @ Q^T**, not S = Q @ K^T.
-
----
-
-## Why S^T?
-
-### MFMA Output Layout
-
-Thread t, VGPR v holds C[M, N] where:
-- M = (t/32)*4 + (v%4) + (v/4)*8
-- N = t % 32
-
-### With S = Q @ K^T
-```
-Thread holds S[row_interleaved, query=t%32]
-VGPRs hold different queries → summing mixes queries (WRONG)
-```
-
-### With S^T = K @ Q^T
-```
-Thread holds S^T[key_interleaved, query=t%32]
-VGPRs hold different keys for SAME query → summing is row-wise (CORRECT)
-```
+## Reference Kernel
+`hsa/gfx950/fmha_v3_fwd/fwd_hd128_bf16.s`
 
 ---
 
-## Implementation Match
+## Key Patterns from BF16 (Must Follow)
 
-| Component | BF16 | FP8 |
-|-----------|------|-----|
-| QK: K @ Q^T | ✅ | ✅ |
-| Max: VGPR + permlane32_swap | ✅ | ✅ |
-| Sum: VGPR + permlane32_swap | ✅ | ✅ |
-| No ds_swizzle for softmax | ✅ | ✅ |
-| P normalize before PV | ✅ | ✅ |
-
----
-
-## Softmax Pattern
-
+### 1. Buffer Descriptor Setup
 ```asm
-// VGPR reduction (16 keys per thread)
-v_add_f32_e32 v20, v32, v33
-...
-
-// Combine thread pairs (same query, different key halves)
-v_permlane32_swap_b32_e32 v22, v20
-v_add_f32_e32 v18, v20, v22
+// BF16 pattern
+s_load_dwordx2 s[8:9], s[0:1], 0x08   // Load base address
+s_mov_b32 s10, 4096                    // Size
+s_mov_b32 s11, 0x20000                 // Flags (offen mode)
 ```
 
-**No ds_swizzle** - that would mix different queries.
+### 2. K-tile Offset Management
+```asm
+// BF16 K-loop pattern
+s_mov_b32 s34, 0                       // K offset starts at 0
+s_mul_i32 s43, 64, s47                 // K stride = 64 * stride_param
+...
+buffer_load_dwordx4 v4, s[12:15], s34 offen lds
+s_add_i32 s34, s43, s34                // Advance to next tile
+```
+
+### 3. Online Softmax State
+```asm
+// BF16 maintains across K-tiles:
+v_mov_b32_e32 v24, 0xff7fffff          // running_max = -large
+v_mov_b32_e32 v16, 0                   // running_sum = 0
+// v[96:159] = O accumulator
+```
+
+### 4. Correction Factor
+```asm
+// When new tile has larger max:
+v_sub_f32_e32 v16, v_old_max, v_new_max
+v_mul_f32_e32 v16, s37, v16            // * log2(e)
+v_exp_f32_e32 v16, v16                 // correction = exp(...)
+// Apply to O accumulator:
+v_mul_f32_e32 v110, v16, v110
+```
 
 ---
 
-## Reference Files
+## FP8 Implementation Status
 
-| File | Location |
-|------|----------|
-| BF16 kernel | `hsa/gfx950/fmha_v3_fwd/fwd_hd128_bf16.s` |
-| FP8 kernel | `hsa/gfx950/fmha_v3_fwd_fp8/test_full_hd128.s` |
+### Same as BF16 ✅
+- S^T = K @ Q^T computation pattern
+- Row-wise softmax via VGPR sum + permlane32_swap
+- Buffer descriptor format (s10=size, s11=0x20000)
+- scalar offset in buffer_load
+
+### Different from BF16
+- MFMA instruction: `v_mfma_f32_32x32x16_fp8_fp8` (2 VGPR operands)
+  vs BF16: `v_mfma_f32_32x32x16_bf16` (4 VGPR operands)
+- FP8 conversion: `v_cvt_pk_fp8_f32` before MFMA
+- Element size: 1 byte vs 2 bytes
+
+---
+
+## Discovered Issue (Fixed)
+
+### `.args` Metadata Required
+FP8 kernels MUST include explicit `.args:` section:
+```yaml
+.amdgpu_metadata
+...
+.args:
+  - {.name: ptr_O, .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global}
+```
+
+Missing this causes memory fault at address (nil).
+BF16 kernel likely has this from original compilation.
