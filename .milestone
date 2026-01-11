@@ -5,41 +5,34 @@ FP8 kernel with >30% TF/s improvement over BF16 (~1000 → >1300 TF/s)
 
 ---
 
-## Status: Phase 2 Complete ✅
+## Current Status: Phase 2 Complete ✅
 
-### Completed
+### Phase 2: HD=128 Single-tile Correctness ✅
+- S^T = K @ Q^T computation (matches BF16 reference)
+- Row-wise softmax via VGPR sum + permlane32_swap
+- P transpose store for correct PV input
+- All 7 rigorous tests passing
+- Shape: 32 queries × 32 keys × 128 head_dim
 
-| Phase | Description | Status |
-|-------|-------------|--------|
-| 1 | HD=32 foundation | ✅ |
-| 2 | HD=128 correctness | ✅ |
-
-### Phase 2 Details
-- S^T = K @ Q^T computation
-- Row-wise softmax (VGPR sum + permlane32_swap)
-- P transpose store
-- 7 rigorous tests passing
-
----
-
-## Next: Phase 3 (K-loop)
+### Phase 3: K-tile Loop (TODO)
 
 | Task | Status |
 |------|--------|
-| Kernel arg for seq_len | ⬜ |
-| K-tile loop structure | ⬜ |
+| Study BF16 buffer_load patterns | ⬜ |
+| Add seq_len kernel argument | ⬜ |
+| Implement K-tile loop | ⬜ |
 | Online softmax (running max/sum) | ⬜ |
 | Output rescaling between tiles | ⬜ |
+| Test seq_len > 32 | ⬜ |
 
 ---
 
-## Phase 4 (Optimization)
+## Test Command
 
-| Task | Status |
-|------|--------|
-| LDS bank conflict reduction | ⬜ |
-| Instruction scheduling | ⬜ |
-| Performance benchmarking | ⬜ |
+```bash
+cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
+python test_rigorous.py
+```
 
 ---
 
@@ -47,9 +40,19 @@ FP8 kernel with >30% TF/s improvement over BF16 (~1000 → >1300 TF/s)
 
 ```
 hsa/gfx950/fmha_v3_fwd_fp8/
-├── test_full_hd128.s       # Production kernel
-├── test_rigorous.py        # Main test suite
-├── test_softmax_check.py   # Quick check
-├── test_rowwise_softmax.py # Row-wise verify
-└── test_transpose_theory.py # S^T proof
+├── test_full_hd128.s       # Production kernel (HD=128, SEQ=32)
+├── test_rigorous.py        # Main test suite (7 tests)
+├── test_softmax_check.py   # Quick sanity check
+├── test_rowwise_softmax.py # Row-wise verification
+├── test_transpose_theory.py # S^T math proof
 ```
+
+---
+
+## Performance Targets
+
+| Seq Len | BF16 TF/s | FP8 Target | Status |
+|---------|-----------|------------|--------|
+| 32 | N/A | Correctness | ✅ |
+| 1024 | ~400 | >520 | Phase 3 |
+| 32130 | ~1000 | >1300 | Phase 3 |
