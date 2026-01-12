@@ -40,7 +40,7 @@ v_mov_b32_e32 v16, 0                   // running_sum = 0
 **FP8 Status**: ✅ Same pattern
 - `v70` = running_max (init to 0xff800000 = -inf)
 - `v71` = running_sum (init to 0)
-- `v[80:95]` = O accumulator (first 32 HD cols)
+- `v[80:143]` = O accumulator (all 128 HD cols, 4 tiles of 16 regs each)
 
 ### 4. Correction Factor
 ```asm
@@ -144,6 +144,27 @@ s_mov_b32 s18, -1         // V buffer size = max
 - Small precision difference in final `O / running_sum`
 **Result**: ~0.09-0.18 max error depending on tile count
 
+### 5. AGPR Write Timing for Multi-HD-Tile (Critical Bug)
+When doing multiple HD tiles per K-pass, AGPR writes must happen AFTER V packing, just before MFMA.
+```asm
+// WRONG - AGPR write before V read causes stale data
+v_accvgpr_write_b32 a0, v28     // Write P to AGPRs
+v_accvgpr_write_b32 a1, v29
+s_nop 1
+// ... V read and packing (modifies v30) ...
+v_mfma_f32_32x32x16_fp8_fp8 v[80:95], a[0:1], v[30:31], v[80:95]
+
+// CORRECT - AGPR write after V packing, before MFMA
+// ... V read and packing (v30 = V data) ...
+v_accvgpr_write_b32 a0, v28     // Write P to AGPRs
+v_accvgpr_write_b32 a1, v29
+s_nop 1
+v_mfma_f32_32x32x16_fp8_fp8 v[80:95], a[0:1], v[30:31], v[80:95]
+```
+**Symptom**: First HD tile (cols 0-31) gives NaN/wrong values, other tiles work
+**Cause**: v30 used as temp in P conversion, then overwritten by V packing - order matters
+**Fix**: Keep original BF16 pattern - AGPR write immediately before MFMA
+
 ---
 
 ## LDS Layout Comparison
@@ -157,16 +178,17 @@ s_mov_b32 s18, -1         // V buffer size = max
 
 ---
 
-## Test Results (After Buffer Descriptor Fix)
+## Test Results (Full HD=128 Output)
 
 ```
-seq_len=32  (1 tile):  max_error=0.088 ✅
-seq_len=64  (2 tiles): max_error=0.073 ✅
-seq_len=96  (3 tiles): max_error=0.044 ✅
-seq_len=128 (4 tiles): max_error=0.035 ✅
+seq_len=32  (1 tile):  max_error=0.088 ✅ (all 128 columns)
+seq_len=64  (2 tiles): max_error=0.073 ✅ (all 128 columns)
+seq_len=96  (3 tiles): max_error=0.060 ✅ (all 128 columns)
+seq_len=128 (4 tiles): max_error=0.066 ✅ (all 128 columns)
+seq_len=256 (8 tiles): max_error=0.043 ✅ (debug harness)
 ```
 
-Note: Multi-tile errors now DECREASE with more tiles (proper accumulation).
+Note: Multi-tile errors generally DECREASE with more tiles (proper accumulation).
 
 ---
 

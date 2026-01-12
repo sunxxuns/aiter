@@ -58,7 +58,7 @@ def test_kloop_attention(seq_len, seed=42):
     K_fp8 = K.to(torch.float8_e4m3fn)
     V_fp8 = V.to(torch.float8_e4m3fn)
     
-    # Output (first 32 HD columns only in this version)
+    # Output (full HD=128)
     O = torch.zeros(Q_ROWS, HD, dtype=torch.float32, device='cuda')
     
     # Args
@@ -90,15 +90,14 @@ def test_kloop_attention(seq_len, seed=42):
     P_fp8 = P.to(torch.float8_e4m3fn).float()
     O_ref = P_fp8 @ V_fp8.float()  # [32, HD]
     
-    # Compare first 32 columns
-    O_kernel = O[:, :32]
-    O_ref_32 = O_ref[:, :32]
+    # Compare all 128 columns (full HD=128)
+    max_err = (O - O_ref).abs().max().item()
+    mean_err = (O - O_ref).abs().mean().item()
     
-    max_err = (O_kernel - O_ref_32).abs().max().item()
-    mean_err = (O_kernel - O_ref_32).abs().mean().item()
-    
-    print(f"O_kernel[0,:5]: {O_kernel[0,:5].tolist()}")
-    print(f"O_ref[0,:5]:    {O_ref_32[0,:5].tolist()}")
+    print(f"O_kernel[0,:5]: {O[0,:5].tolist()}")
+    print(f"O_ref[0,:5]:    {O_ref[0,:5].tolist()}")
+    print(f"O_kernel[0,64:69]: {O[0,64:69].tolist()}")
+    print(f"O_ref[0,64:69]:    {O_ref[0,64:69].tolist()}")
     print(f"Max error: {max_err:.6f}")
     print(f"Mean error: {mean_err:.6f}")
     

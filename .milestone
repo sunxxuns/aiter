@@ -33,12 +33,41 @@ seq_len=128 (4 tiles): max_error=0.035 ✅
 
 ---
 
-## Phase 4: Full HD=128 Output 🔜 NEXT
+## Phase 4: Full HD=128 Output ✅ COMPLETE
+
+### Summary
+Extended kernel from 32 columns to full 128 columns (4 HD tiles).
+
+### Completed
+- [x] Expand O accumulator to v[80:143] (64 registers for 4 HD tiles)
+- [x] Update O rescaling for all 64 registers
+- [x] Add PV MFMA for HD tiles 1, 2, 3 (V col offsets 32, 64, 96)
+- [x] Update final normalization for all 64 registers
+- [x] Expand output store for 128 columns
+
+### Bug Found and Fixed
+**HD tile 0 (cols 0-31) initially produced NaN/wrong values.**
+
+**Root Cause**: AGPR writes were moved to BEFORE V read, but should be AFTER V packing (just before MFMA).
+
+**Fix**: 
+1. Use v30 (not v60) for P conversion temp - matches original code pattern
+2. Move `v_accvgpr_write` to just before each MFMA (after V packing)
+
+### Test Results
+All tests pass:
+- seq_len=32 (1 tile): max_err=0.0879 ✅
+- seq_len=64 (2 tiles): max_err=0.0727 ✅
+- seq_len=128 (4 tiles): max_err=0.0348 ✅
+- seq_len=256 (8 tiles): max_err=0.0428 ✅
+- Debug harness: 31/31 tests passed ✅
+
+## Phase 5: Benchmark 🔜 NEXT
 
 ### Todo
-- [ ] Extend PV MFMA to cover all 4 HD tiles (cols 0-127)
-- [ ] Update output store for full 128 columns
-- [ ] Run benchmark against BF16
+- [ ] Run benchmark against BF16 kernel
+- [ ] Measure TF/s for various sequence lengths
+- [ ] Profile for optimization opportunities
 
 ---
 

@@ -58,8 +58,21 @@ _ZN5aiter13fwd_fp8_kloopE:
     v_mov_b32_e32 v70, s3                  // running_max = -inf
     v_mov_b32_e32 v71, 0                   // running_sum = 0
     
-    // Initialize O accumulator (v80-v95 for first HD tile only for now)
+    // Initialize O accumulator (v80-v143 for all 4 HD tiles)
+    // HD tile 0 (cols 0-31):   v[80:95]
+    // HD tile 1 (cols 32-63):  v[96:111]
+    // HD tile 2 (cols 64-95):  v[112:127]
+    // HD tile 3 (cols 96-127): v[128:143]
     .irp i, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95
+        v_mov_b32_e32 v\i, 0
+    .endr
+    .irp i, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111
+        v_mov_b32_e32 v\i, 0
+    .endr
+    .irp i, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127
+        v_mov_b32_e32 v\i, 0
+    .endr
+    .irp i, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143
         v_mov_b32_e32 v\i, 0
     .endr
     
@@ -212,8 +225,17 @@ K_TILE_LOOP:
     v_exp_f32_e32 v23, v23                // v23 = correction
     s_nop 3
     
-    // Rescale O accumulator: O = O * correction
+    // Rescale O accumulator: O = O * correction (all 4 HD tiles)
     .irp i, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95
+        v_mul_f32_e32 v\i, v\i, v23
+    .endr
+    .irp i, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111
+        v_mul_f32_e32 v\i, v\i, v23
+    .endr
+    .irp i, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127
+        v_mul_f32_e32 v\i, v\i, v23
+    .endr
+    .irp i, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143
         v_mul_f32_e32 v\i, v\i, v23
     .endr
     
@@ -348,13 +370,57 @@ K_TILE_LOOP:
     s_barrier
     
     // ========================================================================
-    // PV MFMA: O += P @ V (first HD tile only)
+    // PV MFMA: O += P @ V (all 4 HD tiles)
     // P at offset 4096, V at offset 8192
+    // HD tile 0 (cols 0-31):   V col offset 0,  output v[80:95]
+    // HD tile 1 (cols 32-63):  V col offset 32, output v[96:111]
+    // HD tile 2 (cols 64-95):  V col offset 64, output v[112:127]
+    // HD tile 3 (cols 96-127): V col offset 96, output v[128:143]
     // ========================================================================
     v_and_b32_e32 v2, 31, v0
     v_lshrrev_b32_e32 v3, 5, v0
     
-    // K-pass 0 (k=0..15): Read P from offset 4096
+    // Macro for V read and pack (8 FP8 values from V column)
+    .macro READ_V_COL v_col_offset, k_row_offset
+        v_lshlrev_b32_e32 v5, 10, v3
+        v_add_u32_e32 v5, v5, v2
+        v_add_u32_e32 v5, 8192 + \k_row_offset + \v_col_offset, v5
+        
+        ds_read_u8 v10, v5
+        v_add_u32_e32 v6, 128, v5
+        ds_read_u8 v11, v6
+        v_add_u32_e32 v6, 256, v5
+        ds_read_u8 v12, v6
+        v_add_u32_e32 v6, 384, v5
+        ds_read_u8 v13, v6
+        v_add_u32_e32 v6, 512, v5
+        ds_read_u8 v14, v6
+        v_add_u32_e32 v6, 640, v5
+        ds_read_u8 v15, v6
+        v_add_u32_e32 v6, 768, v5
+        ds_read_u8 v16, v6
+        v_add_u32_e32 v6, 896, v5
+        ds_read_u8 v17, v6
+        s_waitcnt lgkmcnt(0)
+        
+        v_lshlrev_b32_e32 v11, 8, v11
+        v_or_b32_e32 v10, v10, v11
+        v_lshlrev_b32_e32 v12, 16, v12
+        v_or_b32_e32 v10, v10, v12
+        v_lshlrev_b32_e32 v13, 24, v13
+        v_or_b32_e32 v30, v10, v13
+        v_lshlrev_b32_e32 v15, 8, v15
+        v_or_b32_e32 v14, v14, v15
+        v_lshlrev_b32_e32 v16, 16, v16
+        v_or_b32_e32 v14, v14, v16
+        v_lshlrev_b32_e32 v17, 24, v17
+        v_or_b32_e32 v31, v14, v17
+    .endm
+    
+    // ================================
+    // K-pass 0 (k=0..15)
+    // ================================
+    // Read P for K-pass 0
     v_lshlrev_b32_e32 v4, 7, v2
     v_lshlrev_b32_e32 v5, 5, v3
     v_add_u32_e32 v4, v4, v5
@@ -369,6 +435,7 @@ K_TILE_LOOP:
     ds_read_b64 v[26:27], v5
     s_waitcnt lgkmcnt(0)
     
+    // Convert P to FP8 (reused for all 4 HD tiles)
     v_cvt_pk_fp8_f32 v28, v20, v21
     v_and_b32_e32 v28, 0xFFFF, v28
     v_cvt_pk_fp8_f32 v29, v22, v23
@@ -382,10 +449,11 @@ K_TILE_LOOP:
     v_and_b32_e32 v30, 0xFFFF0000, v30
     v_or_b32_e32 v29, v29, v30
     
-    // V read from LDS offset 8192
+    // HD tile 0: V cols 0-31, output v[80:95]
+    // Read V first (v30 will be overwritten by V packing)
     v_lshlrev_b32_e32 v5, 10, v3
     v_add_u32_e32 v5, v5, v2
-    v_add_u32_e32 v5, 8192, v5            // V is at offset 8192
+    v_add_u32_e32 v5, 8192, v5            // V at offset 8192, col 0
     
     ds_read_u8 v10, v5
     v_add_u32_e32 v6, 128, v5
@@ -417,13 +485,38 @@ K_TILE_LOOP:
     v_lshlrev_b32_e32 v17, 24, v17
     v_or_b32_e32 v31, v14, v17
     
+    // Write P to AGPRs (just before MFMA, like original)
     v_accvgpr_write_b32 a0, v28
     v_accvgpr_write_b32 a1, v29
     s_nop 1
     v_mfma_f32_32x32x16_fp8_fp8 v[80:95], a[0:1], v[30:31], v[80:95]
+    
+    // HD tile 1: V cols 32-63, output v[96:111]
+    READ_V_COL 32, 0
+    v_accvgpr_write_b32 a0, v28
+    v_accvgpr_write_b32 a1, v29
+    s_nop 1
+    v_mfma_f32_32x32x16_fp8_fp8 v[96:111], a[0:1], v[30:31], v[96:111]
+    
+    // HD tile 2: V cols 64-95, output v[112:127]
+    READ_V_COL 64, 0
+    v_accvgpr_write_b32 a0, v28
+    v_accvgpr_write_b32 a1, v29
+    s_nop 1
+    v_mfma_f32_32x32x16_fp8_fp8 v[112:127], a[0:1], v[30:31], v[112:127]
+    
+    // HD tile 3: V cols 96-127, output v[128:143]
+    READ_V_COL 96, 0
+    v_accvgpr_write_b32 a0, v28
+    v_accvgpr_write_b32 a1, v29
+    s_nop 1
+    v_mfma_f32_32x32x16_fp8_fp8 v[128:143], a[0:1], v[30:31], v[128:143]
     s_nop 15
     
-    // K-pass 1 (k=16..31): P at offset 4096 + 64
+    // ================================
+    // K-pass 1 (k=16..31)
+    // ================================
+    // Read P for K-pass 1
     v_add_u32_e32 v4, 64, v4              // Advance P read address
     ds_read_b64 v[20:21], v4
     v_add_u32_e32 v5, 8, v4
@@ -434,6 +527,7 @@ K_TILE_LOOP:
     ds_read_b64 v[26:27], v5
     s_waitcnt lgkmcnt(0)
     
+    // Convert P to FP8
     v_cvt_pk_fp8_f32 v28, v20, v21
     v_and_b32_e32 v28, 0xFFFF, v28
     v_cvt_pk_fp8_f32 v29, v22, v23
@@ -447,44 +541,33 @@ K_TILE_LOOP:
     v_and_b32_e32 v30, 0xFFFF0000, v30
     v_or_b32_e32 v29, v29, v30
     
-    v_lshlrev_b32_e32 v5, 10, v3
-    v_add_u32_e32 v5, v5, v2
-    v_add_u32_e32 v5, 8192 + 2048, v5     // V at offset 8192 + 2048 for second half
-    
-    ds_read_u8 v10, v5
-    v_add_u32_e32 v6, 128, v5
-    ds_read_u8 v11, v6
-    v_add_u32_e32 v6, 256, v5
-    ds_read_u8 v12, v6
-    v_add_u32_e32 v6, 384, v5
-    ds_read_u8 v13, v6
-    v_add_u32_e32 v6, 512, v5
-    ds_read_u8 v14, v6
-    v_add_u32_e32 v6, 640, v5
-    ds_read_u8 v15, v6
-    v_add_u32_e32 v6, 768, v5
-    ds_read_u8 v16, v6
-    v_add_u32_e32 v6, 896, v5
-    ds_read_u8 v17, v6
-    s_waitcnt lgkmcnt(0)
-    
-    v_lshlrev_b32_e32 v11, 8, v11
-    v_or_b32_e32 v10, v10, v11
-    v_lshlrev_b32_e32 v12, 16, v12
-    v_or_b32_e32 v10, v10, v12
-    v_lshlrev_b32_e32 v13, 24, v13
-    v_or_b32_e32 v30, v10, v13
-    v_lshlrev_b32_e32 v15, 8, v15
-    v_or_b32_e32 v14, v14, v15
-    v_lshlrev_b32_e32 v16, 16, v16
-    v_or_b32_e32 v14, v14, v16
-    v_lshlrev_b32_e32 v17, 24, v17
-    v_or_b32_e32 v31, v14, v17
-    
+    // HD tile 0: V cols 0-31, k=16..31
+    READ_V_COL 0, 2048
     v_accvgpr_write_b32 a0, v28
     v_accvgpr_write_b32 a1, v29
     s_nop 1
     v_mfma_f32_32x32x16_fp8_fp8 v[80:95], a[0:1], v[30:31], v[80:95]
+    
+    // HD tile 1: V cols 32-63, k=16..31
+    READ_V_COL 32, 2048
+    v_accvgpr_write_b32 a0, v28
+    v_accvgpr_write_b32 a1, v29
+    s_nop 1
+    v_mfma_f32_32x32x16_fp8_fp8 v[96:111], a[0:1], v[30:31], v[96:111]
+    
+    // HD tile 2: V cols 64-95, k=16..31
+    READ_V_COL 64, 2048
+    v_accvgpr_write_b32 a0, v28
+    v_accvgpr_write_b32 a1, v29
+    s_nop 1
+    v_mfma_f32_32x32x16_fp8_fp8 v[112:127], a[0:1], v[30:31], v[112:127]
+    
+    // HD tile 3: V cols 96-127, k=16..31
+    READ_V_COL 96, 2048
+    v_accvgpr_write_b32 a0, v28
+    v_accvgpr_write_b32 a1, v29
+    s_nop 1
+    v_mfma_f32_32x32x16_fp8_fp8 v[128:143], a[0:1], v[30:31], v[128:143]
     s_nop 15
     
     // Advance to next K/V tile
@@ -494,7 +577,7 @@ K_TILE_LOOP:
     s_cbranch_scc1 K_TILE_LOOP
     
     // ========================================================================
-    // FINAL NORMALIZATION: O = O / running_sum
+    // FINAL NORMALIZATION: O = O / running_sum (all 4 HD tiles)
     // ========================================================================
     v_rcp_f32_e32 v72, v71
     s_nop 3
@@ -502,20 +585,31 @@ K_TILE_LOOP:
     .irp i, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95
         v_mul_f32_e32 v\i, v\i, v72
     .endr
+    .irp i, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111
+        v_mul_f32_e32 v\i, v\i, v72
+    .endr
+    .irp i, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127
+        v_mul_f32_e32 v\i, v\i, v72
+    .endr
+    .irp i, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143
+        v_mul_f32_e32 v\i, v\i, v72
+    .endr
     
     // ========================================================================
-    // STORE OUTPUT (first 32 columns only)
+    // STORE OUTPUT (all 128 columns)
     // ========================================================================
     v_and_b32_e32 v2, 31, v0
     v_lshrrev_b32_e32 v3, 5, v0
     v_lshlrev_b32_e32 v3, 2, v3
     
-    .macro STORE_O vreg, row_mod4, row_8_group
+    // Macro with HD column offset
+    .macro STORE_O vreg, row_mod4, row_8_group, hd_col_offset
         v_mov_b32_e32 v7, \row_mod4
         v_add_u32_e32 v7, v7, v3
         v_add_u32_e32 v7, \row_8_group * 8, v7
         v_lshlrev_b32_e32 v7, 7, v7           // row * 128 (HD)
-        v_add_u32_e32 v7, v7, v2              // + col (within first 32)
+        v_add_u32_e32 v7, v7, v2              // + col (within 32)
+        v_add_u32_e32 v7, \hd_col_offset, v7  // + HD tile offset
         v_lshlrev_b32_e32 v7, 2, v7           // byte offset
         v_mov_b32_e32 v10, s4
         v_mov_b32_e32 v11, s5
@@ -524,22 +618,77 @@ K_TILE_LOOP:
         flat_store_dword v[10:11], \vreg
     .endm
     
-    STORE_O v80, 0, 0
-    STORE_O v81, 1, 0
-    STORE_O v82, 2, 0
-    STORE_O v83, 3, 0
-    STORE_O v84, 0, 1
-    STORE_O v85, 1, 1
-    STORE_O v86, 2, 1
-    STORE_O v87, 3, 1
-    STORE_O v88, 0, 2
-    STORE_O v89, 1, 2
-    STORE_O v90, 2, 2
-    STORE_O v91, 3, 2
-    STORE_O v92, 0, 3
-    STORE_O v93, 1, 3
-    STORE_O v94, 2, 3
-    STORE_O v95, 3, 3
+    // HD tile 0 (cols 0-31): v[80:95]
+    STORE_O v80, 0, 0, 0
+    STORE_O v81, 1, 0, 0
+    STORE_O v82, 2, 0, 0
+    STORE_O v83, 3, 0, 0
+    STORE_O v84, 0, 1, 0
+    STORE_O v85, 1, 1, 0
+    STORE_O v86, 2, 1, 0
+    STORE_O v87, 3, 1, 0
+    STORE_O v88, 0, 2, 0
+    STORE_O v89, 1, 2, 0
+    STORE_O v90, 2, 2, 0
+    STORE_O v91, 3, 2, 0
+    STORE_O v92, 0, 3, 0
+    STORE_O v93, 1, 3, 0
+    STORE_O v94, 2, 3, 0
+    STORE_O v95, 3, 3, 0
+    
+    // HD tile 1 (cols 32-63): v[96:111]
+    STORE_O v96, 0, 0, 32
+    STORE_O v97, 1, 0, 32
+    STORE_O v98, 2, 0, 32
+    STORE_O v99, 3, 0, 32
+    STORE_O v100, 0, 1, 32
+    STORE_O v101, 1, 1, 32
+    STORE_O v102, 2, 1, 32
+    STORE_O v103, 3, 1, 32
+    STORE_O v104, 0, 2, 32
+    STORE_O v105, 1, 2, 32
+    STORE_O v106, 2, 2, 32
+    STORE_O v107, 3, 2, 32
+    STORE_O v108, 0, 3, 32
+    STORE_O v109, 1, 3, 32
+    STORE_O v110, 2, 3, 32
+    STORE_O v111, 3, 3, 32
+    
+    // HD tile 2 (cols 64-95): v[112:127]
+    STORE_O v112, 0, 0, 64
+    STORE_O v113, 1, 0, 64
+    STORE_O v114, 2, 0, 64
+    STORE_O v115, 3, 0, 64
+    STORE_O v116, 0, 1, 64
+    STORE_O v117, 1, 1, 64
+    STORE_O v118, 2, 1, 64
+    STORE_O v119, 3, 1, 64
+    STORE_O v120, 0, 2, 64
+    STORE_O v121, 1, 2, 64
+    STORE_O v122, 2, 2, 64
+    STORE_O v123, 3, 2, 64
+    STORE_O v124, 0, 3, 64
+    STORE_O v125, 1, 3, 64
+    STORE_O v126, 2, 3, 64
+    STORE_O v127, 3, 3, 64
+    
+    // HD tile 3 (cols 96-127): v[128:143]
+    STORE_O v128, 0, 0, 96
+    STORE_O v129, 1, 0, 96
+    STORE_O v130, 2, 0, 96
+    STORE_O v131, 3, 0, 96
+    STORE_O v132, 0, 1, 96
+    STORE_O v133, 1, 1, 96
+    STORE_O v134, 2, 1, 96
+    STORE_O v135, 3, 1, 96
+    STORE_O v136, 0, 2, 96
+    STORE_O v137, 1, 2, 96
+    STORE_O v138, 2, 2, 96
+    STORE_O v139, 3, 2, 96
+    STORE_O v140, 0, 3, 96
+    STORE_O v141, 1, 3, 96
+    STORE_O v142, 2, 3, 96
+    STORE_O v143, 3, 3, 96
     
     s_waitcnt vmcnt(0)
     s_endpgm
@@ -554,9 +703,9 @@ K_TILE_LOOP:
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
     .amdhsa_system_sgpr_workgroup_id_x 1
     .amdhsa_system_vgpr_workitem_id 0
-    .amdhsa_next_free_vgpr 100
+    .amdhsa_next_free_vgpr 148
     .amdhsa_next_free_sgpr 32
-    .amdhsa_accum_offset 64
+    .amdhsa_accum_offset 148
     .amdhsa_float_round_mode_32 0
     .amdhsa_float_round_mode_16_64 0
     .amdhsa_float_denorm_mode_32 3
@@ -576,7 +725,7 @@ amdhsa.kernels:
     .kernarg_segment_align: 8
     .wavefront_size: 64
     .sgpr_count: 32
-    .vgpr_count: 100
+    .vgpr_count: 148
     .agpr_count: 4
     .max_flat_workgroup_size: 64
     .args:
