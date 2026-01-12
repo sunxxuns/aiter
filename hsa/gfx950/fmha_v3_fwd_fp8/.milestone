@@ -137,18 +137,18 @@ s_add_u32 s63, 0x8200, s63       // + 33280 base
    - MFMA output values match reference (1024/1024, max_diff=0.0002)
    - Output layout is MFMA-native (not row-major), but that's OK
    - Softmax and PV MFMA use the same layout, no conversion needed
-6. [ ] **Build 256T kernel**:
-   - Use flat_load + ds_write for Q/K/V
-   - Add softmax on S output
-   - Add PV MFMA (P × V → O)
-7. [ ] Verify numerics with non-uniform attention
-8. [ ] Benchmark TF/s
+6. [x] **Working 64T kernel verified** (fwd_fp8_kloop.s)
+   - Uniform input: max_diff=0.000000 (exact match!)
+   - P/V read patterns are complex but correct
+   - P stored as F32 in LDS, converted to FP8 on read
+   - V read with row-stride pattern (stride 128)
 
-### Phase 2: Scale to 256T (128 Q rows)
-1. [ ] Extend fixed kernel to 4 waves
-2. [ ] Each wave loads its own Q[32 rows]
-3. [ ] All waves share K/V loading
+### Phase 2: Scale to 256T (128 Q rows) [NEXT]
+1. [ ] Extend fwd_fp8_kloop.s to 4 waves
+2. [ ] Each wave handles its own 32 Q rows (independent)
+3. [ ] All waves share K/V loading (cooperative)
 4. [ ] Per-wave output to O[wave_id*32 : wave_id*32+32]
+5. [ ] Follow BF16's wave coordination pattern
 
 ### Phase 3: Optimize for >1300 TF/s
 5. [ ] Double buffering for K/V tiles

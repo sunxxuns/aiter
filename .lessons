@@ -773,3 +773,37 @@ Thread 0 transpose read: `[0, 1, 64, 65, 128, 129, 192, 193]`
     s_nop 15
 .endr
 ```
+
+---
+
+## 8.12 Working 64T Kernel Verified
+
+### Test Results
+- Input: Q=K=V=1.0 (uniform), seq_len=32
+- Expected O: 1.0 (softmax distributes uniformly)
+- Actual O: 1.0 (exact match!)
+- max_diff: 0.000000
+
+### Key P/V Read Patterns (from fwd_fp8_kloop.s)
+
+**P (Attention weights)**:
+- Stored as F32 in LDS (not FP8!)
+- Read: 4 × ds_read_b64 = 32 bytes = 8 F32 values
+- Converted to FP8 with v_cvt_pk_fp8_f32 just before MFMA
+- Different P columns for K-pass 0 vs K-pass 1
+
+**V (Value matrix)**:
+- Read byte-by-byte with row-stride: ds_read_u8 at offsets 0, 128, 256, ...
+- 8 reads to get 8 values from 8 different rows
+- Pack into 2 VGPRs for MFMA B operand
+- This gives transposed access pattern needed for MFMA
+
+### Why step4_full.s Failed
+1. P stored directly as FP8 (should be F32, converted on read)
+2. V read sequentially (should be row-strided)
+3. Same P used for all HD tiles (wrong for K-pass separation)
+
+### Next Step: Scale to 256T
+- Working 64T kernel is correct
+- Scale by adding 3 more waves (4 total)
+- Follow BF16's wave coordination pattern
