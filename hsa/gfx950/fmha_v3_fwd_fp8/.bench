@@ -3,64 +3,72 @@
 ## Quick Benchmark
 
 ```bash
-# Benchmark FP8 kernel
 cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
-python bench_fp8_attention.py
 
-# Benchmark BF16 reference (for comparison)
-python /sgl-workspace/sglang/benchmark/kernels/bench_aiter_fmha_v3.py
-```
+# Single sequence length
+python bench_fp8_attention.py --seq-len 1024
 
-## Target Performance
+# Sweep all sequence lengths  
+python bench_fp8_attention.py --sweep
 
-- **BF16 baseline**: ~1000 TF/s
-- **FP8 target**: >1300 TF/s (30% improvement)
-
-## Benchmark Methodology
-
-### FLOP Calculation
-For flash attention with:
-- batch=1, heads=1, seq_len=N, head_dim=128
-
-```
-QK MFMA:  32 * N * 128 * 2 FLOPs (matmul)
-Softmax:  32 * N * 5 FLOPs (approx)
-PV MFMA:  32 * N * 128 * 2 FLOPs (matmul)
-Total:    32 * N * 128 * 4 + 32 * N * 5 FLOPs
-        ≈ 32 * N * 517 FLOPs
-```
-
-### Timing
-- Warmup: 10 iterations
-- Measure: 100 iterations
-- Use `hipEventElapsedTime` for accurate GPU timing
-
-## Expected Results (TBD)
-
-| seq_len | BF16 TF/s | FP8 TF/s | Speedup |
-|---------|-----------|----------|---------|
-| 1024 | TBD | TBD | TBD |
-| 4096 | TBD | TBD | TBD |
-| 8192 | TBD | TBD | TBD |
-| 16384 | TBD | TBD | TBD |
-| 32130 | ~1000 | TBD | TBD |
-
-## Benchmark Command
-
-```bash
-# Full benchmark with sequence length
+# BF16 reference (for comparison)
 python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 32130
 ```
 
-## Notes
+## Current Results (Single-Head, 32 Output Rows)
 
-- FP8 MFMA has 2x theoretical throughput vs BF16
-- Memory bandwidth may be limiting factor for long sequences
-- LDS size (12KB) limits tile size to 32 rows
+```
+SeqLen  Tiles   Time(us)     TFLOPS
+--------------------------------------
+    32      1        6.6     0.0805
+    64      2        9.8     0.1076
+   128      4       16.2     0.1305
+   256      8       28.8     0.1471
+   512     16       54.1     0.1567
+  1024     32      104.6     0.1620
+  2048     64      205.7     0.1647
+  4096    128      408.1     0.1661
+```
 
-## Optimization Opportunities (Phase 5+)
+**Note**: These numbers are for single-head, 32-row kernel.
+Production benchmark requires multi-head extension (Phase 5+).
 
-1. **Prefetching**: Overlap K/V loads with computation
-2. **Register reuse**: Reduce VGPR pressure
-3. **LDS banking**: Minimize bank conflicts
-4. **Instruction scheduling**: Hide latencies
+## Target Performance (Full Kernel)
+
+- **BF16 baseline**: ~1000 TF/s (at 40 heads, seq=32130)
+- **FP8 target**: >1300 TF/s (30% improvement)
+
+## FLOP Calculation
+
+For flash attention with batch=1, heads=H, seq_len=N, head_dim=128:
+
+```
+Per head:
+  QK MFMA:  32 * N * 128 * 2 FLOPs
+  Softmax:  32 * N * 5 FLOPs  
+  PV MFMA:  32 * N * 128 * 2 FLOPs
+  Total:    32 * N * 517 FLOPs
+
+Full kernel (H heads):
+  Total:    H * 32 * N * 517 FLOPs
+```
+
+## Benchmark Methodology
+
+- Warmup: 10 iterations
+- Measure: 100 iterations  
+- Timing: `hipEventElapsedTime` (GPU-accurate)
+
+## Why Current TF/s is Low
+
+1. **Single head**: Production uses 40 heads
+2. **32 output rows**: Only one workgroup
+3. **Memory bound**: Small compute/memory ratio at low seq_len
+4. **Launch overhead**: Dominates at small sizes
+
+## Next Steps (Phase 5+)
+
+1. **Multi-head support**: Launch multiple workgroups
+2. **Batch support**: Process multiple sequences
+3. **Integration**: Wire into aiter.ops.mha API
+4. **Optimization**: Prefetching, scheduling, LDS banking

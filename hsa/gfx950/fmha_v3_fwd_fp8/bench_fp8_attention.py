@@ -1,195 +1,187 @@
 #!/usr/bin/env python3
 """
-Performance Benchmark for FP8 Flash Attention HD=128
+FP8 Flash Attention Benchmark
 
-Measures:
-- Kernel latency (microseconds)
-- Throughput (GFLOP/s and TF/s)
-- Comparison with theoretical peak
+Benchmarks the FP8 ASM kernel (fwd_fp8_kloop.s) at various sequence lengths.
+Comparable to BF16 benchmark: bench_mi350_fmha_asm.py
 
-Note: Current kernel only supports seq_len=32 (single tile)
-Full benchmark at production shapes requires Phase 3 (K-tile loop)
+Usage:
+    python bench_fp8_attention.py                    # Default seq_len=1024
+    python bench_fp8_attention.py --seq-len 4096    # Specific seq_len
+    python bench_fp8_attention.py --sweep           # Sweep all seq_lens
 """
 
 import torch
 import subprocess
 import ctypes
 import os
-import time
+import argparse
 import math
 
-def build_kernel():
-    """Build the kernel"""
+
+def build_kernel(kernel_name="fwd_fp8_kloop"):
+    """Build the FP8 kernel"""
     cwd = os.path.dirname(os.path.abspath(__file__))
-    subprocess.run(
+    src = f"{kernel_name}.s"
+    obj = f"{kernel_name}.o"
+    co = f"{kernel_name}.co"
+    
+    result = subprocess.run(
         ["clang", "-x", "assembler", "-target", "amdgcn-amd-amdhsa",
-         "-mcpu=gfx950", "-c", "test_full_hd128.s", "-o", "test_full_hd128.o"],
-        check=True, capture_output=True, cwd=cwd
+         "-mcpu=gfx950", "-c", src, "-o", obj],
+        capture_output=True, cwd=cwd
     )
-    subprocess.run(
-        ["ld.lld", "-shared", "-o", "test_full_hd128.co", "test_full_hd128.o"],
-        check=True, capture_output=True, cwd=cwd
+    if result.returncode != 0:
+        raise RuntimeError(f"Compile failed: {result.stderr.decode()}")
+    
+    result = subprocess.run(
+        ["ld.lld", "-shared", "-o", co, obj],
+        capture_output=True, cwd=cwd
     )
-    return os.path.join(cwd, "test_full_hd128.co")
+    if result.returncode != 0:
+        raise RuntimeError(f"Link failed: {result.stderr.decode()}")
+    
+    return os.path.join(cwd, co)
 
 
-def get_kernel_func(co_path):
-    """Load kernel"""
+def load_kernel(co_path, func_name="_ZN5aiter13fwd_fp8_kloopE"):
+    """Load kernel module"""
     hip = ctypes.CDLL("/opt/rocm/lib/libamdhip64.so")
     module = ctypes.c_void_p()
     ret = hip.hipModuleLoad(ctypes.byref(module), co_path.encode())
     if ret != 0:
         raise RuntimeError(f"hipModuleLoad failed: {ret}")
+    
     func = ctypes.c_void_p()
-    ret = hip.hipModuleGetFunction(ctypes.byref(func), module, b"_ZN5aiter14test_full_hd128E")
+    ret = hip.hipModuleGetFunction(ctypes.byref(func), module, func_name.encode())
     if ret != 0:
         raise RuntimeError(f"hipModuleGetFunction failed: {ret}")
+    
     return hip, module, func
 
 
-def benchmark_kernel(hip, func, warmup=10, iterations=100):
-    """Benchmark kernel latency"""
-    SEQ, HD = 32, 128
+def benchmark_fp8_fmha(
+    seq_len: int = 1024,
+    head_dim: int = 128,
+    warmup: int = 10,
+    iters: int = 100,
+):
+    """Benchmark FP8 Flash Attention kernel."""
     
-    # Create test data
+    # Build and load
+    co_path = build_kernel()
+    hip, module, func = load_kernel(co_path)
+    
+    # Create test data (single head, single batch for now)
+    Q_ROWS = 32  # Output rows per workgroup
+    
     torch.manual_seed(42)
-    Q = torch.randn(SEQ, HD, dtype=torch.float32, device='cuda').to(torch.float8_e4m3fn)
-    K = torch.randn(SEQ, HD, dtype=torch.float32, device='cuda').to(torch.float8_e4m3fn)
-    V = torch.randn(SEQ, HD, dtype=torch.float32, device='cuda').to(torch.float8_e4m3fn)
-    O = torch.zeros(SEQ, HD, dtype=torch.float32, device='cuda')
+    Q = torch.randn(Q_ROWS, head_dim, device='cuda').to(torch.float8_e4m3fn)
+    K = torch.randn(seq_len, head_dim, device='cuda').to(torch.float8_e4m3fn)
+    V = torch.randn(seq_len, head_dim, device='cuda').to(torch.float8_e4m3fn)
+    O = torch.zeros(Q_ROWS, head_dim, dtype=torch.float32, device='cuda')
     
-    args_list = [
+    # Kernel args
+    args = [
         ctypes.c_void_p(O.data_ptr()),
         ctypes.c_void_p(Q.data_ptr()),
         ctypes.c_void_p(K.data_ptr()),
         ctypes.c_void_p(V.data_ptr()),
+        ctypes.c_uint32(seq_len),
     ]
-    args_array = (ctypes.c_void_p * 4)(
-        *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args_list]
+    args_arr = (ctypes.c_void_p * 5)(
+        *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]
     )
+    
+    shared_mem = 12288  # 12KB LDS
     
     # Warmup
     for _ in range(warmup):
-        hip.hipModuleLaunchKernel(func, 1, 1, 1, 64, 1, 1, 8192, None, args_array, None)
+        hip.hipModuleLaunchKernel(func, 1, 1, 1, 64, 1, 1, shared_mem, None, args_arr, None)
     hip.hipDeviceSynchronize()
     
     # Benchmark with HIP events
-    hipEventCreate = hip.hipEventCreate
-    hipEventRecord = hip.hipEventRecord
-    hipEventSynchronize = hip.hipEventSynchronize
-    hipEventElapsedTime = hip.hipEventElapsedTime
-    hipEventDestroy = hip.hipEventDestroy
-    
     start_event = ctypes.c_void_p()
     end_event = ctypes.c_void_p()
-    hipEventCreate(ctypes.byref(start_event))
-    hipEventCreate(ctypes.byref(end_event))
+    hip.hipEventCreate(ctypes.byref(start_event))
+    hip.hipEventCreate(ctypes.byref(end_event))
     
-    hipEventRecord(start_event, None)
-    for _ in range(iterations):
-        hip.hipModuleLaunchKernel(func, 1, 1, 1, 64, 1, 1, 8192, None, args_array, None)
-    hipEventRecord(end_event, None)
-    hipEventSynchronize(end_event)
+    hip.hipEventRecord(start_event, None)
+    for _ in range(iters):
+        hip.hipModuleLaunchKernel(func, 1, 1, 1, 64, 1, 1, shared_mem, None, args_arr, None)
+    hip.hipEventRecord(end_event, None)
+    hip.hipEventSynchronize(end_event)
     
     elapsed_ms = ctypes.c_float()
-    hipEventElapsedTime(ctypes.byref(elapsed_ms), start_event, end_event)
+    hip.hipEventElapsedTime(ctypes.byref(elapsed_ms), start_event, end_event)
     
-    hipEventDestroy(start_event)
-    hipEventDestroy(end_event)
+    hip.hipEventDestroy(start_event)
+    hip.hipEventDestroy(end_event)
     
-    avg_us = (elapsed_ms.value * 1000) / iterations
+    avg_time_ms = elapsed_ms.value / iters
     
-    return avg_us
-
-
-def compute_flops(seq_len, head_dim):
-    """Compute FLOPs for flash attention"""
-    # QK: S = Q @ K^T → 2 * seq * seq * head_dim
-    qk_flops = 2 * seq_len * seq_len * head_dim
-    # Softmax: ~5 ops per element (sub, exp, sum, div, etc.)
-    softmax_flops = 5 * seq_len * seq_len
-    # PV: O = P @ V → 2 * seq * head_dim * seq
-    pv_flops = 2 * seq_len * head_dim * seq_len
+    # Calculate metrics
+    # FLOPs: QK (2*Q*K*D) + softmax (~5*Q*K) + PV (2*Q*K*D)
+    flops = Q_ROWS * seq_len * head_dim * 4 + Q_ROWS * seq_len * 5
+    tflops = (flops / avg_time_ms) / 1e9  # TFLOPs
     
-    total_flops = qk_flops + softmax_flops + pv_flops
-    return total_flops
-
-
-def main():
-    print("="*70)
-    print("FP8 FLASH ATTENTION BENCHMARK")
-    print("HD=128, SEQ=32 (single tile)")
-    print("="*70)
-    
-    # Build and load kernel
-    print("\nBuilding kernel...")
-    co_path = build_kernel()
-    hip, module, func = get_kernel_func(co_path)
-    print("Kernel loaded")
-    
-    # Run benchmark
-    SEQ, HD = 32, 128
-    print(f"\nBenchmarking (warmup=10, iterations=100)...")
-    
-    latency_us = benchmark_kernel(hip, func)
-    flops = compute_flops(SEQ, HD)
-    
-    # Calculate throughput
-    gflops = (flops / latency_us) / 1000  # GFLOP/s
-    tflops = gflops / 1000  # TF/s
-    
-    print(f"\n{'='*70}")
-    print("RESULTS")
-    print('='*70)
-    print(f"  Shape: seq={SEQ}, head_dim={HD}")
-    print(f"  Latency: {latency_us:.2f} μs")
-    print(f"  FLOPs per call: {flops:,}")
-    print(f"  Throughput: {gflops:.1f} GFLOP/s ({tflops:.4f} TF/s)")
-    
-    # MI300X theoretical peak
-    # FP8 MFMA: ~2600 TF/s theoretical peak per chip
-    # But our kernel is tiny (32x32) so launch overhead dominates
-    print(f"\n  Note: Small shape (32×32) - launch overhead dominates")
-    print(f"  Production shapes (seq=4096+) needed for meaningful TF/s")
-    
-    # Estimate at larger shapes (theoretical)
-    print(f"\n{'='*70}")
-    print("PROJECTED PERFORMANCE (theoretical, requires K-tile loop)")
-    print('='*70)
-    
-    for seq in [1024, 4096, 8192, 16384, 32768]:
-        # Assume kernel time scales linearly with tiles (optimistic)
-        num_tiles = (seq // 32) ** 2  # K-tiles × Q-tiles
-        est_time_us = latency_us * num_tiles
-        est_flops = compute_flops(seq, HD)
-        est_tflops = (est_flops / est_time_us) / 1e9
-        
-        # More realistic: add some overhead per tile
-        overhead_per_tile_us = 0.5
-        realistic_time_us = latency_us * num_tiles + overhead_per_tile_us * num_tiles
-        realistic_tflops = (est_flops / realistic_time_us) / 1e9
-        
-        print(f"  seq={seq:5d}: {num_tiles:6d} tiles, est {est_tflops:.1f}-{realistic_tflops:.1f} TF/s")
-    
-    # Compare to BF16 baseline
-    print(f"\n{'='*70}")
-    print("BF16 BASELINE COMPARISON (from bench_aiter_fmha_v3.py)")
-    print('='*70)
-    print("  BF16 ASM kernel at similar shapes:")
-    print("    seq=1024:  ~400 TF/s")
-    print("    seq=4096:  ~780 TF/s")
-    print("    seq=8192:  ~980 TF/s")
-    print("    seq=32130: ~1000 TF/s")
-    print(f"\n  FP8 Target: >1300 TF/s (30%+ improvement)")
+    # Memory: Q + K + V + O
+    mem_bytes = Q_ROWS * head_dim + seq_len * head_dim * 2 + Q_ROWS * head_dim * 4  # FP8 + F32
+    bandwidth = (mem_bytes / avg_time_ms) / 1e6  # GB/s
     
     hip.hipModuleUnload(module)
     
-    print(f"\n{'='*70}")
-    print("CONCLUSION")
-    print('='*70)
-    print("  Current kernel: Single tile (32×32) - for numerical validation only")
-    print("  Next step: Implement K-tile loop (Phase 3) for production benchmark")
-    print('='*70)
+    return {
+        'seq_len': seq_len,
+        'time_ms': avg_time_ms,
+        'time_us': avg_time_ms * 1000,
+        'tflops': tflops,
+        'bandwidth_gbs': bandwidth,
+        'flops': flops,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="FP8 Flash Attention Benchmark")
+    parser.add_argument("--seq-len", type=int, default=1024, help="Sequence length")
+    parser.add_argument("--sweep", action="store_true", help="Sweep sequence lengths")
+    parser.add_argument("--iters", type=int, default=100, help="Benchmark iterations")
+    args = parser.parse_args()
+    
+    if args.sweep:
+        print(f"\n{'='*70}")
+        print("FP8 Flash Attention - Sequence Length Sweep")
+        print(f"{'='*70}")
+        print(f"{'SeqLen':>8} {'Tiles':>6} {'Time(us)':>10} {'TFLOPS':>10}")
+        print(f"{'-'*70}")
+        
+        for seq_len in [32, 64, 128, 256, 512, 1024, 2048, 4096]:
+            try:
+                result = benchmark_fp8_fmha(seq_len=seq_len, iters=args.iters)
+                tiles = (seq_len + 31) // 32
+                print(f"{seq_len:>8} {tiles:>6} {result['time_us']:>10.1f} {result['tflops']:>10.4f}")
+            except Exception as e:
+                print(f"{seq_len:>8} ERROR: {e}")
+        
+        print(f"{'='*70}")
+        
+    else:
+        print(f"\n{'='*70}")
+        print(f"FP8 Flash Attention Benchmark")
+        print(f"{'='*70}")
+        
+        result = benchmark_fp8_fmha(seq_len=args.seq_len, iters=args.iters)
+        
+        print(f"Seq Length:  {result['seq_len']}")
+        print(f"K-tiles:     {(result['seq_len'] + 31) // 32}")
+        print(f"Time:        {result['time_us']:.1f} μs ({result['time_ms']:.3f} ms)")
+        print(f"TFLOPS:      {result['tflops']:.4f}")
+        print(f"Bandwidth:   {result['bandwidth_gbs']:.1f} GB/s")
+        print(f"{'='*70}")
+        
+        # Comparison note
+        print(f"\nNote: This is single-head, 32-row output.")
+        print(f"Full benchmark requires multi-head kernel (Phase 5+)")
 
 
 if __name__ == "__main__":
