@@ -20,22 +20,20 @@ Working kernel: `test_full_hd128.s`
 - [x] `.args` metadata requirement discovered
 - [x] Created fwd_fp8_kloop.s with online softmax structure
 
-### Current Issue 🔴
-`fwd_fp8_kloop.s` compiles and runs, but numerical results are wrong:
-- Single-tile (seq=32): Output ~100x too large
-- Multi-tile: Some produce zeros, some pass by accident
+### Progress ✅
+Single-tile (seq=32) now passes with perfect match!
+- Root cause: `accum_offset` metadata was wrong (96 vs 64)
+- MFMA requires correct VGPR/AGPR boundary
 
-### Debug Notes
-1. QK MFMA uses AGPRs correctly (matched working kernel)
-2. P storage at LDS offset 4096, V at 8192
-3. Output store uses correct formula (row*128 + col)*4
-4. Issue likely in P normalization or FP8 conversion
+### Current Issue 🟡
+Multi-tile (seq > 32): K-loop runs but only uses first tile
+- All seq_len produce same output as seq=32
+- Per-tile P normalization complicates multi-tile accumulation
 
 ### Next Steps
-- [ ] Debug P normalization vs working kernel
-- [ ] Verify FP8 conversion doesn't lose precision  
-- [ ] Add intermediate value checks
-- [ ] Compare exact MFMA operand values
+- [ ] Implement proper online softmax (no per-tile P normalization)
+- [ ] Test with multiple K-tiles
+- [ ] Match BF16 online softmax pattern
 
 ---
 

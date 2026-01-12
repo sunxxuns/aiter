@@ -90,12 +90,12 @@ _ZN5aiter13fwd_fp8_kloopE:
     s_mov_b32 s27, 0                       // k_offset = 0
     s_mov_b32 s28, 0                       // tile_idx = 0
     
-    // Setup K buffer descriptor
-    s_mov_b32 s14, 0x100000
+    // Setup K buffer descriptor (size = 4096 for one tile)
+    s_mov_b32 s14, 4096
     s_mov_b32 s15, 0x20000
     
-    // Setup V buffer descriptor
-    s_mov_b32 s18, 0x100000
+    // Setup V buffer descriptor (size = 4096 for one tile)
+    s_mov_b32 s18, 4096
     s_mov_b32 s19, 0x20000
 
     // ========================================================================
@@ -555,9 +555,9 @@ K_TILE_LOOP:
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
     .amdhsa_system_sgpr_workgroup_id_x 1
     .amdhsa_system_vgpr_workitem_id 0
-    .amdhsa_next_free_vgpr 96
+    .amdhsa_next_free_vgpr 100
     .amdhsa_next_free_sgpr 32
-    .amdhsa_accum_offset 96
+    .amdhsa_accum_offset 64
     .amdhsa_float_round_mode_32 0
     .amdhsa_float_round_mode_16_64 0
     .amdhsa_float_denorm_mode_32 3
@@ -577,7 +577,7 @@ amdhsa.kernels:
     .kernarg_segment_align: 8
     .wavefront_size: 64
     .sgpr_count: 32
-    .vgpr_count: 96
+    .vgpr_count: 100
     .agpr_count: 4
     .max_flat_workgroup_size: 64
     .args:
