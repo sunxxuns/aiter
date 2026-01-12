@@ -102,17 +102,21 @@ _ZN5aiter13fwd_fp8_kloopE:
     // K-TILE LOOP
     // ========================================================================
 K_TILE_LOOP:
-    // Load K tile to LDS at offset 4096
+    // Recalculate v1 for K load (might have been clobbered)
+    v_lshlrev_b32_e32 v1, 4, v0
+    
+    // Load K tile to LDS at offset 4096 (matching working kernel pattern)
     s_mov_b32 m0, 4096
-    buffer_load_dwordx4 v1, s[12:15], s27 offen lds
-    s_add_i32 s20, s27, 1024
+    s_mov_b32 s20, s27
+    buffer_load_dwordx4 v1, s[12:15], s20 offen lds
     s_mov_b32 m0, 5120
+    s_add_i32 s20, s27, 1024
     buffer_load_dwordx4 v1, s[12:15], s20 offen lds
-    s_add_i32 s20, s27, 2048
     s_mov_b32 m0, 6144
+    s_add_i32 s20, s27, 2048
     buffer_load_dwordx4 v1, s[12:15], s20 offen lds
-    s_add_i32 s20, s27, 3072
     s_mov_b32 m0, 7168
+    s_add_i32 s20, s27, 3072
     buffer_load_dwordx4 v1, s[12:15], s20 offen lds
     
     s_waitcnt vmcnt(0)
@@ -270,29 +274,8 @@ K_TILE_LOOP:
     v_permlane32_swap_b32_e32 v22, v20
     v_add_f32_e32 v20, v20, v22           // v20 = tile_sum
     
-    // Update running_sum
+    // Update running_sum (P is NOT normalized per-tile for online softmax)
     v_add_f32_e32 v71, v71, v20
-    
-    // NORMALIZE P per-tile (like working kernel)
-    // This ensures P @ V gives correctly scaled output
-    v_rcp_f32_e32 v19, v20
-    s_nop 3
-    v_mul_f32_e32 v32, v32, v19
-    v_mul_f32_e32 v33, v33, v19
-    v_mul_f32_e32 v34, v34, v19
-    v_mul_f32_e32 v35, v35, v19
-    v_mul_f32_e32 v36, v36, v19
-    v_mul_f32_e32 v37, v37, v19
-    v_mul_f32_e32 v38, v38, v19
-    v_mul_f32_e32 v39, v39, v19
-    v_mul_f32_e32 v40, v40, v19
-    v_mul_f32_e32 v41, v41, v19
-    v_mul_f32_e32 v42, v42, v19
-    v_mul_f32_e32 v43, v43, v19
-    v_mul_f32_e32 v44, v44, v19
-    v_mul_f32_e32 v45, v45, v19
-    v_mul_f32_e32 v46, v46, v19
-    v_mul_f32_e32 v47, v47, v19
     
     // ========================================================================
     // STORE P TO LDS, LOAD V
@@ -499,10 +482,14 @@ K_TILE_LOOP:
     s_cbranch_scc1 K_TILE_LOOP
     
     // ========================================================================
-    // NO FINAL NORMALIZATION (P is normalized per-tile)
-    // For true online softmax, would need: O = O / running_sum
+    // FINAL NORMALIZATION: O = O / running_sum
     // ========================================================================
-    // (skip for now - P is normalized per-tile)
+    v_rcp_f32_e32 v72, v71
+    s_nop 3
+    
+    .irp i, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95
+        v_mul_f32_e32 v\i, v\i, v72
+    .endr
     
     // ========================================================================
     // STORE OUTPUT (first 32 columns only)
