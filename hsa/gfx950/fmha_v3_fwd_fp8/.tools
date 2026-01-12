@@ -58,12 +58,16 @@ python asm_validator.py --params 128 -1 -1
 - Cannot track register values through complex control flow
 - May miss issues in unrolled loops
 - Does not validate MFMA operand layouts
+- Does not check AGPR write timing (Bug #7)
 
 **False positive cases**:
 - (none known yet)
 
 **False negative cases**:
 - Buffer descriptor overwritten after initial setup (partially detected)
+- AGPR write timing issues (v_accvgpr_write before vs after V packing)
+
+**Improvement needed**: Add check for AGPR write distance from MFMA
 
 ---
 
@@ -72,20 +76,20 @@ python asm_validator.py --params 128 -1 -1
 **Purpose**: Runtime tests with structured inputs
 
 **What it checks**:
-- V=1 identity (sum of softmax = 1)
-- Tile isolation (each tile contributes)
+- **HD tile identity** (NEW): Tests each HD tile (0-31, 32-63, 64-95, 96-127) separately
+- V=1 identity (sum of softmax = 1, all 128 columns)
+- Tile isolation (each K-tile contributes)
 - Accumulation (sum of isolated = full)
-- Element ratio consistency
+- Element ratio consistency (all 128 columns)
 
 **Sanity checks**:
 ```bash
-# Should pass all 19 tests
+# Should pass all tests including HD tile test
 python debug_harness.py fwd_fp8_kloop.s
-# Expected: "19/19 tests passed"
+# Expected: "XX/XX tests passed" (includes 4 HD tile tests)
 ```
 
 **Known limitations**:
-- Only tests first 32 HD columns (until Phase 4)
 - Threshold hardcoded (may need adjustment for different precisions)
 - Cannot detect subtle timing/race issues
 
@@ -94,6 +98,9 @@ python debug_harness.py fwd_fp8_kloop.s
 
 **False negative cases**:
 - Bugs that only manifest with specific Q/K patterns
+
+**Bug #7 detection**: The HD tile identity test would catch AGPR timing bugs
+where only one HD tile fails (e.g., HD0 NaN while HD1-3 correct)
 
 ---
 
@@ -125,6 +132,9 @@ python test_bf16_baseline.py
 | 2024-01-12 | asm_validator.py | Created | Initial version |
 | 2024-01-12 | debug_harness.py | Created | Initial version |
 | 2024-01-12 | test_bf16_baseline.py | Created | Validate methodology |
+| 2024-01-12 | debug_harness.py | Added HD tile identity test | Catch Bug #7 (AGPR timing) |
+| 2024-01-12 | debug_harness.py | Updated tests to check all 128 cols | Phase 4 full HD=128 |
+| 2024-01-12 | .bugs | Added Bug #7, #8 | AGPR write timing issues |
 
 ---
 

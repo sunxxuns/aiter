@@ -125,7 +125,7 @@ class DebugKernel:
         self.launch(O, Q_fp8, K_fp8, V_fp8, seq_len)
         
         expected = 1.0
-        actual_mean = O[:, :32].mean().item()
+        actual_mean = O.mean().item()  # Check ALL 128 columns
         error = abs(actual_mean - expected)
         
         passed = error < 0.1
@@ -139,6 +139,49 @@ class DebugKernel:
         )
         self.results.append(result)
         return result
+        
+    def test_hd_tile_identity(self, seq_len: int = 32) -> List[TestResult]:
+        """
+        Test each HD tile (cols 0-31, 32-63, 64-95, 96-127) separately.
+        This catches bugs like Bug #7 (AGPR write timing) where only one HD tile fails.
+        """
+        results = []
+        hd_tiles = [(0, 32, "HD0 cols 0-31"), (32, 64, "HD1 cols 32-63"), 
+                    (64, 96, "HD2 cols 64-95"), (96, 128, "HD3 cols 96-127")]
+        
+        torch.manual_seed(42)
+        Q = torch.randn(32, 128, device='cuda') * 0.5
+        K = torch.randn(seq_len, 128, device='cuda') * 0.5
+        V = torch.ones(seq_len, 128, device='cuda')
+        
+        Q_fp8 = Q.to(torch.float8_e4m3fn)
+        K_fp8 = K.to(torch.float8_e4m3fn)
+        V_fp8 = V.to(torch.float8_e4m3fn)
+        O = torch.zeros(32, 128, dtype=torch.float32, device='cuda')
+        
+        self.launch(O, Q_fp8, K_fp8, V_fp8, seq_len)
+        
+        for start, end, name in hd_tiles:
+            tile_mean = O[:, start:end].mean().item()
+            tile_has_nan = torch.isnan(O[:, start:end]).any().item()
+            
+            expected = 1.0
+            error = abs(tile_mean - expected) if not tile_has_nan else float('inf')
+            passed = not tile_has_nan and error < 0.1
+            
+            msg = f"NaN detected!" if tile_has_nan else f"mean={tile_mean:.4f}"
+            result = TestResult(
+                name=f"{name} identity (seq={seq_len})",
+                passed=passed,
+                max_error=error,
+                mean_error=error,
+                message=msg,
+                details={'tile': name, 'mean': tile_mean, 'has_nan': tile_has_nan}
+            )
+            results.append(result)
+            self.results.append(result)
+            
+        return results
         
     def test_tile_isolation(self, seq_len: int = 64) -> List[TestResult]:
         """
@@ -229,7 +272,7 @@ class DebugKernel:
         return result
         
     def test_reference_match(self, seq_len: int = 64, threshold: float = 0.15) -> TestResult:
-        """Standard reference comparison test"""
+        """Standard reference comparison test (all 128 columns)"""
         torch.manual_seed(42)
         Q = torch.randn(32, 128, device='cuda') * 0.5
         K = torch.randn(seq_len, 128, device='cuda') * 0.5
@@ -243,8 +286,9 @@ class DebugKernel:
         self.launch(O, Q_fp8, K_fp8, V_fp8, seq_len)
         O_ref = self.reference(Q_fp8, K_fp8, V_fp8)
         
-        max_err = (O[:, :32] - O_ref[:, :32]).abs().max().item()
-        mean_err = (O[:, :32] - O_ref[:, :32]).abs().mean().item()
+        # Check ALL 128 columns
+        max_err = (O - O_ref).abs().max().item()
+        mean_err = (O - O_ref).abs().mean().item()
         passed = max_err < threshold
         
         result = TestResult(
@@ -275,9 +319,9 @@ class DebugKernel:
         self.launch(O, Q_fp8, K_fp8, V_fp8, seq_len)
         O_ref = self.reference(Q_fp8, K_fp8, V_fp8)
         
-        # Calculate ratios for elements with significant magnitude
-        mask = O_ref[:, :32].abs() > 0.01
-        ratios = O[:, :32][mask] / O_ref[:, :32][mask]
+        # Calculate ratios for elements with significant magnitude (all 128 cols)
+        mask = O_ref.abs() > 0.01
+        ratios = O[mask] / O_ref[mask]
         
         ratio_std = ratios.std().item()
         ratio_mean = ratios.mean().item()
@@ -310,6 +354,13 @@ class DebugKernel:
         
         self.build()
         self.load()
+        
+        # First: HD tile test with single seq tile (catches Bug #7: AGPR timing)
+        print(f"\n📋 HD Tile Identity Test (seq_len=32)")
+        print("-" * 50)
+        hd_results = self.test_hd_tile_identity(32)
+        for r in hd_results:
+            print(f"  {'✅' if r.passed else '❌'} {r.name}: {r.message}")
         
         for seq_len in seq_lens:
             print(f"\n📋 Testing seq_len={seq_len} ({seq_len//32} tiles)")

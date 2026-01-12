@@ -101,6 +101,53 @@ v_exp_f32_e32 v32, v23         // P = exp((S - new_max) * scale)
 
 ---
 
+## MFMA Operand Setup
+
+### 7. AGPR Write Too Early
+**Symptom**: First MFMA output wrong/NaN, subsequent outputs correct
+**Cause**: AGPR write happens before V packing, but v30 used as temp gets overwritten
+```asm
+// WRONG - AGPR write before V packing
+v_cvt_pk_fp8_f32 v30, v26, v27    // v30 = P temp
+v_or_b32_e32 v29, v29, v30        // Merge into v29
+v_accvgpr_write_b32 a0, v28       // Write P to AGPR
+v_accvgpr_write_b32 a1, v29
+s_nop 1
+// ... V read ...
+v_or_b32_e32 v30, v10, v13        // v30 = V data (overwrites!)
+v_mfma_f32_32x32x16_fp8_fp8 v[80:95], a[0:1], v[30:31], v[80:95]
+
+// CORRECT - AGPR write after V packing, immediately before MFMA
+v_cvt_pk_fp8_f32 v30, v26, v27    // v30 = P temp
+v_or_b32_e32 v29, v29, v30        // Merge into v29
+// ... V read ...
+v_or_b32_e32 v30, v10, v13        // v30 = V data
+v_accvgpr_write_b32 a0, v28       // Write P to AGPR
+v_accvgpr_write_b32 a1, v29
+s_nop 1
+v_mfma_f32_32x32x16_fp8_fp8 v[80:95], a[0:1], v[30:31], v[80:95]
+```
+**Detection**:
+- First HD tile wrong, other HD tiles correct
+- Per-HD-tile V=1 test shows tile 0 != 1.0
+
+### 8. Multi-HD-Tile AGPR Reuse
+**Symptom**: Some HD tiles produce wrong output
+**Cause**: Assuming AGPRs persist across multiple MFMAs without refresh
+```asm
+// When doing 4 HD tiles with same P data:
+// MUST refresh AGPRs before each MFMA
+READ_V_COL 32, 0
+v_accvgpr_write_b32 a0, v28       // Refresh!
+v_accvgpr_write_b32 a1, v29
+s_nop 1
+v_mfma_f32_32x32x16_fp8_fp8 v[96:111], a[0:1], v[30:31], v[96:111]
+```
+**Note**: AGPRs ARE preserved across MFMAs, but refreshing ensures correctness
+if any intervening code might modify them.
+
+---
+
 ## Debug Strategies
 
 ### Quick Checks
