@@ -1,0 +1,39 @@
+###task###
+ to write an assembly kernel to do fp8 flash attention, to provide tf/s higher than bf16
+ the bf16 flash attention as the golden reference:
+ /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd/fwd_hd128_bf16.s
+
+###Make sure ###
+do not fall back to triton or CK kernels, we only want asm
+do not rewrite different strategy than the bf16 reference, as it would be very challenging
+use per tensor scaled fp8 1-4-3 input make sure it's same as mfma fp8 kernel expect. 
+first downcast then calling mfma fp8
+we are using the same strategy as the bf16 version, such as online softmax
+read past lessnons recorded in .lessons
+
+### benchmark ###
+to benchmark tf/s use python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 32130
+this is the shape we are aiming for
+this is how we bench bf16 flash attn kernel around 1000TF/s, fp8 should at least have 30% more
+divide the diffcult task into small tasks and make the numeric right
+### hill climbing strategy ###
+-refer to .milestone to understand roadmap and the current phase
+-adding/revising .s file to implement
+-compare with the bf16 reference and update the same and difference in .comp
+-return if there's significant difference non necessary
+-doing numeric tests 
+-doing benchmar on tf/s
+-return if numeric tests does not pass or there's non scalable performance
+-write down lessons and update .milestone .lessons .bench .numerics for reviewer to decide whether to move to next phase
+-check if current .bench results are scalable toward the goal and update .scale
+
+#additional:
+do not do long reasoning on the entire flash attn kernel, instead, calve out problemtic part and do minmal test/debug,
+for each time, do vigorious numerica test, use structured or random input to reveal potential accumulation or order issues,
+do not use uniform input got false positive
+# log files
+.bench: record tf/s and reason if it meets expected value for fp8 (using bf16 as a reference)
+.scale: reasoning if current implementation is scalable to > 1300 TF/s for the shapes in --seq-len 32130
+.numerics: make sure the layout correct, yield correct results
+.comp: make sure following the patterns in bf16 asm, with only the necessary differences
+.milestone: record road maps and summarize current status

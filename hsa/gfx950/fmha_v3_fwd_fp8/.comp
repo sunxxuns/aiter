@@ -273,18 +273,167 @@ Issues found:
 3. **LDS access**: Coordinate to avoid conflicts
 4. **Reduction**: Use `v_permlane32_swap_b32_e32` (same as 64T)
 
-### Next: Multi-Wave Compute
+### Next: Multi-Wave Compute (Step-by-Step)
 
-To achieve 4x occupancy, need all 4 waves computing:
-- Wave 0: Q rows 0-7
-- Wave 1: Q rows 8-15
-- Wave 2: Q rows 16-23
-- Wave 3: Q rows 24-31
+**Goal**: All 4 waves computing their respective Q rows
 
-But current MFMA produces 32×32 output per wave.
-Options:
-1. Each wave computes full 32×32, stores only its 8 rows
-2. Cooperative compute where waves split the work
+**Reference Architecture** (from BF16):
+- Wave 0: Q rows 0-7   → S[0:8, :]   → O[0:8, :]
+- Wave 1: Q rows 8-15  → S[8:16, :] → O[8:16, :]
+- Wave 2: Q rows 16-23 → S[16:24, :] → O[16:24, :]
+- Wave 3: Q rows 24-31 → S[24:32, :] → O[24:32, :]
+
+---
+
+## Step-by-Step Implementation Plan
+
+### Step 1: Wave-Aware Q Load ✅ (to implement)
+**BF16 Reference** (lines 180-182, 284-289):
+```asm
+// BF16: LDS offset per wave
+s_mul_i32 s63, 0x408, s5          // wave_offset = 0x408 * wave_id
+s_add_u32 s63, 0x8200, s63        // + base
+s_mov_b32 m0, s63                 // m0 = LDS destination
+
+// BF16: Q source offset per wave (lines 344-354)
+s_and_b32 s40, 1, s5              // wave_id & 1
+s_mul_i32 s40, s40, s47           // * stride
+s_mul_i32 s40, 2, s40             // * 2
+```
+
+**FP8 Adaptation**:
+```asm
+// FP8: Each wave loads 8 Q rows (8 × 128 × 1B = 1KB)
+s_mul_i32 s40, s_wave_id, 1024    // wave_offset = wave_id * 1KB
+s_mov_b32 m0, s40                 // LDS destination for wave's Q
+// Then load 8 rows per wave
+```
+
+**Test**: Output wave_id and Q values per wave
+
+### Step 2: Shared K/V Load (all 256 threads)
+**BF16**: All 256 threads cooperate to load K/V
+**FP8 Adaptation**:
+```asm
+// 256 threads × 16 bytes = 4KB (one FP8 tile)
+// thread_id = wave_id*64 + lane_id
+v_lshlrev_b32 v_tid, 6, v_wave_id
+v_add_u32 v_tid, v_tid, v_lane_id
+v_lshlrev_b32 v_offset, 4, v_tid   // × 16 bytes
+s_mov_b32 m0, 4096                 // K at LDS offset 4096
+buffer_load_dwordx4 v_offset, srd_K, s_k_tile_offset offen lds
+```
+
+**Test**: Verify K data in LDS is correct
+
+### Step 3: Per-Wave QK MFMA
+**Key Insight**: MFMA 32×32×16 outputs 32 rows, but each wave only uses 8 rows.
+
+**BF16 Strategy** (Option B from above):
+- Each wave computes full 32×32 S matrix
+- Each wave only stores/uses its 8 rows from the result
+- "Wasteful" but simple - 4 waves compute 4× redundantly
+
+**FP8 Adaptation**:
+```asm
+// Each wave reads Q from its LDS region (wave_id * 1024)
+// Each wave reads K from shared region (4096)
+// QK MFMA produces 32×32 S, wave uses rows [wave_id*8 : (wave_id+1)*8]
+```
+
+**Test**: Output S matrix, verify each wave's 8 rows
+
+### Step 4: Per-Wave Softmax
+**No cross-wave dependency** - each row is independent!
+```asm
+// Softmax for wave's 8 rows
+// running_max[8], running_sum[8] per wave
+// Cross-lane reduction within wave (same as 64T)
+```
+
+### Step 5: Per-Wave PV MFMA
+```asm
+// P is in registers (8 rows × 32 cols)
+// V is in shared LDS
+// Output: O[8 rows × 128 cols]
+```
+
+### Step 6: Per-Wave Output Store
+**BF16 Reference** (lines 2462-2465):
+```asm
+s_mul_i32 s40, s5, s79            // s40 = wave_id * stride
+s_mul_i32 s40, s40, 32            // s40 *= 32 rows per chunk
+s_add_u32 s40, s59, s40           // s40 = base + wave_offset
+v_add_u32_e32 v22, s40, v12       // Final output addr
+```
+
+**FP8 Adaptation**:
+```asm
+// Wave's output starts at: base + wave_id * 8 * 128 * 4 bytes
+s_mul_i32 s40, s_wave_id, 8*128*4  // 4096 bytes per wave
+s_add_u32 s40, s_base, s40
+// Store wave's 8 rows
+```
+
+---
+
+## Current Progress
+
+| Step | Description | Status |
+|------|-------------|--------|
+| 1 | Wave-aware Q load | ✅ PASSED |
+| 2 | Shared K/V load | ✅ PASSED |
+| 3 | Per-wave QK MFMA | ❌ DEBUGGING |
+| 4 | Per-wave softmax | ⬜ Pending |
+| 5 | Per-wave PV MFMA | ⬜ Pending |
+| 6 | Per-wave output store | ⬜ Pending |
+
+### Step 3 Debugging Notes
+
+Issue: QK MFMA produces wrong S values despite correct LDS data.
+- LDS verification: Q[0,0]=56, K[0,0]=56 ✓
+- Expected S[0,0]=128.0 (sum of 128 products of 1.0×1.0)
+- Actual: garbage values (varies each run)
+
+Attempted fixes:
+1. Early wave masking (like fwd_fp8_256t_min.s) - still wrong
+2. Simplified Q/K load (4 passes like 64T) - still wrong
+3. Removed debug section - still wrong
+
+The working fwd_fp8_256t_min.s (wave 0 only) produces correct output=1.0.
+The step3 kernel has same structure but outputs wrong MFMA values.
+
+Next steps to try:
+1. Compare disassembly of working vs step3 MFMA sections
+2. Check if exec mask affects MFMA register allocation
+3. Verify AGPR setup is correct
+
+### Step 1 Results
+```
+Wave 0: Q[0,0]=0x38, Q[0,127]=0x39 ✅ (loaded to LDS[0:1023])
+Wave 1: Q[8,0]=0x48, Q[8,127]=0x49 ✅ (loaded to LDS[1024:2047])
+Wave 2: Q[16,0]=0x58, Q[16,127]=0x59 ✅ (loaded to LDS[2048:3071])
+Wave 3: Q[24,0]=0x68, Q[24,127]=0x69 ✅ (loaded to LDS[3072:4095])
+All 256 wave_id and lane_id values correct ✅
+```
+
+### Step 2 Results
+**Key Pattern**: Each wave loads 1KB, with wave-dependent m0 and scalar offset:
+```asm
+// Wave's per-thread offset (same as 64T)
+v_lshlrev_b32_e32 v3, 4, v0            // v3 = lane_id * 16
+
+// Wave's global source offset
+s_mul_i32 s21, s_wave_id, 1024         // s21 = wave_id * 1024
+
+// Wave's LDS destination base
+s_add_u32 s22, s21, 4096               // s22 = 4096 + wave_id * 1024
+s_mov_b32 m0, s22                      // m0 = LDS base for this wave
+
+// Load K (same pattern as 64T's 4-pass loop, but all waves run in parallel)
+buffer_load_dwordx4 v3, s[12:15], s21 offen lds
+```
+K corners verified: K[0,0]=0xAA, K[0,127]=0xBB, K[31,0]=0xCC, K[31,127]=0xDD ✅
 
 ---
 
