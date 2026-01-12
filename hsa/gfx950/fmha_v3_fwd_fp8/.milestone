@@ -84,27 +84,81 @@ Target: 128 Q rows per workgroup (4× more work)
 
 ---
 
-## LDS Layout (64KB available)
+## LDS Layout - Lessons Learned
 
+### Simple Row-Major Works!
+After extensive debugging, we found that simple row-major LDS layout DOES work correctly.
+The "ds_read_b64 returns zeros" issue was a **Python test bug** (see .lessons).
+
+Simple row-major is fine:
 ```
-Offset      Size    Content
-0x0000      16KB    Q[128×128×1B] - all 128 rows
-0x4000      4KB     K tile[32×128×1B]
-0x5000      4KB     V tile[32×128×1B]  
-0x6000      16KB    P intermediate per wave (4×4KB)
-0x8000      24KB    Scratch/prefetch
+Wave 0: Q at LDS[0:4095]        (32×128 bytes)
+Wave 1: Q at LDS[4096:8191]
+...
 ```
+
+### BF16 Swizzling for Performance
+BF16 uses swizzled layout for **performance** (bank-conflict-free), not correctness:
+```asm
+s_mul_i32 s63, 0x408, s5         // wave_id × 1032 (swizzled stride)
+s_add_u32 s63, 0x8200, s63       // + 33280 base
+```
+
+**Recommendation**: Use BF16 swizzling for optimal performance, but simple layout works.
 
 ---
 
-## Implementation Steps
+## Implementation Steps (UPDATED)
 
-1. [ ] Modify kernel to accept 128 Q rows (increase LDS allocation)
-2. [ ] Per-wave Q region: wave loads Q[wave_id*32:(wave_id+1)*32]
-3. [ ] Shared K/V: all 256 threads cooperate to load
-4. [ ] Per-wave softmax (rows are independent, no cross-wave sync)
-5. [ ] Per-wave PV compute and output
-6. [ ] Benchmark and tune
+### Phase 1: Working 64T Kernel ✅ COMPLETE
+- fwd_fp8_kloop.s: K-loop with online softmax
+- ds_read_b64 works correctly (Python test bug was fixed)
+
+### Phase 1.5: Build 256T FP8 Kernel Following BF16 Exactly [CURRENT]
+**Decision**: Use ds_read_b64_tr_b16 with "2 FP8 = 1 BF16" packing (see lesson 8.8)
+
+**Why this approach**:
+- EXACT same LDS byte layout as BF16
+- EXACT same swizzle pattern (proven bank-conflict-free)
+- EXACT same instruction sequence (ds_read_b64_tr_b16)
+- Matches .cursorrules: "do not rewrite different strategy than bf16 reference"
+
+**Implementation plan**:
+1. [x] Understand BF16's swizzle formula (read offsets derived)
+2. [x] Confirm ds_read_b64_tr_b16 works with FP8 pairs
+3. [x] Document approach (lesson 8.8)
+4. [x] **Swizzled write + transpose read verified** (step2_flat.s)
+   - buffer_load ... offen lds has buffer descriptor issues
+   - Used flat_load + ds_write_b128 with swizzled addresses instead
+   - Transpose read gives correct pattern: stride-4 gather
+   - Thread 0 reads: [row0, row4, row8, row12] = perfect!
+5. [ ] **Build 256T kernel**:
+   - Use flat_load + ds_write (swizzled) for Q/K/V
+   - FP8 MFMA: 2 VGPRs per operand (vs BF16's 4) → fewer reads!
+6. [ ] Verify numerics with non-uniform attention
+7. [ ] Benchmark TF/s
+
+### Phase 2: Scale to 256T (128 Q rows)
+1. [ ] Extend fixed kernel to 4 waves
+2. [ ] Each wave loads its own Q[32 rows]
+3. [ ] All waves share K/V loading
+4. [ ] Per-wave output to O[wave_id*32 : wave_id*32+32]
+
+### Phase 3: Optimize for >1300 TF/s
+5. [ ] Double buffering for K/V tiles
+6. [ ] Instruction scheduling (hide memory latency)
+7. [ ] Benchmark and tune
+
+### Key Insights
+- Simple row-major LDS works (no swizzling required for correctness)
+- BF16 swizzling is for performance optimization only
+- Waves are independent (no cross-wave reduction needed)
+- **CRITICAL**: Kernel metadata must match working kernel:
+  ```asm
+  .amdhsa_next_free_vgpr 148
+  .amdhsa_accum_offset 148
+  ```
+  Using lower values causes MFMA output corruption/NaN!
 
 ---
 

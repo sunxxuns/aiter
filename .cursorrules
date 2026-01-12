@@ -11,6 +11,27 @@ first downcast then calling mfma fp8
 we are using the same strategy as the bf16 version, such as online softmax
 read past lessnons recorded in .lessons
 
+###CRITICAL: Python Debug Buffer Bug - WASTED HOURS OF DEBUGGING!###
+When reading uint32 values from a float32 debug buffer in Python:
+
+WRONG (returns 0 for values like 0x2e9b391c stored as raw bits):
+  b64_lo = int(d[0].item())   # BUG: int(0.000000) = 0
+
+CORRECT (interprets raw bits properly):
+  import struct
+  def as_u32(f): return struct.unpack('I', struct.pack('f', f))[0]
+  b64_lo = as_u32(d[0].item())  # Returns 0x2e9b391c correctly
+
+This bug caused HOURS debugging "ds_read_b64 returns zeros" when the instruction
+was working correctly! Kernel stores uint32 via v_mov_b32, Python int() truncates.
+ALWAYS use struct.unpack for uint32 values in float32 debug buffers!
+
+###Follow BF16 Patterns for Performance###
+The BF16 reference kernel uses SWIZZLED LDS layout for performance (bank-conflict-free).
+- The swizzling with 0x408 stride, base offsets like 0x8200 is for PERFORMANCE
+- Simple row-major LDS layout DOES work correctly (ds_read_b64 is fine)
+- But BF16's swizzled layout is recommended for optimal throughput
+
 ### benchmark ###
 to benchmark tf/s use python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 32130
 this is the shape we are aiming for

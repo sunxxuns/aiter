@@ -1,0 +1,115 @@
+# Plan: Build 256T FP8 Kernel Following BF16
+
+## Goal
+Create FP8 flash attention kernel that follows BF16's structure exactly,
+achieving >1300 TF/s (30% improvement over BF16's ~1000 TF/s).
+
+## Key Insight: "2 FP8 = 1 BF16" Packing
+
+Since FP8 is 8-bit and BF16 is 16-bit:
+- Pack two FP8 values into each 16-bit slot
+- Use EXACT same byte addresses as BF16
+- Use EXACT same ds_read_b64_tr_b16 instruction
+- After reading, interpret bytes as FP8 instead of BF16
+
+## What Changes from BF16
+
+| Component | BF16 | FP8 |
+|-----------|------|-----|
+| Thread count | 256 | 256 (same) |
+| LDS layout | Swizzled | Same byte offsets |
+| Global load | buffer_load ... lds | Same |
+| LDS read | ds_read_b64_tr_b16 | Same |
+| MFMA instruction | v_mfma_f32_32x32x16_bf16 | v_mfma_f32_32x32x16_fp8_fp8 |
+| A operand VGPRs | 4 (8 BF16) | 2 (8 FP8) |
+| B operand VGPRs | 4 (8 BF16) | 2 (8 FP8) |
+| Reads per operand | 2 | 1 |
+
+FP8 needs FEWER reads than BF16! This could mean better performance.
+
+## Implementation Steps
+
+### Step 1: Copy BF16 Structure ✅
+- Start from fwd_hd128_bf16.s
+- Keep all LDS layout, m0 offsets, swizzle patterns
+
+### Step 2: Adapt Data Loading ✅ VERIFIED
+- **Finding**: buffer_load ... offen lds has buffer descriptor issues
+- **Solution**: Use flat_load + ds_write_b128 with swizzled addresses
+- Swizzle formula: `addr = 0x8200 + (lane&1)*0x80 + (lane>>1)*0x408 + (lane>>5)*16 + wave_offset`
+- FP8 data is pre-packed as [fp8_even, fp8_odd] pairs
+- **Result**: Thread 0 transpose read gets [row0, row4, row8, row12] = correct!
+
+### Step 3: Adapt ds_read_b64_tr_b16
+- Same offset tables
+- Result goes to 2 VGPRs instead of 4
+- One read per MFMA operand (instead of two)
+
+### Step 4: Adapt MFMA Calls
+- Change instruction to v_mfma_f32_32x32x16_fp8_fp8
+- A operand: 2 VGPRs (from one ds_read)
+- B operand: 2 VGPRs (from one ds_read)
+- Output: 16 VGPRs (same as BF16)
+
+### Step 5: Adapt Softmax
+- Same online softmax algorithm
+- Scale factor changes for FP8 range
+
+### Step 6: Adapt Output Store
+- Same output pattern
+- Output is F32 (same as BF16)
+
+## File Structure
+
+```
+New files to create:
+├── fwd_fp8_256t_swizzle.s    # Main kernel (copy from BF16, adapt)
+├── test_256t_swizzle.py       # Test script
+
+Reference:
+├── fwd_hd128_bf16.s          # BF16 reference (DO NOT MODIFY)
+└── fwd_fp8_kloop.s           # Working 64T FP8 (for numeric reference)
+```
+
+## Key Code Sections to Adapt
+
+### 1. LDS Load (lines 180-270 in BF16)
+```asm
+// BF16: buffer_load_dwordx4 v4, s[8:11], 0 offen lds
+// FP8: Same! Data is packed so same byte size
+buffer_load_dwordx4 v4, s[8:11], 0 offen lds
+```
+
+### 2. ds_read_b64_tr_b16 (lines 780-810 in BF16)
+```asm
+// BF16: 32 reads to fill 4 VGPRs per operand
+// FP8: 16 reads to fill 2 VGPRs per operand
+
+// BF16 pattern (needs 2 reads for A operand):
+ds_read_b64_tr_b16 v[192:193], v10           // 4 BF16 = 8 bytes
+ds_read_b64_tr_b16 v[194:195], v10 offset:512 // 4 more BF16
+
+// FP8 pattern (needs 1 read for A operand):
+ds_read_b64_tr_b16 v[30:31], v10             // 4 "BF16 slots" = 8 FP8
+// That's it! One read gives full MFMA operand
+```
+
+### 3. MFMA Call
+```asm
+// BF16:
+v_mfma_f32_32x32x16_bf16 v[96:111], v[192:195], v[32:35], v[96:111]
+//                       output     A (4 VGPRs) B (4 VGPRs)
+
+// FP8:
+v_mfma_f32_32x32x16_fp8_fp8 v[96:111], v[30:31], v[32:33], v[96:111]
+//                          output    A (2 VGPRs) B (2 VGPRs)
+```
+
+## Performance Expectation
+
+FP8 should be FASTER than BF16 because:
+1. Same LDS bandwidth utilization
+2. Fewer ds_read instructions (1 vs 2 per operand)
+3. FP8 MFMA has higher theoretical TFLOPS
+
+Target: >1300 TF/s (vs BF16's ~1000 TF/s)
