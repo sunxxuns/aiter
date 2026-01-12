@@ -30,8 +30,23 @@ SeqLen  Tiles   Time(us)     TFLOPS
   4096    128      408.1     0.1661
 ```
 
-**Note**: These numbers are for single-head, 32-row kernel.
-Production benchmark requires multi-head extension (Phase 5+).
+## FP8 vs BF16 Comparison (`--compare`)
+
+```
+SeqLen    FP8 us/GF   BF16 us/GF    Speedup
+--------------------------------------------
+    32    12422.990    56398.823     4.54x  ← FP8 wins (same work)
+    64     9285.919    13382.402     1.44x  ← FP8 wins
+   128     7646.149     3283.553     0.43x  ← BF16 wins (parallelism)
+   256     6782.253      885.982     0.13x
+  1024     6171.260       80.362     0.01x
+  4096     6023.830       11.216     0.00x
+```
+
+**Key Insight**:
+- FP8 compute efficiency is **~2x better** than BF16 (us/GF at seq=32)
+- BF16 wins at large seq_len due to **multi-workgroup parallelism**
+- FP8 needs Phase 5+ (multi-head) to match BF16 at production sizes
 
 ## Target Performance (Full Kernel)
 
