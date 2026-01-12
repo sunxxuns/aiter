@@ -249,12 +249,42 @@ Similar structure to QK.
 | AGPRs | 4 | ~16 | 96 |
 | Waves | 1 | 4 | 4 |
 
+### Working 256T Kernel: fwd_fp8_256t_min.s
+
+**Approach**: Minimal modification to 64T kernel
+- Add wave_id extraction: `v1 = v0 >> 6`
+- Mask to wave 0: `v_cmp_eq_u32 + s_and_saveexec`
+- Wave 0 runs identical compute as 64T
+- Waves 1-3 branch to END_KERNEL
+
+**Result**: Produces IDENTICAL output to 64T (max diff = 0.0)
+
+### Failed Approach: fwd_fp8_v256_step3.s
+
+Issues found:
+1. Modified Q/K load pattern (single pass) broke LDS layout
+2. Race conditions on P LDS storage
+3. Different reduction pattern (DPP vs permlane32_swap)
+
 ### Key Differences from 64T
 
 1. **Thread ID**: `v0` is lane (0-63), `v1` is wave (0-3)
 2. **Output rows**: Each wave handles 8 rows, not 32
 3. **LDS access**: Coordinate to avoid conflicts
-4. **Reduction**: Need cross-wave max/sum
+4. **Reduction**: Use `v_permlane32_swap_b32_e32` (same as 64T)
+
+### Next: Multi-Wave Compute
+
+To achieve 4x occupancy, need all 4 waves computing:
+- Wave 0: Q rows 0-7
+- Wave 1: Q rows 8-15
+- Wave 2: Q rows 16-23
+- Wave 3: Q rows 24-31
+
+But current MFMA produces 32×32 output per wave.
+Options:
+1. Each wave computes full 32×32, stores only its 8 rows
+2. Cooperative compute where waves split the work
 
 ---
 

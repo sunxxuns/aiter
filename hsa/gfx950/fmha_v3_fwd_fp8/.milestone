@@ -1,0 +1,164 @@
+# FP8 Flash Attention Development Milestone
+
+## Goal
+Achieve >1300 TF/s (30% improvement over BF16's ~1000 TF/s)
+
+## Current State (Phase 6)
+
+### Working Kernels
+| Kernel | Threads | TF/s | Status |
+|--------|---------|------|--------|
+| `fwd_fp8_kloop.s` | 64 | ~150 TF/s | ✅ Correct, slow |
+| `fwd_fp8_full.s` | 64 | ~150 TF/s | ✅ Full seq_len |
+| `fwd_fp8_256t_min.s` | 256 (wave 0 only) | ~150 TF/s | ✅ Same as 64T |
+
+### Problem
+Current 256T kernels only use 1 wave (64 threads) for compute.
+This wastes 3/4 of the hardware resources!
+
+---
+
+## BF16 Reference Architecture Analysis
+
+### Key Finding: Work Distribution
+BF16 kernel (`fwd_hd128_bf16.s`) uses **4 waves computing different Q rows**:
+
+```
+Wave 0: Q rows 0-7   → computes S[0:8, :] → O[0:8, :]
+Wave 1: Q rows 8-15  → computes S[8:16, :] → O[8:16, :]
+Wave 2: Q rows 16-23 → computes S[16:24, :] → O[16:24, :]
+Wave 3: Q rows 24-31 → computes S[24:32, :] → O[24:32, :]
+```
+
+### BF16 Code Evidence
+
+**Wave offset for LDS** (lines 284-289):
+```asm
+s_and_b32 s40, 3, s5              // s40 = wave_id & 3
+s_mul_i32 s40, s40, 0x100         // s40 *= 256 bytes
+v_add_u32_e32 v2, s40, v2         // Add wave offset to LDS addr
+```
+
+**Wave offset for output** (lines 2462-2465):
+```asm
+s_mul_i32 s40, s5, s79            // s40 = wave_id * stride
+s_mul_i32 s40, s40, 32            // s40 *= 32 (rows per chunk)
+s_add_u32 s40, s59, s40           // s40 = base + wave_offset
+v_add_u32_e32 v22, s40, v12       // Final output addr
+```
+
+### BF16 vs Current FP8 Architecture
+
+| Aspect | BF16 256T | FP8 Current |
+|--------|-----------|-------------|
+| Active waves | 4 | 1 |
+| Q rows per wave | 8 | 32 |
+| Occupancy | 100% | 25% |
+| MFMA per tile | 176 | 44 |
+| LDS layout | Per-wave regions | Single region |
+
+---
+
+## Required Changes for FP8 256T
+
+### Phase 6b: Multi-Wave Compute (Critical)
+
+Each wave must:
+1. **Load its 8 Q rows** to its LDS region
+2. **Share K/V tiles** (all waves read same K/V)
+3. **Compute QK for its 8 rows**: S[wave*8:(wave+1)*8, :] = Q[wave*8:(wave+1)*8, :] @ K.T
+4. **Independent softmax** per row (no cross-wave dependency)
+5. **Compute PV for its 8 rows**: O[wave*8:(wave+1)*8, :] = P @ V
+6. **Store its 8 output rows**
+
+### LDS Layout Change
+
+```
+Current (12KB):
+  [0-4095]:    Q (32 rows × 128 cols × 1B)
+  [4096-8191]: K tile
+  [8192-12287]: V tile
+
+Required (32KB+):
+  [0-1023]:     Q wave 0 (8 rows × 128 cols × 1B)
+  [1024-2047]:  Q wave 1
+  [2048-3071]:  Q wave 2
+  [3072-4095]:  Q wave 3
+  [4096-8191]:  K tile (shared)
+  [8192-12287]: V tile (shared)
+  [12288-16383]: P wave 0
+  [16384-20479]: P wave 1
+  [20480-24575]: P wave 2
+  [24576-28671]: P wave 3
+```
+
+### MFMA Changes
+
+For 8 Q-rows per wave with MFMA 32×32×16:
+- Option A: Use MFMA 8×32×16 (if available)
+- Option B: Each wave computes full 32×32, discards 24 rows
+- Option C: 2 waves share one MFMA output (wave 0+1 and wave 2+3)
+
+BF16 uses **Option B** - compute more, store less.
+
+---
+
+## Implementation Plan
+
+### Step 1: Q Load Per-Wave
+```asm
+// Wave's Q region = 8 rows × 128 cols = 1KB
+s_mul_i32 s40, s_wave_id, 1024    // Q LDS offset per wave
+v_add_u32_e32 v_lds, s40, v_lane_offset
+// Load Q[wave*8:(wave+1)*8, :] to LDS[wave*1024:wave*1024+1024]
+```
+
+### Step 2: Shared K/V Load
+All 256 threads cooperate to load K/V:
+```asm
+// Thread 0-255 each load 16 bytes
+v_lshlrev_b32 v_tid, 4, v_thread_id  // tid * 16
+buffer_load_dwordx4 v_tid, srd_K, k_offset offen lds
+```
+
+### Step 3: QK MFMA Per-Wave
+Each wave computes S = K @ Q.T (transposed) for its 8 rows.
+Since MFMA produces 32×32, each wave gets 32 rows of S but only uses 8.
+
+### Step 4: Independent Softmax
+Each wave's rows are independent - no cross-wave reduction needed.
+
+### Step 5: PV MFMA Per-Wave
+Same as QK - each wave computes, uses only its 8 rows.
+
+### Step 6: Store Per-Wave
+```asm
+s_mul_i32 s_out_offset, s_wave_id, 8*128*4  // 8 rows × 128 cols × 4B
+v_add_u32_e32 v_out, s_out_offset, v_lane_offset
+buffer_store v_O, v_out, srd_O offen
+```
+
+---
+
+## Performance Target
+
+| Metric | Current | Target | Improvement |
+|--------|---------|--------|-------------|
+| Active waves | 1 | 4 | 4× |
+| Occupancy | 25% | 100% | 4× |
+| MFMA utilization | ~30% | ~80% | 2.7× |
+| Expected TF/s | 150 | 1300+ | 8.7× |
+
+Theoretical max with FP8: 2× BF16 = 2000 TF/s
+Target: 1300 TF/s = 65% of theoretical
+
+---
+
+## Next Steps
+
+1. [ ] Implement Q load per-wave
+2. [ ] Implement shared K/V load
+3. [ ] Adapt QK MFMA for 8-row output
+4. [ ] Test single-tile correctness
+5. [ ] Add K-tile loop
+6. [ ] Benchmark and optimize
