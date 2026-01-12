@@ -1,0 +1,66 @@
+# FP8 Flash Attention Benchmark
+
+## Quick Benchmark
+
+```bash
+# Benchmark FP8 kernel
+cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
+python bench_fp8_attention.py
+
+# Benchmark BF16 reference (for comparison)
+python /sgl-workspace/sglang/benchmark/kernels/bench_aiter_fmha_v3.py
+```
+
+## Target Performance
+
+- **BF16 baseline**: ~1000 TF/s
+- **FP8 target**: >1300 TF/s (30% improvement)
+
+## Benchmark Methodology
+
+### FLOP Calculation
+For flash attention with:
+- batch=1, heads=1, seq_len=N, head_dim=128
+
+```
+QK MFMA:  32 * N * 128 * 2 FLOPs (matmul)
+Softmax:  32 * N * 5 FLOPs (approx)
+PV MFMA:  32 * N * 128 * 2 FLOPs (matmul)
+Total:    32 * N * 128 * 4 + 32 * N * 5 FLOPs
+        ≈ 32 * N * 517 FLOPs
+```
+
+### Timing
+- Warmup: 10 iterations
+- Measure: 100 iterations
+- Use `hipEventElapsedTime` for accurate GPU timing
+
+## Expected Results (TBD)
+
+| seq_len | BF16 TF/s | FP8 TF/s | Speedup |
+|---------|-----------|----------|---------|
+| 1024 | TBD | TBD | TBD |
+| 4096 | TBD | TBD | TBD |
+| 8192 | TBD | TBD | TBD |
+| 16384 | TBD | TBD | TBD |
+| 32130 | ~1000 | TBD | TBD |
+
+## Benchmark Command
+
+```bash
+# Full benchmark with sequence length
+python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 32130
+```
+
+## Notes
+
+- FP8 MFMA has 2x theoretical throughput vs BF16
+- Memory bandwidth may be limiting factor for long sequences
+- LDS size (12KB) limits tile size to 32 rows
+
+## Optimization Opportunities (Phase 5+)
+
+1. **Prefetching**: Overlap K/V loads with computation
+2. **Register reuse**: Reduce VGPR pressure
+3. **LDS banking**: Minimize bank conflicts
+4. **Instruction scheduling**: Hide latencies

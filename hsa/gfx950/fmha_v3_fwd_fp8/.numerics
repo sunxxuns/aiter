@@ -1,0 +1,66 @@
+# FP8 Flash Attention Numerical Accuracy
+
+## Quick Test
+
+```bash
+cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
+python test_kloop_attn.py
+```
+
+## Expected Results (Full HD=128)
+
+| seq_len | tiles | max_error | mean_error | status |
+|---------|-------|-----------|------------|--------|
+| 32 | 1 | 0.097 | 0.009 | ✅ |
+| 64 | 2 | 0.073 | 0.008 | ✅ |
+| 96 | 3 | 0.060 | 0.007 | ✅ |
+| 128 | 4 | 0.066 | 0.007 | ✅ |
+
+Threshold: max_error < 0.20 (accounts for FP8 quantization noise)
+
+## Detailed Numerical Tests
+
+```bash
+# Run debug harness (23 tests)
+python debug_harness.py fwd_fp8_kloop.s
+
+# Expected output:
+# HD Tile Identity: all 4 HD tiles ~1.0
+# V=1 identity: ~1.01
+# Tile isolation: each tile contributes
+# Accumulation: sum matches full
+# Reference match: max_err < 0.15
+# Element ratios: std < 0.3
+```
+
+## Error Sources
+
+1. **FP8 Quantization** (~0.05-0.10)
+   - Q, K, V converted to FP8 before MFMA
+   - P converted to FP8 before PV MFMA
+   - Inherent precision loss
+
+2. **F32/FP8 Softmax Mismatch** (~0.01-0.03)
+   - `running_sum` accumulated from F32 P values
+   - `O` accumulated from FP8 P @ FP8 V
+   - Final `O / running_sum` has small scale mismatch
+
+3. **Multi-tile Accumulation** (varies)
+   - Error tends to DECREASE with more tiles (averaging effect)
+   - More tiles = more softmax samples = smoother distribution
+
+## Comparison with BF16
+
+| Metric | BF16 | FP8 | Notes |
+|--------|------|-----|-------|
+| V=1 identity | 1.0000 | ~1.01 | FP8 quantization |
+| max_error | ~0.001 | 0.06-0.10 | Expected 10-100x higher |
+| ratio_std | 0.003 | 0.18-0.27 | FP8 noise |
+
+## Red Flags (Indicates Bug)
+
+- ❌ max_error > 0.5 (fundamental bug, not precision)
+- ❌ NaN in output (memory/register issue)
+- ❌ One HD tile wrong, others correct (AGPR timing - Bug #7)
+- ❌ Only tile 0 contributes (buffer descriptor size - Bug #3)
+- ❌ Output all zeros (VGPR staleness - Bug #2)
