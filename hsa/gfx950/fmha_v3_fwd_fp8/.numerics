@@ -4,63 +4,96 @@
 
 ```bash
 cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
-python test_kloop_attn.py
+python test_numerics.py
 ```
 
-## Expected Results (Full HD=128)
+## Test Summary (28 tests)
 
-| seq_len | tiles | max_error | mean_error | status |
-|---------|-------|-----------|------------|--------|
-| 32 | 1 | 0.097 | 0.009 | ✅ |
-| 64 | 2 | 0.073 | 0.008 | ✅ |
-| 96 | 3 | 0.060 | 0.007 | ✅ |
-| 128 | 4 | 0.066 | 0.007 | ✅ |
+All tests verify kernel: `fwd_fp8_kloop.s`
+Shape: 32 Q-rows × seq_len K-rows × 128 head_dim
 
-Threshold: max_error < 0.20 (accounts for FP8 quantization noise)
+### 1. Basic Functionality (4 tests)
+| Test | seq_len | max_error | Status |
+|------|---------|-----------|--------|
+| Single tile | 32 | 0.097 | ✅ |
+| Multi-tile | 64 | 0.073 | ✅ |
+| Multi-tile | 96 | 0.060 | ✅ |
+| Multi-tile | 128 | 0.066 | ✅ |
 
-## Detailed Numerical Tests
+### 2. Input Patterns (8 tests)
+| Test | Description | Status |
+|------|-------------|--------|
+| V=1 identity | Output should be ~1.0 | ✅ |
+| V=0 zero | Output should be ~0 | ✅ |
+| Structured V | V=row_index pattern | ✅ |
+| Seeds 0,123,999,2024 | Different random inputs | ✅ all |
 
-```bash
-# Run debug harness (23 tests)
-python debug_harness.py fwd_fp8_kloop.s
+### 3. Numerical Stability (3 tests)
+| Test | Description | Status |
+|------|-------------|--------|
+| Large scores | Q,K scaled 2x (no NaN) | ✅ |
+| Small scores | Q,K scaled 0.1x | ✅ |
+| Spike attention | One K dominates (no NaN) | ✅ |
 
-# Expected output:
-# HD Tile Identity: all 4 HD tiles ~1.0
-# V=1 identity: ~1.01
-# Tile isolation: each tile contributes
-# Accumulation: sum matches full
-# Reference match: max_err < 0.15
-# Element ratios: std < 0.3
-```
+### 4. Multi-Tile Correctness (4 tests)
+| Test | Description | Status |
+|------|-------------|--------|
+| Tile 0 contributes | V=1 only in tile 0 | ✅ |
+| Tile 1 contributes | V=1 only in tile 1 | ✅ |
+| Tile additivity | sum(isolated) ≈ full | ✅ |
 
-## Error Sources
+### 5. Edge Cases (6 tests)
+| Test | Description | Status |
+|------|-------------|--------|
+| Identical Q rows | All O rows should match | ✅ |
+| Identical K rows | O ≈ mean(V) | ✅ |
+| NaN check (4 cases) | No NaN for various scales | ✅ all |
 
-1. **FP8 Quantization** (~0.05-0.10)
-   - Q, K, V converted to FP8 before MFMA
-   - P converted to FP8 before PV MFMA
-   - Inherent precision loss
+### 6. Longer Sequences (3 tests)
+| Test | seq_len | tiles | max_error | Status |
+|------|---------|-------|-----------|--------|
+| Long | 256 | 8 | 0.043 | ✅ |
+| Long | 512 | 16 | 0.029 | ✅ |
+| Long | 1024 | 32 | 0.049 | ✅ |
 
-2. **F32/FP8 Softmax Mismatch** (~0.01-0.03)
-   - `running_sum` accumulated from F32 P values
-   - `O` accumulated from FP8 P @ FP8 V
-   - Final `O / running_sum` has small scale mismatch
+## Known FP8 Limitations
 
-3. **Multi-tile Accumulation** (varies)
-   - Error tends to DECREASE with more tiles (averaging effect)
-   - More tiles = more softmax samples = smoother distribution
+These are **expected behaviors**, not bugs:
+
+1. **Large attention scores** (Q·K > ~10)
+   - FP8 e4m3 max value is ~448
+   - Large values overflow → high error vs F32 reference
+   - Kernel remains stable (no NaN/Inf)
+
+2. **Extreme softmax spikes**
+   - When one attention weight >> others
+   - FP8 P quantization loses precision for small probabilities
+   - Output remains in reasonable range
+
+3. **Gradient patterns in V**
+   - Smooth gradients quantize to steps in FP8
+   - Higher error (~0.29) but correct behavior
+
+## Error Analysis
+
+| Metric | Typical | Acceptable | Red Flag |
+|--------|---------|------------|----------|
+| max_error (random) | 0.05-0.10 | < 0.15 | > 0.50 |
+| V=1 identity | 1.01 | 0.95-1.05 | < 0.5 or > 1.5 |
+| Tile additivity | 0.00 | < 0.20 | > 0.50 |
+
+## Red Flags (Indicates Bug)
+
+- ❌ NaN or Inf in output
+- ❌ max_error > 0.5 for random inputs
+- ❌ V=1 identity far from 1.0
+- ❌ Some tiles contribute 0 (buffer descriptor bug)
+- ❌ Output all zeros (VGPR staleness bug)
 
 ## Comparison with BF16
 
 | Metric | BF16 | FP8 | Notes |
 |--------|------|-----|-------|
+| max_error | ~0.001 | 0.05-0.10 | 50-100x higher for FP8 |
 | V=1 identity | 1.0000 | ~1.01 | FP8 quantization |
-| max_error | ~0.001 | 0.06-0.10 | Expected 10-100x higher |
-| ratio_std | 0.003 | 0.18-0.27 | FP8 noise |
-
-## Red Flags (Indicates Bug)
-
-- ❌ max_error > 0.5 (fundamental bug, not precision)
-- ❌ NaN in output (memory/register issue)
-- ❌ One HD tile wrong, others correct (AGPR timing - Bug #7)
-- ❌ Only tile 0 contributes (buffer descriptor size - Bug #3)
-- ❌ Output all zeros (VGPR staleness - Bug #2)
+| NaN safety | ✅ | ✅ | Both stable |
