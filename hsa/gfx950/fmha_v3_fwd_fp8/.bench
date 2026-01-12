@@ -5,17 +5,34 @@
 ```bash
 cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
 
-# Single sequence length
-python bench_fp8_attention.py --seq-len 1024
+# Full attention benchmark (recommended)
+python bench_full_attention.py --sweep
 
-# Sweep all sequence lengths  
-python bench_fp8_attention.py --sweep
-
-# BF16 reference (for comparison)
+# BF16 reference (target shape)
 python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 32130
 ```
 
-## Current Results (Single-Head, 32 Output Rows)
+## Current Results: ❌ NOT MEETING TARGET
+
+### Full Attention (Single Head) - `fwd_fp8_full.s`
+```
+SeqLen   FP8(ms)   BF16(ms)   FP8 TF/s   BF16 TF/s   Ratio
+------------------------------------------------------------
+  1024     0.11      0.04        5.1       12.7      0.40x
+  4096     0.42      0.10       20.9       89.5      0.23x
+ 16384     1.95      0.33       71.3      426.1      0.17x
+ 32128     4.91      0.74      108.7      717.2      0.15x  ❌
+```
+
+**FP8 is 5-7x SLOWER than BF16** due to resource underutilization.
+See `.scale` for detailed analysis.
+
+### Target Shape (H=40, seq=32130)
+- BF16: 1016 TF/s @ 20.8ms
+- FP8 target: >1300 TF/s
+- FP8 current: NOT TESTED (single-head only)
+
+## Old Results (Single Q-Tile) - `fwd_fp8_kloop.s`
 
 ```
 SeqLen  Tiles   Time(us)     TFLOPS
