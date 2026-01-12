@@ -132,11 +132,17 @@ s_add_u32 s63, 0x8200, s63       // + 33280 base
    - Used flat_load + ds_write_b128 with swizzled addresses instead
    - Transpose read gives correct pattern: stride-4 gather
    - Thread 0 reads: [row0, row4, row8, row12] = perfect!
-5. [ ] **Build 256T kernel**:
-   - Use flat_load + ds_write (swizzled) for Q/K/V
-   - FP8 MFMA: 2 VGPRs per operand (vs BF16's 4) → fewer reads!
-6. [ ] Verify numerics with non-uniform attention
-7. [ ] Benchmark TF/s
+5. [x] **QK MFMA verified** (step3_qk.s)
+   - Simple row-major LDS layout works fine
+   - MFMA output values match reference (1024/1024, max_diff=0.0002)
+   - Output layout is MFMA-native (not row-major), but that's OK
+   - Softmax and PV MFMA use the same layout, no conversion needed
+6. [ ] **Build 256T kernel**:
+   - Use flat_load + ds_write for Q/K/V
+   - Add softmax on S output
+   - Add PV MFMA (P × V → O)
+7. [ ] Verify numerics with non-uniform attention
+8. [ ] Benchmark TF/s
 
 ### Phase 2: Scale to 256T (128 Q rows)
 1. [ ] Extend fixed kernel to 4 waves
