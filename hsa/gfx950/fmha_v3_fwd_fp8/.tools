@@ -1,0 +1,150 @@
+# Debug Tools Reference & Sanity Checks
+
+## Tool Inventory
+
+| Tool | Purpose | Sanity Check |
+|------|---------|--------------|
+| `asm_validator.py` | Static ASM analysis | `--sanity` flag |
+| `debug_harness.py` | Runtime kernel tests | BF16 baseline comparison |
+| `test_bf16_baseline.py` | Validates test methodology | Should pass 100% |
+
+---
+
+## Quick Sanity Check
+
+Run this to verify all tools are working:
+```bash
+cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8
+python tools_sanity.py
+```
+
+Expected output (8/8 passed):
+```
+✅ asm_validator: good case (unlimited)
+✅ asm_validator: bad case (overflow)
+✅ asm_validator: edge case (single tile)
+✅ debug_harness: FP8 V=1 identity
+✅ debug_harness: tile isolation
+✅ bf16_baseline: available
+✅ bf16_baseline: passes
+✅ ratio_consistency: detection
+```
+
+---
+
+## Tool Details
+
+### 1. asm_validator.py
+
+**Purpose**: Static analysis of assembly to detect common bugs
+
+**What it checks**:
+- Buffer descriptor size limits
+- VGPR staleness in loops
+- Missing barriers after LDS ops
+
+**Sanity checks**:
+```bash
+# Should detect buffer size issue
+python asm_validator.py --params 128 4096 4096
+# Expected: "BUFFER OVERFLOW DETECTED for tile 1"
+
+# Should pass with unlimited size
+python asm_validator.py --params 128 -1 -1  
+# Expected: "All tiles accessible"
+```
+
+**Known limitations**:
+- Cannot track register values through complex control flow
+- May miss issues in unrolled loops
+- Does not validate MFMA operand layouts
+
+**False positive cases**:
+- (none known yet)
+
+**False negative cases**:
+- Buffer descriptor overwritten after initial setup (partially detected)
+
+---
+
+### 2. debug_harness.py
+
+**Purpose**: Runtime tests with structured inputs
+
+**What it checks**:
+- V=1 identity (sum of softmax = 1)
+- Tile isolation (each tile contributes)
+- Accumulation (sum of isolated = full)
+- Element ratio consistency
+
+**Sanity checks**:
+```bash
+# Should pass all 19 tests
+python debug_harness.py fwd_fp8_kloop.s
+# Expected: "19/19 tests passed"
+```
+
+**Known limitations**:
+- Only tests first 32 HD columns (until Phase 4)
+- Threshold hardcoded (may need adjustment for different precisions)
+- Cannot detect subtle timing/race issues
+
+**False positive cases**:
+- High FP8 quantization noise may trigger ratio consistency failure
+
+**False negative cases**:
+- Bugs that only manifest with specific Q/K patterns
+
+---
+
+### 3. test_bf16_baseline.py
+
+**Purpose**: Validate test methodology against known-working kernel
+
+**What it checks**:
+- Same tests as debug_harness but against BF16 kernel
+- Compares error magnitudes
+
+**Sanity checks**:
+```bash
+# Should pass all tests with very low error
+python test_bf16_baseline.py
+# Expected: "19/19 tests passed", max_err < 0.01
+```
+
+**Known limitations**:
+- Requires aiter package installed
+- BF16 kernel interface may change
+
+---
+
+## Revision History
+
+| Date | Tool | Change | Reason |
+|------|------|--------|--------|
+| 2024-01-12 | asm_validator.py | Created | Initial version |
+| 2024-01-12 | debug_harness.py | Created | Initial version |
+| 2024-01-12 | test_bf16_baseline.py | Created | Validate methodology |
+
+---
+
+## Adding New Checks
+
+When you find a bug not caught by existing tools:
+
+1. **Document the bug** in `.bugs`
+2. **Add detection** to appropriate tool
+3. **Add sanity check** to verify detection works
+4. **Update this file** with revision history
+
+Template for new sanity check:
+```python
+def test_new_bug_detection():
+    """
+    Bug: [description]
+    Detection: [how tool should catch it]
+    """
+    # Create input that triggers bug
+    # Run tool
+    # Assert tool detects it
+```

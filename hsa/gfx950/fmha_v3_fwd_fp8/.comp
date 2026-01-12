@@ -123,7 +123,22 @@ K_TILE_LOOP:
 **Cause**: v1 was set once for Q load, became stale by K load time
 **Fix**: Add `v_lshlrev_b32_e32 v1, 4, v0` at start of K_TILE_LOOP
 
-### 3. F32/FP8 Running Sum Consideration
+### 3. Buffer Descriptor Size Must Be Max (Critical Bug)
+The buffer descriptor size field must be -1 (max) for multi-tile access with scalar offsets.
+```asm
+// WRONG - limits access to first 4096 bytes
+s_mov_b32 s14, 4096       // K buffer size
+s_mov_b32 s18, 4096       // V buffer size
+
+// CORRECT - allows full buffer access
+s_mov_b32 s14, -1         // K buffer size = max
+s_mov_b32 s18, -1         // V buffer size = max
+```
+**Symptom**: Only tile 0 data used; output is 1/N of expected for N tiles
+**Cause**: With size=4096, `s27=4096` offset for tile 1 exceeds bounds → returns 0
+**Fix**: Set buffer descriptor size to -1 (max) for K and V
+
+### 4. F32/FP8 Running Sum Consideration
 - `running_sum` computed from F32 P values
 - `O` computed from FP8 P @ FP8 V
 - Small precision difference in final `O / running_sum`
@@ -142,11 +157,60 @@ K_TILE_LOOP:
 
 ---
 
-## Test Results
+## Test Results (After Buffer Descriptor Fix)
 
 ```
-seq_len=32  (1 tile):  max_error=0.087 ✅
-seq_len=64  (2 tiles): max_error=0.178 ✅
-seq_len=96  (3 tiles): max_error=0.123 ✅
-seq_len=128 (4 tiles): max_error=0.109 ✅
+seq_len=32  (1 tile):  max_error=0.088 ✅
+seq_len=64  (2 tiles): max_error=0.073 ✅
+seq_len=96  (3 tiles): max_error=0.044 ✅
+seq_len=128 (4 tiles): max_error=0.035 ✅
 ```
+
+Note: Multi-tile errors now DECREASE with more tiles (proper accumulation).
+
+---
+
+## Debug Tools
+
+### 1. Assembly Validator (`asm_validator.py`)
+Static analysis to detect common issues:
+```bash
+python asm_validator.py fwd_fp8_kloop.s
+```
+Detects:
+- Buffer descriptor size limits
+- VGPR not recalculated in loops
+- Missing barriers
+
+### 2. Runtime Parameter Validator
+Pre-launch check for buffer overflow:
+```python
+from asm_validator import validate_kernel_params
+validate_kernel_params(seq_len=128, k_buffer_size=4096)  # Will warn!
+```
+
+### 3. Debug Harness (`debug_harness.py`)
+Comprehensive kernel testing:
+```bash
+python debug_harness.py fwd_fp8_kloop.s
+```
+Tests:
+- V=1 identity (output should be 1.0)
+- Tile isolation (each tile contributes)
+- Accumulation check (sum of isolated = full)
+- Element ratio consistency (detects addressing bugs)
+
+### 4. BF16 Baseline Test (`test_bf16_baseline.py`)
+Validates testing methodology against known-working BF16 kernel:
+```bash
+python test_bf16_baseline.py
+```
+
+**Comparison (BF16 vs FP8):**
+| Metric | BF16 | FP8 | Notes |
+|--------|------|-----|-------|
+| V=1 identity | 1.0000 | ~1.01 | FP8 quantization |
+| Reference max_err | 0.001 | 0.03-0.09 | Expected precision diff |
+| Ratio consistency std | 0.003 | 0.18-0.27 | FP8 noise |
+
+BF16 passes all tests → validates our methodology is correct

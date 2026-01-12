@@ -64,10 +64,23 @@ _ZN5aiter13fwd_fp8_kloopE:
     .endr
     
     // ========================================================================
+    // SETUP BUFFER DESCRIPTORS (4 SGPRs each: base_lo, base_hi, size, flags)
+    // ========================================================================
+    // Q descriptor at s[8:11]: s[8:9] already has Q pointer
+    s_mov_b32 s10, -1              // size = max
+    s_mov_b32 s11, 0x20000         // flags
+    
+    // K descriptor at s[12:15]: s[12:13] already has K pointer
+    s_mov_b32 s14, -1              // size = max
+    s_mov_b32 s15, 0x20000         // flags
+    
+    // V descriptor at s[16:19]: s[16:17] already has V pointer
+    s_mov_b32 s18, -1              // size = max
+    s_mov_b32 s19, 0x20000         // flags
+    
+    // ========================================================================
     // LOAD Q TO LDS (stays for all tiles)
     // ========================================================================
-    s_mov_b32 s10, 4096
-    s_mov_b32 s11, 0x20000
     v_lshlrev_b32_e32 v1, 4, v0
     
     s_mov_b32 m0, 0
@@ -90,13 +103,9 @@ _ZN5aiter13fwd_fp8_kloopE:
     s_mov_b32 s27, 0                       // k_offset = 0
     s_mov_b32 s28, 0                       // tile_idx = 0
     
-    // Setup K buffer descriptor (size = 4096 for one tile)
-    s_mov_b32 s14, 4096
-    s_mov_b32 s15, 0x20000
-    
-    // Setup V buffer descriptor (size = 4096 for one tile)
-    s_mov_b32 s18, 4096
-    s_mov_b32 s19, 0x20000
+    // K and V buffer descriptors already set up above with size=-1 (max)
+    // DO NOT overwrite s14, s18 - they need to allow access beyond 4096 bytes
+    // for multi-tile access with s27 offset
 
     // ========================================================================
     // K-TILE LOOP
@@ -214,8 +223,9 @@ K_TILE_LOOP:
     // Update running_max
     v_mov_b32_e32 v70, v22
     
-    // Compute P = exp((S - tile_max) * scale)
-    v_mul_f32_e32 v23, s2, v21            // tile_max * scale
+    // Compute P = exp((S - new_max) * scale)
+    // MUST use new_max (v22), not tile_max (v21) for correct online softmax!
+    v_mul_f32_e32 v23, s2, v22            // new_max * scale
     v_fma_f32 v32, v32, s2, -v23
     v_fma_f32 v33, v33, s2, -v23
     v_fma_f32 v34, v34, s2, -v23
@@ -320,6 +330,8 @@ K_TILE_LOOP:
     s_barrier                          // Sync all threads
     
     // Load V tile to LDS at offset 8192 (Q at 0, P at 4096)
+    // MUST recalculate v1 - same issue as K load!
+    v_lshlrev_b32_e32 v1, 4, v0
     s_mov_b32 m0, 8192
     buffer_load_dwordx4 v1, s[16:19], s27 offen lds
     s_add_i32 s20, s27, 1024

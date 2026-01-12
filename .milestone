@@ -15,20 +15,21 @@ Working kernel: `test_full_hd128.s`
 
 ### Key Fixes
 1. **v1 must be recalculated before K load** - The VGPR offset was getting stale
-2. **Online softmax with F32/FP8 mismatch** - running_sum uses F32 P, PV uses FP8 P
+2. **Buffer descriptor size must be -1 (max)** - Size=4096 blocked tile 1+ access
 3. **Proper O rescaling** - correction = exp((old_max - new_max) * scale)
+4. **Use new_max for P computation** - Was using tile_max instead of global max
 
-### Test Results
+### Test Results (After Buffer Descriptor Fix)
 ```
-seq_len=32  (1 tile):  max_error=0.087 ✅
-seq_len=64  (2 tiles): max_error=0.178 ✅  
-seq_len=96  (3 tiles): max_error=0.123 ✅
-seq_len=128 (4 tiles): max_error=0.109 ✅
+seq_len=32  (1 tile):  max_error=0.088 ✅
+seq_len=64  (2 tiles): max_error=0.073 ✅  
+seq_len=96  (3 tiles): max_error=0.044 ✅
+seq_len=128 (4 tiles): max_error=0.035 ✅
 ```
 
 ### Notes
-- Error is higher for multi-tile due to F32/FP8 running_sum mismatch
-- Threshold relaxed to 0.20 for K-loop kernel
+- Multi-tile errors now DECREASE with more tiles (proper accumulation)
+- FP8 quantization noise is the primary error source
 
 ---
 
