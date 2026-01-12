@@ -169,12 +169,92 @@ v_mfma_f32_32x32x16_fp8_fp8 v[80:95], a[0:1], v[30:31], v[80:95]
 
 ## LDS Layout Comparison
 
-| Region | BF16 (~32KB) | FP8 (12KB) |
-|--------|--------------|------------|
-| Q | offset 0 | offset 0 (4KB) |
-| K | offset ~8KB | offset 4096 → P reuse |
-| V | loaded per-tile | offset 8192 (4KB) |
-| P | in registers | offset 4096 (overwrites K) |
+| Region | BF16 (~64KB) | FP8 64T (12KB) | FP8 256T (32KB) |
+|--------|--------------|----------------|-----------------|
+| Q | offset 0 | offset 0 (4KB) | offset 0 (4KB) |
+| K | offset ~8KB | offset 4096 | offset 4096 (4KB) |
+| V | per-tile | offset 8192 | offset 8192 (4KB) |
+| P | in registers | offset 4096 | offset 12288 (4KB) |
+| Scratch | - | - | offset 16384+ |
+
+---
+
+## Phase 6: 256-Thread Architecture
+
+### BF16 Reference (256 threads = 4 waves)
+```asm
+// Thread decomposition
+v_lshrrev_b32_e32 v1, 6, v0    // wave_id = thread / 64
+v_and_b32_e32 v0, 63, v0       // lane_id = thread % 64
+
+// BF16 uses wave_id to select output rows
+// Each wave: 8 Q-rows (32 total / 4 waves)
+```
+
+### FP8 256T Implementation Plan
+
+#### Step 1: Thread Decomposition
+```asm
+// Save in v1, v0
+v_lshrrev_b32_e32 v1, 6, v0    // v1 = wave_id (0-3)
+v_and_b32_e32 v0, 63, v0       // v0 = lane_id (0-63)
+v_lshlrev_b32_e32 v2, 3, v1    // v2 = wave_id * 8 = q_row_base
+```
+
+#### Step 2: Q Load (all waves cooperate)
+```asm
+// 256 threads × 16 bytes = 4KB = one Q tile
+// thread_id = wave*64 + lane → offset = thread_id * 16
+v_lshlrev_b32_e32 v3, 6, v1    // wave * 64
+v_add_u32_e32 v3, v0, v3       // + lane = thread_id
+v_lshlrev_b32_e32 v3, 4, v3    // × 16 bytes
+buffer_load_dwordx4 v3, s[8:11], 0 offen lds
+```
+
+#### Step 3: K Load (all waves cooperate)
+Same as Q load, different destination:
+```asm
+v_add_u32_e32 v4, 4096, v3     // LDS offset for K
+buffer_load_dwordx4 v4, s[12:15], s27 offen lds
+```
+
+#### Step 4: QK MFMA (each wave handles 8 Q-rows)
+```asm
+// Wave's Q starts at: wave_id * 8 * 128 = wave_id * 1024
+// For 8 Q-rows, need smaller tile or multiple passes
+
+// Option A: 8x32 output per wave (requires adjustment)
+// Option B: Each wave does full 32x32, selects its 8 rows
+// Following BF16: use MFMA 32x32, each wave gets 8 rows of result
+```
+
+#### Step 5: Softmax (per-wave with cross-wave reduction)
+```asm
+// Each wave computes max/sum for its 8 rows
+// Need cross-wave reduction for global max
+v_permlane32_swap_b32_e32 v_max, v_max  // Within wave
+// Cross-wave via LDS or shared accumulator
+```
+
+#### Step 6: PV MFMA (each wave outputs 8 rows)
+Similar structure to QK.
+
+### Resources Required
+
+| Resource | FP8 64T | FP8 256T | BF16 256T |
+|----------|---------|----------|-----------|
+| Threads | 64 | 256 | 256 |
+| LDS | 12KB | 32KB | 64KB |
+| VGPRs | 148 | ~200 | 256 |
+| AGPRs | 4 | ~16 | 96 |
+| Waves | 1 | 4 | 4 |
+
+### Key Differences from 64T
+
+1. **Thread ID**: `v0` is lane (0-63), `v1` is wave (0-3)
+2. **Output rows**: Each wave handles 8 rows, not 32
+3. **LDS access**: Coordinate to avoid conflicts
+4. **Reduction**: Need cross-wave max/sum
 
 ---
 
