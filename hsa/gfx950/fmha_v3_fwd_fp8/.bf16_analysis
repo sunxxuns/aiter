@@ -1,0 +1,145 @@
+# BF16 Kernel Architecture Analysis
+
+## Resource Comparison
+
+| Resource | BF16 | FP8 (current) | Ratio |
+|----------|------|---------------|-------|
+| Threads/WG | 256 | 64 | 4x |
+| LDS | 65536 (64KB) | 12288 (12KB) | 5.3x |
+| VGPRs | 256 | 148 | 1.7x |
+| AGPRs | 96 | 4 | 24x |
+| SGPRs | 96 | 32 | 3x |
+
+## BF16 Thread Organization (256 threads = 4 waves)
+
+```
+v0 = thread_id (0-255)
+
+Wave extraction:
+  v3 = v0 >> 6        // wave_id (0-3)
+  v0 = v0 & 63        // lane_id within wave (0-63)
+
+Thread decomposition for MFMA:
+  v_lshrrev_b32 v12, 5, v0   // v12 = lane / 32 (0 or 1)
+  v_and_b32 v12, 31, v0      // v12 = lane % 32
+```
+
+## MFMA Pattern
+
+BF16 uses `v_mfma_f32_32x32x16_bf16`:
+- Input: 4 VGPRs (v[192:195]) × 4 VGPRs (v[160:163])
+- Output: 16 VGPRs (v[32:47])
+
+Multiple output blocks:
+- v[32:47]  - output block 0
+- v[48:63]  - output block 1  
+- v[64:79]  - output block 2
+- v[80:95]  - output block 3
+
+This allows 4 MFMA operations to be in flight (pipelining).
+
+## Memory Access Pattern
+
+### Q/K/V Loading (Direct to LDS)
+```asm
+buffer_load_dwordx4 v4, s[8:11], 0 offen lds
+```
+- Uses `lds` flag: bypasses VGPRs, loads directly to LDS
+- 4 threads load in parallel: v4, v5, v6, v7
+
+### LDS Reads (Bulk)
+```asm
+ds_read_b64 v[160:161], v2
+ds_read_b64 v[162:163], v2 offset:8
+ds_read_b128 v[192:195], v8
+```
+- Uses b64 (8 bytes) and b128 (16 bytes) for efficiency
+- Offset addressing for contiguous reads
+
+## Prefetching Strategy
+
+BF16 overlaps K/V loads with MFMA:
+```asm
+; Load K tile N+1
+buffer_load_dwordx4 v4, s[12:15], s34 offen lds
+buffer_load_dwordx4 v5, s[12:15], s34 offen lds
+
+; MFMA on K tile N (while loading)
+v_mfma_f32_32x32x16_bf16 v[32:47], v[192:195], v[160:163], 0
+v_mfma_f32_32x32x16_bf16 v[32:47], v[196:199], v[164:167], v[32:47]
+
+; Load V tile N+1
+buffer_load_dwordx4 v6, s[16:19], s35 offen lds
+buffer_load_dwordx4 v7, s[16:19], s35 offen lds
+
+; More MFMA (overlapped with loads)
+v_mfma_f32_32x32x16_bf16 v[64:79], v[192:195], v[160:163], 0
+```
+
+## LDS Layout (64KB)
+
+Estimated layout:
+```
+Offset 0:      Q tile (persistent)     ~8KB
+Offset 8K:     K tile (double buffer)  ~16KB  
+Offset 24K:    V tile (double buffer)  ~16KB
+Offset 40K:    P matrix (softmax)      ~8KB
+Offset 48K:    Scratch                 ~16KB
+```
+
+Double buffering allows:
+- Load tile N+1 while computing tile N
+- No stalls waiting for memory
+
+## Key Optimizations to Port to FP8
+
+### 1. Increase Threads (Critical)
+- Change from 64 to 256 threads
+- 4 waves per workgroup
+- Each wave handles different output rows
+
+### 2. Increase LDS (Critical)  
+- Need at least 32KB for double buffering
+- 64KB matches BF16
+
+### 3. Add Prefetching
+```asm
+; Pseudo-code for prefetch loop:
+LOAD K[tile+1] to LDS_buffer_B
+LOAD V[tile+1] to LDS_buffer_B
+s_barrier
+
+; Compute on buffer A while loading to B
+MFMA using K[tile] from LDS_buffer_A
+MFMA using V[tile] from LDS_buffer_A
+
+; Swap buffers
+swap LDS_buffer_A, LDS_buffer_B
+```
+
+### 4. Pipeline MFMA
+- Issue multiple MFMA before waiting
+- Hide 64-cycle latency
+- Use different output register blocks
+
+### 5. Use AGPRs Properly
+- BF16 uses 96 AGPRs for accumulation
+- Allows more MFMA in flight
+
+## Implementation Plan
+
+### Phase 6: Basic 256-Thread Version
+1. Increase thread count to 256
+2. Adjust work distribution (4 waves)
+3. Increase LDS to 32KB minimum
+4. Test correctness
+
+### Phase 7: Add Prefetching
+1. Implement double buffering
+2. Overlap loads with compute
+3. Measure improvement
+
+### Phase 8: MFMA Pipelining
+1. Issue multiple MFMA before waiting
+2. Use multiple output register blocks
+3. Optimize instruction scheduling
