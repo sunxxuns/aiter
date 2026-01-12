@@ -310,3 +310,84 @@ v_add_u32 v8, 16, v6
 
 **Tested**: max_err = 0.00007 (test_qk_hd128.py)
 
+---
+
+### 12. FP8/BF16 MFMA Minimum Size: 32×32 Only!
+
+**CRITICAL HARDWARE CONSTRAINT on gfx950 (MI300X/MI350)**:
+
+For FP8 and BF16, only ONE MFMA size exists:
+- FP8: `v_mfma_f32_32x32x16_fp8_fp8` (32×32 output, K=16)
+- BF16: `v_mfma_f32_32x32x8_bf16` (32×32 output, K=8)
+
+**There are NO smaller variants (8×8, 16×16) for FP8/BF16!**
+
+**Implications**:
+- Each wave MUST process at least 32 rows
+- Cannot split 32 rows across 4 waves (8 rows each) - hardware doesn't support it
+- The "compute 32×32, use only 8 rows" approach is WASTEFUL but NECESSARY if you have fewer Q rows
+
+**Verified by**:
+```bash
+echo "v_mfma_f32_16x16x32_fp8_fp8 ..." | llvm-mc -mcpu=gfx950  # ERROR: invalid
+echo "v_mfma_f32_8x8x16_fp8_fp8 ..." | llvm-mc -mcpu=gfx950   # ERROR: invalid
+echo "v_mfma_f32_32x32x16_fp8_fp8 ..." | llvm-mc -mcpu=gfx950 # OK: valid
+```
+
+---
+
+### 13. BF16 Reference Architecture: 128 Q Rows, 32 Per Wave
+
+**Analysis of `fwd_hd128_bf16.s` revealed the actual multi-wave strategy**:
+
+The BF16 kernel does NOT use "32 Q rows split across 4 waves". Instead:
+
+| Wave | Q Row Range | Output Rows | LDS Region |
+|------|-------------|-------------|------------|
+| 0 | 0-31 | 0-31 | 0x8200 + 0×0x408 |
+| 1 | 32-63 | 32-63 | 0x8200 + 1×0x408 |
+| 2 | 64-95 | 64-95 | 0x8200 + 2×0x408 |
+| 3 | 96-127 | 96-127 | 0x8200 + 3×0x408 |
+
+**Key code from BF16 kernel**:
+```asm
+// Output offset per wave (line 2469)
+s_mul_i32 s40, s5, 32              // wave_id × 32 rows
+
+// LDS offset per wave (line 180-181)
+s_mul_i32 s63, 0x408, s5           // wave_id × 1032 bytes
+s_add_u32 s63, 0x8200, s63         // + 33280 base
+```
+
+**This means**:
+1. **Total Q rows per workgroup: 128** (not 32)
+2. **Each wave: 32 rows** (full MFMA tile, no waste)
+3. **No redundant compute**: each wave processes its own data
+4. **LDS: 64KB** used for Q, K tiles, P, etc.
+
+**Implications for FP8 kernel**:
+- Current FP8 kernel: 32 Q rows per workgroup (1 wave worth)
+- Target FP8 kernel: 128 Q rows per workgroup (4 waves)
+- This is where the 4× occupancy improvement comes from!
+
+---
+
+### 14. Wrong Assumption That Blocked 256T Progress
+
+**Initial wrong assumption**:
+> "Each wave handles 8 Q rows, compute full 32×32, use only 8 rows"
+
+**Reality**:
+> "Each wave handles 32 Q rows (its own complete MFMA tile)"
+
+**Why this matters**:
+- With 8 rows per wave: 4× redundant compute, complex coordination
+- With 32 rows per wave: no redundancy, waves are independent
+- The BF16 kernel's ~1000 TF/s comes from 4× more work, not 4× parallelism on same work
+
+**To achieve >1300 TF/s with FP8**:
+1. Increase Q tile from 32 to 128 rows
+2. Each wave loads+computes its own 32 Q rows
+3. Waves are independent (no cross-wave reduction needed)
+4. FP8's 2× MFMA throughput vs BF16 provides the additional speedup
+
