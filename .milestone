@@ -6,10 +6,7 @@ FP8 kernel with >30% TF/s improvement over BF16 (~1000 → >1300 TF/s)
 ---
 
 ## Phase 2: Single-Tile HD=128 ✅ COMPLETE
-
-- S^T = K @ Q^T computation
-- Row-wise softmax via VGPR sum + permlane32_swap
-- P transpose store for PV MFMA
+Working kernel: `test_full_hd128.s`
 - All 7 rigorous tests passing
 
 ---
@@ -17,47 +14,28 @@ FP8 kernel with >30% TF/s improvement over BF16 (~1000 → >1300 TF/s)
 ## Phase 3: K-tile Loop 🔄 IN PROGRESS
 
 ### Completed ✅
-- [x] buffer_load with scalar offset verified
 - [x] K-loop structure verified (test_kloop.py)
-- [x] Scalar offset advancement works (1, 2, 4, 8 tiles)
+- [x] buffer_load with scalar offset works
 - [x] Loop control with s_cbranch_scc1 works
+- [x] `.args` metadata requirement discovered
+- [x] Created fwd_fp8_kloop.s with online softmax structure
+
+### Current Issue 🔴
+`fwd_fp8_kloop.s` compiles and runs, but numerical results are wrong:
+- Single-tile (seq=32): Output ~100x too large
+- Multi-tile: Some produce zeros, some pass by accident
+
+### Debug Notes
+1. QK MFMA uses AGPRs correctly (matched working kernel)
+2. P storage at LDS offset 4096, V at 8192
+3. Output store uses correct formula (row*128 + col)*4
+4. Issue likely in P normalization or FP8 conversion
 
 ### Next Steps
-- [ ] Integrate K-loop into test_full_hd128.s
-- [ ] Add online softmax (running max/sum across tiles)
-- [ ] Add O rescaling: O *= exp(old_max - new_max)
-- [ ] Test with real FP8 attention
-
----
-
-## Verified K-Loop Pattern
-
-```asm
-// Setup
-s_mov_b32 s18, 0                        // k_offset = 0
-s_mov_b32 s19, stride                   // k_stride (bytes per tile)
-s_mov_b32 s20, 0                        // tile_idx = 0
-
-K_LOOP:
-    buffer_load_dword v, voff, s[8:11], s18 offen
-    s_waitcnt vmcnt(0)
-    // ... process tile ...
-    s_add_i32 s18, s18, s19              // k_offset += k_stride
-    s_add_i32 s20, s20, 1                // tile_idx++
-    s_cmp_lt_i32 s20, s17                // if tile_idx < num_tiles
-    s_cbranch_scc1 K_LOOP
-```
-
----
-
-## Test Results
-
-| Tiles | Seq Len | Status |
-|-------|---------|--------|
-| 1 | 32 | ✅ |
-| 2 | 64 | ✅ |
-| 4 | 128 | ✅ |
-| 8 | 256 | ✅ |
+- [ ] Debug P normalization vs working kernel
+- [ ] Verify FP8 conversion doesn't lose precision  
+- [ ] Add intermediate value checks
+- [ ] Compare exact MFMA operand values
 
 ---
 
@@ -65,9 +43,21 @@ K_LOOP:
 
 ```
 hsa/gfx950/fmha_v3_fwd_fp8/
-├── test_full_hd128.s       # Production single-tile kernel
-├── test_kloop.s            # K-loop test kernel ✅
-├── test_kloop.py           # K-loop test script ✅
-├── debug_bufload.s/py      # buffer_load debug
-├── test_rigorous.py        # Phase 2 test suite
+├── test_full_hd128.s       # Working single-tile kernel ✅
+├── fwd_fp8_kloop.s         # K-loop kernel (numerical bug)
+├── test_kloop_attn.py      # K-loop attention test
+├── test_kloop.s/py         # K-loop structure test ✅
+├── debug_bufload.s/py      # buffer_load test ✅
+├── test_rigorous.py        # Phase 2 tests ✅
 ```
+
+---
+
+## LDS Layout (K-loop kernel)
+
+| Offset | Size | Content |
+|--------|------|---------|
+| 0 | 4KB | Q (stays for all tiles) |
+| 4096 | 4KB | K → P (reused) |
+| 8192 | 4KB | V |
+| **Total** | **12KB** | |
