@@ -94,7 +94,7 @@ K_TILE_LOOP:
 
 ---
 
-## Discovered Issues (Fixed)
+## Discovered Bugs (Fixed)
 
 ### 1. `.args` Metadata Required
 FP8 kernels MUST include explicit `.args:` section in `.amdgpu_metadata`:
@@ -112,16 +112,22 @@ amdhsa.kernels:
 **Cause**: Without `.args`, HIP runtime can't pass kernel arguments correctly
 **Note**: BF16 kernel has this from original compilation
 
-### 2. VGPR Offset Staleness
-The `v1` register (per-thread offset for buffer_load) must be recalculated before each K-tile load.
-**Symptom**: QK MFMA produces zeros
+### 2. VGPR Offset Must Be Recalculated (Critical Bug)
+The `v1` register (per-thread offset for buffer_load) must be recalculated before each K-tile load inside the loop.
+```asm
+K_TILE_LOOP:
+    v_lshlrev_b32_e32 v1, 4, v0        // MUST recalculate here!
+    buffer_load_dwordx4 v1, s[12:15], s20 offen lds
+```
+**Symptom**: Output is all zeros (computation completely wrong, not precision issue)
+**Cause**: v1 was set once for Q load, became stale by K load time
 **Fix**: Add `v_lshlrev_b32_e32 v1, 4, v0` at start of K_TILE_LOOP
 
-### 3. F32/FP8 Running Sum Mismatch
+### 3. F32/FP8 Running Sum Consideration
 - `running_sum` computed from F32 P values
 - `O` computed from FP8 P @ FP8 V
-- Final `O / running_sum` has precision mismatch
-**Result**: ~0.18 max error for multi-tile (acceptable)
+- Small precision difference in final `O / running_sum`
+**Result**: ~0.09-0.18 max error depending on tile count
 
 ---
 
