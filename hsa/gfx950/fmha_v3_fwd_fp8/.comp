@@ -1,99 +1,146 @@
-# FP8 vs BF16 Flash Attention Kernel Comparison
+# FP8 Flash Attention - BF16 Comparison
 
-## Strategy Alignment: ✅ Same Core Algorithm
-
-Both FP8 (`fwd_fp8_kloop.s`) and BF16 (`fwd_hd128_bf16.s`) kernels use:
-
-### 1. Online Softmax ✅ Matching
-| Aspect | BF16 Kernel | FP8 K-loop Kernel |
-|--------|-------------|-------------------|
-| Running max | `v_max_f32_e32 v21, v20, v21` | `v_max_f32_e32 v22, v70, v21` |
-| Correction | `v_sub_f32_e32 v16, v24, v21` → exp | `v_sub_f32_e32 v23, v70, v22` → exp |
-| O rescaling | Implicit in pk_mul | `v_mul_f32_e32 v80-v95, v23` |
-| Final norm | `v_rcp_f32 v18` → pk_mul O | `v_rcp_f32_e32 v72, v71` → mul O |
-
-### 2. K-tile Loop ✅ Matching
-| Aspect | BF16 Kernel | FP8 K-loop Kernel |
-|--------|-------------|-------------------|
-| Loop control | `s_cmp_lt_i32 s39, s38` | `s_cmp_lt_i32 s28, s25` |
-| Branch | `s_cbranch_scc0 label_0D6A` | `s_cbranch_scc1 K_TILE_LOOP` |
-| Tile stride | Dynamic via s43, s44 | `s26 = 4096` bytes |
-
-### 3. LDS Layout ✅ Similar
-| BF16 | FP8 K-loop |
-|------|------------|
-| Q at offset 0 | Q at offset 0 (4KB) |
-| K at offset ~8KB | K/P at offset 4096 (4KB) |
-| V loaded per-tile | V at offset 8192 (4KB) |
-| Total: ~32KB | Total: 12KB |
-
-### 4. MFMA Pattern ✅ Adapted for FP8
-| BF16 | FP8 |
-|------|-----|
-| `v_mfma_f32_32x32x16_bf16` | `v_mfma_f32_32x32x16_fp8_fp8` |
-| 4 VGPRs per operand (8 BF16) | 2 VGPRs per operand (8 FP8) |
-| 8 MFMAs per HD pass | 8 MFMAs per HD pass |
+## Reference Kernel
+`hsa/gfx950/fmha_v3_fwd/fwd_hd128_bf16.s`
 
 ---
 
-## Key Differences
+## Key Patterns from BF16 (Must Follow)
 
-### Data Type Handling
+### 1. Buffer Descriptor Setup
+```asm
+// BF16 pattern
+s_load_dwordx2 s[8:9], s[0:1], 0x08   // Load base address
+s_mov_b32 s10, 4096                    // Size
+s_mov_b32 s11, 0x20000                 // Flags (offen mode)
+```
+**FP8 Status**: ✅ Same pattern used
+
+### 2. K-tile Offset Management
+```asm
+// BF16 K-loop pattern
+s_mov_b32 s34, 0                       // K offset starts at 0
+s_mul_i32 s43, 64, s47                 // K stride = 64 * stride_param
+...
+buffer_load_dwordx4 v4, s[12:15], s34 offen lds
+s_add_i32 s34, s43, s34                // Advance to next tile
+```
+**FP8 Status**: ✅ Same pattern
+- `s27` = K offset (starts at 0)
+- `s26` = K stride (4096 bytes = 32 rows × 128 cols × 1 byte)
+- `s_add_i32 s27, s27, s26` advances offset
+
+### 3. Online Softmax State
+```asm
+// BF16 maintains across K-tiles:
+v_mov_b32_e32 v24, 0xff7fffff          // running_max = -large
+v_mov_b32_e32 v16, 0                   // running_sum = 0
+// v[96:159] = O accumulator
+```
+**FP8 Status**: ✅ Same pattern
+- `v70` = running_max (init to 0xff800000 = -inf)
+- `v71` = running_sum (init to 0)
+- `v[80:95]` = O accumulator (first 32 HD cols)
+
+### 4. Correction Factor
+```asm
+// When new tile has larger max:
+v_sub_f32_e32 v16, v_old_max, v_new_max
+v_mul_f32_e32 v16, s37, v16            // * log2(e)/sqrt(d)
+v_exp_f32_e32 v16, v16                 // correction = exp(...)
+// Apply to O accumulator:
+v_mul_f32_e32 v110, v16, v110
+```
+**FP8 Status**: ✅ Same pattern
+```asm
+v_sub_f32_e32 v23, v70, v22            // old_max - new_max
+v_mul_f32_e32 v23, s2, v23             // * scale
+v_exp_f32_e32 v23, v23                 // correction
+v_mul_f32_e32 v80, v80, v23            // rescale O
+```
+
+### 5. V1 Recalculation Before K Load
+**Critical Fix**: BF16 kernel sets VGPR offset before each buffer_load block.
+FP8 must recalculate `v1 = tid * 16` before K load in loop:
+```asm
+K_TILE_LOOP:
+    v_lshlrev_b32_e32 v1, 4, v0        // MUST recalculate!
+    buffer_load_dwordx4 v1, s[12:15], s20 offen lds
+```
+
+---
+
+## FP8 Implementation Status
+
+### Same as BF16 ✅
+| Feature | BF16 | FP8 |
+|---------|------|-----|
+| S^T = K @ Q^T | ✅ | ✅ |
+| Row-wise softmax | VGPR sum + permlane32_swap | Same |
+| Buffer descriptor | s10=size, s11=0x20000 | Same |
+| Scalar offset | buffer_load with soff | Same |
+| Online softmax | running_max, running_sum | Same |
+| O rescaling | correction * O | Same |
+| Final norm | O / running_sum | Same |
+
+### Different from BF16
 | Aspect | BF16 | FP8 |
 |--------|------|-----|
-| Input precision | BF16 (1-8-7) | FP8 e4m3 (1-4-3) |
-| Accumulator | F32 | F32 |
-| P matrix | F32 in regs | F32 → FP8 for PV |
-| Output | F32 → BF16 | F32 (kept as F32) |
+| MFMA | `v_mfma_f32_32x32x16_bf16` | `v_mfma_f32_32x32x16_fp8_fp8` |
+| Operand size | 4 VGPRs (8 BF16) | 2 VGPRs (8 FP8) |
+| Element size | 2 bytes | 1 byte |
+| FP8 conversion | N/A | `v_cvt_pk_fp8_f32` before PV MFMA |
+| P storage | Direct to MFMA | F32 → LDS → FP8 |
 
-### P Matrix Conversion
-- **BF16**: P stays in F32, converted to BF16 only for PV MFMA
-- **FP8**: P computed in F32, stored to LDS as F32, converted to FP8 at PV MFMA load time
+---
 
-### Known Discrepancy
-The FP8 kernel has ~0.1-0.18 max error for multi-tile due to:
+## Discovered Issues (Fixed)
+
+### 1. `.args` Metadata Required
+FP8 kernels MUST include explicit `.args:` section in `.amdgpu_metadata`:
+```yaml
+.amdgpu_metadata
+---
+amdhsa.kernels:
+  - .name: kernel_name
+    .args:
+      - {.name: ptr_O, .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global}
+      - {.name: ptr_Q, .size: 8, .offset: 8, .value_kind: global_buffer, .address_space: global}
+      ...
+```
+**Symptom**: Memory fault at address (nil)
+**Cause**: Without `.args`, HIP runtime can't pass kernel arguments correctly
+**Note**: BF16 kernel has this from original compilation
+
+### 2. VGPR Offset Staleness
+The `v1` register (per-thread offset for buffer_load) must be recalculated before each K-tile load.
+**Symptom**: QK MFMA produces zeros
+**Fix**: Add `v_lshlrev_b32_e32 v1, 4, v0` at start of K_TILE_LOOP
+
+### 3. F32/FP8 Running Sum Mismatch
 - `running_sum` computed from F32 P values
 - `O` computed from FP8 P @ FP8 V
-- Final `O / running_sum` has F32/FP8 mismatch
+- Final `O / running_sum` has precision mismatch
+**Result**: ~0.18 max error for multi-tile (acceptable)
 
 ---
 
-## Code Structure Comparison
+## LDS Layout Comparison
 
-```
-BF16 Kernel (2681 lines)          FP8 K-loop Kernel (590 lines)
-─────────────────────────         ──────────────────────────────
-Load kernel args                  Load kernel args
-Setup buffer descriptors          Setup buffer descriptors
-                                  Load Q to LDS (stays)
-K-TILE LOOP:                      K_TILE_LOOP:
-  Load K,V to LDS                   Load K to LDS
-  QK MFMA (BF16)                    QK MFMA (FP8)
-  Online softmax:                   Online softmax:
-    - Find tile max                   - Find tile max
-    - Cross-lane max                  - Cross-lane max  
-    - Correction factor               - Correction factor
-    - Rescale O, running_sum          - Rescale O, running_sum
-    - Compute P = exp(...)            - Compute P = exp(...)
-    - Update running_sum              - Update running_sum
-  PV MFMA (BF16)                    Store P to LDS
-  Loop if more tiles                Load V to LDS
-                                    PV MFMA (FP8)
-                                    Loop if more tiles
-Final O normalization             Final O normalization
-Store O (BF16)                    Store O (F32)
-```
+| Region | BF16 (~32KB) | FP8 (12KB) |
+|--------|--------------|------------|
+| Q | offset 0 | offset 0 (4KB) |
+| K | offset ~8KB | offset 4096 → P reuse |
+| V | loaded per-tile | offset 8192 (4KB) |
+| P | in registers | offset 4096 (overwrites K) |
 
 ---
 
-## Conclusion
+## Test Results
 
-✅ **Same algorithmic approach** as BF16 reference kernel:
-- Online softmax with running max/sum
-- K-tile loop with O rescaling
-- Final O = O / running_sum normalization
-
-⚠️ **FP8-specific adaptations**:
-- Smaller MFMA operands (2 VGPRs vs 4)
-- P stored to LDS for FP8 conversion
-- Accepted ~0.18 max error for multi-tile
+```
+seq_len=32  (1 tile):  max_error=0.087 ✅
+seq_len=64  (2 tiles): max_error=0.178 ✅
+seq_len=96  (3 tiles): max_error=0.123 ✅
+seq_len=128 (4 tiles): max_error=0.109 ✅
+```
