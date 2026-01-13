@@ -1,0 +1,39 @@
+=== 128Q Kernel Debug Session ===
+
+## Findings
+
+### Bug 1: Register clobbering
+- MFMA result registers v[0:15] were being clobbered by address calculations
+- Fix: Use different registers (v50+) for temporary values after MFMA
+
+### Bug 2: wave_id clobbering O pointer  
+- s5 was used for both wave_id (via v_readfirstlane) and O pointer high bits
+- Fix: Use s28 for wave_id, keep s[4:5] for O pointer
+
+### Bug 3: PV MFMA incomplete (CRITICAL)
+- 64T kernel does 2 MFMAs per HD tile (K=0..15 and K=16..31)
+- 128Q kernel only did 1 MFMA per HD tile
+- Fix: Add second MFMA for each HD tile
+
+## Working tests:
+- test_128q_qload.py: Wave ID output works, Q loading works
+- test_128q_qk_only.py: QK MFMA works (after fixing register clobber)
+
+## Structure comparison (64T vs 128Q):
+
+### 64T (fwd_fp8_kloop.s):
+- 64 threads, 1 wave
+- Q: 32×128, O: 32×128
+- PV: 2 MFMAs × 4 HD tiles = 8 MFMAs per K-tile
+
+### 128Q target:
+- 256 threads, 4 waves  
+- Q: 128×128 (32 rows per wave), O: 128×128
+- Each wave independent, same structure as 64T
+
+## BF16 reference analysis:
+- 256 threads = 4 waves
+- 176 total MFMAs
+- Per wave: 32 Q rows
+- Uses swizzle: m0 = 0x8200 + 0x408 * wave_id
+- Per-wave Q offset: wave_id * Q_stride * 2
