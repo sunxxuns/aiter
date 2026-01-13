@@ -855,12 +855,32 @@ k_base = 8 if lane >= 32 else 0
 | Random (3 seeds) | mean_diff=0.000 ✓ |
 | Identity pattern | exact match ✓ |
 
-### Why TR_B8 Doesn't Work (Deferred)
+### TR_B8 Gather Formula (Verified 2026-01-12)
 
-- `ds_read_b64` reads 8 consecutive bytes: LDS[addr:addr+7]
-- `TR_B8` reads 8 bytes with stride-16 AND does cross-lane transpose
-- The cross-lane data redistribution doesn't match MFMA operand expectation
-- Would require deep ISA investigation to design compatible LDS layout
+With per-lane address `base`:
+```
+output[k] = LDS[(base >> 3) + k * 16]  for k = 0..7
+```
+
+Example with `base = lane * 8`:
+- Lane 0 (base=0): reads LDS[0, 16, 32, 48, 64, 80, 96, 112]
+- Lane 1 (base=8): reads LDS[1, 17, 33, 49, 65, 81, 97, 113]
+- Lane 8 (base=64): reads LDS[8, 24, 40, 56, 72, 88, 104, 120]
+
+**This is column-major with stride 16!**
+
+To use TR_B8 for MFMA:
+1. Store K matrix in LDS column-major with 16-byte row stride
+2. Each lane reads 8 elements from one column (K dimension)
+3. Cross-lane distribution handles the M dimension
+
+**LDS Layout for TR_B8**:
+For K[row, col], store at: `LDS[row + col * 16]`
+
+Then with `base = mfma_row * 8`:
+- Lane reads: `output[k] = LDS[mfma_row + k * 16] = K[mfma_row, k]` ✓
+
+**Status**: TR_B8 formula verified, MFMA integration WIP (some NaN issues)
 
 ### Recommendation
 

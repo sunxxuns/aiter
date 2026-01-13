@@ -1,0 +1,37 @@
+## Bank Conflict Analysis Results (2026-01-12)
+
+### Tested Approaches
+
+| Approach | Bank Conflicts | Time (4096 blocks) | TF/s | Notes |
+|----------|----------------|-------------------|------|-------|
+| stride-128 | 15/phase | 16.77 µs | 64.0 | Shift addressing (fast) |
+| stride-132 (mul) | 0/phase | 19.87 µs | 54.0 | Multiply addressing (slow) |
+| stride-132 (shifts) | 0/phase | 19.74 µs | 54.4 | (row<<7)+(row<<2) |
+
+### Key Finding
+
+**Stride-128 with bank conflicts is 18% FASTER than stride-132 without conflicts!**
+
+Reasons:
+1. Bank conflict penalty is not as severe as theoretical 16x serialization
+2. Non-power-of-2 stride (132) requires extra instructions even with shift optimization
+3. Modern GPU bank conflict resolution is more efficient than theory suggests
+
+### BF16 Reference
+
+BF16 kernel uses stride 0x408 (1032 bytes) - a carefully chosen "magic" stride for BF16's
+specific access pattern and element size.
+
+### Recommendation
+
+For FP8 QK MFMA:
+1. Use stride-128 (simpler, faster in practice)
+2. Bank conflict overhead (~18%) is less than addressing overhead
+3. Focus optimization effort on other areas (K-loop, double buffering, async loads)
+
+### Alternative: TR_B8
+
+The `ds_read_b64_tr_b8` instruction may provide a better path for FP8:
+- Hardware transpose during LDS read
+- Designed specifically for 8-bit MFMA operands
+- Needs investigation of correct LDS layout to match MFMA operand expectations
