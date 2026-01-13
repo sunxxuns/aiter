@@ -58,3 +58,23 @@ do not use uniform input got false positive
 .numerics: make sure the layout correct, yield correct results
 .comp: make sure following the patterns in bf16 asm, with only the necessary differences
 .milestone: record road maps and summarize current status
+
+### CRITICAL: Swizzle is NOT optional ###
+Row-major LDS layout has bank conflicts that will kill performance at scale.
+The BF16-style swizzle pattern with ds_read_b64_tr_b8 is REQUIRED for FP8.
+Never skip or defer the swizzle implementation - it's a blocking requirement.
+
+### BF16 Swizzle Pattern is for 256 Threads ###
+The BF16 kernel's swizzle (m0=0x8200, stride 0x2040, offsets 0/512/64/576/...)
+is designed for 256 threads (4 waves). It does NOT scale down to 64 threads.
+For FP8 with swizzle, must implement 256T first to use BF16's proven pattern.
+
+### IMPORTANT: Dot file changes require user approval ###
+All changes to .xxx files (.lessons, .milestone, .bench, .numerics, .comp, .scale, .cursorrules, etc.)
+must be proposed to the user first and only applied after explicit approval.
+These files contain critical project state and decisions that need human review.
+
+### EXCEPTION: .xxx.tmp files can be freely modified ###
+Temporary working files (.lessons.tmp, .milestone.tmp, etc.) can be created/modified without approval.
+Use these to store intermediate findings, test results, and progress notes.
+When a milestone is reached, propose moving content from .xxx.tmp to the corresponding .xxx file.

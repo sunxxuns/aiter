@@ -807,3 +807,66 @@ Thread 0 transpose read: `[0, 1, 64, 65, 128, 129, 192, 193]`
 - Working 64T kernel is correct
 - Scale by adding 3 more waves (4 total)
 - Follow BF16's wave coordination pattern
+
+---
+
+## 8.13 VERIFIED: ds_read_b64 + Row-Major LDS + XOR Swizzle (2026-01-12)
+
+### Working Solution for FP8 QK MFMA
+
+**Approach**: Use `ds_read_b64` (non-transpose) with XOR swizzle for bank conflict avoidance.
+
+**XOR Swizzle Formula**:
+```asm
+.macro XOR_SWIZZLE dst, src, tmp
+    v_and_b32_e32 \tmp, 0x1ff, \src     // offset & 0x1ff
+    v_lshrrev_b32_e32 \tmp, 7, \tmp     // >> 7
+    v_lshlrev_b32_e32 \tmp, 3, \tmp     // << 3
+    v_xor_b32_e32 \dst, \tmp, \src      // offset ^ swizzle
+.endm
+```
+
+**MFMA A Operand Mapping (32 rows)**:
+```
+row16 = (lane & 3) + ((lane >> 3) & 3) * 4     // 0-15
+row_hi = (lane >> 2) & 1                        // 0 or 1
+full_row = row16 + row_hi * 16                  // 0-31
+k_base = 8 if lane >= 32 else 0
+```
+
+**LDS Layout**: Row-major with swizzle
+- K[row, k] at `swizzle(row * 16 + k)`
+- Apply same swizzle on both write and read paths
+
+### Benchmark Results
+
+| Comparison | Result |
+|------------|--------|
+| XOR swizzle vs no swizzle | **13% faster** with swizzle |
+| ds_read_b64 vs TR_B8 | ds_read_b64 is **12% faster** |
+
+### Numerical Verification - ALL PASS
+
+| Test | Result |
+|------|--------|
+| Uniform K=Q=1 | output = 16.0 ✓ |
+| Single K row | correct sum ✓ |
+| Single Q row | correct sum ✓ |
+| Random (3 seeds) | mean_diff=0.000 ✓ |
+| Identity pattern | exact match ✓ |
+
+### Why TR_B8 Doesn't Work (Deferred)
+
+- `ds_read_b64` reads 8 consecutive bytes: LDS[addr:addr+7]
+- `TR_B8` reads 8 bytes with stride-16 AND does cross-lane transpose
+- The cross-lane data redistribution doesn't match MFMA operand expectation
+- Would require deep ISA investigation to design compatible LDS layout
+
+### Recommendation
+
+Use **ds_read_b64 + row-major LDS + XOR swizzle** for FP8 flash attention:
+- ✅ Numerically correct
+- ✅ 13% faster than non-swizzled (bank conflict avoidance)
+- ✅ Simpler than TR_B8 approach
+
+**Files**: `stepA_full_qk.s`, `stepA_full_qk.py`, `stepD5_verify_stepA.py`
