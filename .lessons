@@ -870,3 +870,63 @@ Use **ds_read_b64 + row-major LDS + XOR swizzle** for FP8 flash attention:
 - ✅ Simpler than TR_B8 approach
 
 **Files**: `stepA_full_qk.s`, `stepA_full_qk.py`, `stepD5_verify_stepA.py`
+
+---
+
+## 8.14 BETTER SOLUTION: Stride-132 LDS Layout (Zero Bank Conflicts)
+
+### Root Cause of Bank Conflicts
+
+With HD=128 row stride (128 bytes), ALL rows hit **bank 0** because:
+- 128 bytes = 32 banks × 4 bytes
+- Every multiple of 128 hits the same bank!
+
+### Solution: Use Non-Aligned Stride
+
+**Stride 132** achieves **ZERO bank conflicts**:
+- 132 = 128 + 4 (adds 1 bank offset per row)
+- Each row hits a different bank
+- All 4 phases of `ds_read_b64` have 16 unique banks
+
+### Comparison
+
+| Approach | Conflicts/Phase | Speedup vs Naive |
+|----------|-----------------|------------------|
+| Stride 128 (naive) | 15 | Baseline |
+| XOR swizzle | 12 | +13% |
+| **Stride 132** | **0** | **+17%** |
+
+### Implementation
+
+```asm
+.set LDS_STRIDE, 132    // NOT 128!
+
+// Write: row * 132 + col
+v_mov_b32_e32 v2, LDS_STRIDE
+v_mul_lo_u32 v5, row, v2
+v_add_u32_e32 v5, col, v5
+
+// Read: same formula
+v_mul_lo_u32 v70, row, v2
+v_add_u32_e32 v70, k_base, v70
+ds_read_b64 v[30:31], v70
+```
+
+### LDS Size
+
+- Q: 32 rows × 132 stride = 4224 bytes
+- K: 32 rows × 132 stride = 4224 bytes
+- Total: ~8.5 KB (well under 64 KB limit)
+
+### Why This Works
+
+The MFMA row mapping produces rows [0,1,2,3,16,17,18,19,4,5,6,7,...] for phase 0.
+With stride 132:
+- Row 0: offset 0, bank 0
+- Row 1: offset 132, bank 1
+- Row 2: offset 264, bank 2
+- etc.
+
+Each row hits a different bank → zero conflicts.
+
+**Files**: `qk_fp8_stride132.s`, `qk_fp8_stride132_opt.s`, `test_qk_fp8_stride132.py`
