@@ -210,55 +210,46 @@ _ZN5aiter15fwd_fp8_swizzleE:
     // P is now in v[0:15], normalized softmax
     
     // ========================================================================
-    // STORE P TO LDS (offset 8192) AND LOAD V
+    // STORE P TO LDS (offset 8192) - SAME PATTERN AS WORKING KERNEL
     // ========================================================================
     s_barrier
     
-    // Store P (32×32 F32 matrix) to LDS at offset 8192
-    // Layout: row = lane_id & 31 (col in S matrix)
-    //         16 values per lane go to different K positions
+    // P layout: P[col, k] stored as P[col * 32 + k]
+    // col = lane & 31, k_base = (lane >> 5) * 4
+    // v0-v15 contain values for k positions based on MFMA output
     v_and_b32_e32 v24, 31, v60            // col = lane & 31
     v_lshrrev_b32_e32 v25, 5, v60         // half = lane >> 5
+    v_lshlrev_b32_e32 v25, 2, v25         // half * 4
     
-    // P is stored transposed: P[k, col] at LDS[8192 + col * 128 + k * 4]
-    // Each lane stores 16 values (k=0..15 for half=0, k=16..31 for half=1)
-    v_lshlrev_b32_e32 v26, 7, v24         // col * 128
-    v_lshlrev_b32_e32 v27, 6, v25         // half * 64 (16 values * 4 bytes)
-    v_add_u32_e32 v26, v26, v27
-    v_add_u32_e32 v26, 8192, v26          // base = 8192 + col*128 + half*64
+    // Store P using working kernel's STORE_P pattern
+    // addr = 8192 + (col * 32 + k_8_group * 8 + k_mod4 + half*4) * 4
+    .macro STORE_P_256T vreg, k_mod4, k_8_group
+        v_mov_b32_e32 v26, \k_mod4
+        v_add_u32_e32 v26, v26, v25       // + half * 4
+        v_add_u32_e32 v26, \k_8_group * 8, v26
+        v_lshlrev_b32_e32 v27, 5, v24     // col * 32
+        v_add_u32_e32 v27, v27, v26
+        v_lshlrev_b32_e32 v27, 2, v27     // * 4 (bytes)
+        v_add_u32_e32 v27, 8192, v27
+        ds_write_b32 v27, \vreg
+    .endm
     
-    // Store all 16 values
-    ds_write_b32 v26, v0
-    v_add_u32_e32 v27, 4, v26
-    ds_write_b32 v27, v1
-    v_add_u32_e32 v27, 8, v26
-    ds_write_b32 v27, v2
-    v_add_u32_e32 v27, 12, v26
-    ds_write_b32 v27, v3
-    v_add_u32_e32 v27, 16, v26
-    ds_write_b32 v27, v4
-    v_add_u32_e32 v27, 20, v26
-    ds_write_b32 v27, v5
-    v_add_u32_e32 v27, 24, v26
-    ds_write_b32 v27, v6
-    v_add_u32_e32 v27, 28, v26
-    ds_write_b32 v27, v7
-    v_add_u32_e32 v27, 32, v26
-    ds_write_b32 v27, v8
-    v_add_u32_e32 v27, 36, v26
-    ds_write_b32 v27, v9
-    v_add_u32_e32 v27, 40, v26
-    ds_write_b32 v27, v10
-    v_add_u32_e32 v27, 44, v26
-    ds_write_b32 v27, v11
-    v_add_u32_e32 v27, 48, v26
-    ds_write_b32 v27, v12
-    v_add_u32_e32 v27, 52, v26
-    ds_write_b32 v27, v13
-    v_add_u32_e32 v27, 56, v26
-    ds_write_b32 v27, v14
-    v_add_u32_e32 v27, 60, v26
-    ds_write_b32 v27, v15
+    STORE_P_256T v0, 0, 0
+    STORE_P_256T v1, 1, 0
+    STORE_P_256T v2, 2, 0
+    STORE_P_256T v3, 3, 0
+    STORE_P_256T v4, 0, 1
+    STORE_P_256T v5, 1, 1
+    STORE_P_256T v6, 2, 1
+    STORE_P_256T v7, 3, 1
+    STORE_P_256T v8, 0, 2
+    STORE_P_256T v9, 1, 2
+    STORE_P_256T v10, 2, 2
+    STORE_P_256T v11, 3, 2
+    STORE_P_256T v12, 0, 3
+    STORE_P_256T v13, 1, 3
+    STORE_P_256T v14, 2, 3
+    STORE_P_256T v15, 3, 3
     
     s_waitcnt lgkmcnt(0)
     s_barrier
@@ -297,15 +288,16 @@ _ZN5aiter15fwd_fp8_swizzleE:
     // Read P and V, compute MFMA
     // For simplicity, just do one HD tile (cols 0-31 of V)
     
-    // Read P row (8 F32 values = 32 bytes, will convert to FP8)
+    // Read P row - P[col * 32 + k] where col = mfma_row, k = 0..15 (first pass)
+    // addr = 8192 + (col * 32 + k) * 4
     v_and_b32_e32 v24, 31, v60
     v_lshrrev_b32_e32 v25, 5, v60
-    v_lshlrev_b32_e32 v26, 7, v63         // mfma_row * 128
-    v_lshlrev_b32_e32 v27, 3, v64         // k_half * 8 (byte offset)
+    v_lshlrev_b32_e32 v26, 7, v63         // mfma_row * 128 (col * 32 * 4)
+    v_lshlrev_b32_e32 v27, 2, v64         // k_half * 4 (bytes per F32)
     v_add_u32_e32 v26, v26, v27
     v_add_u32_e32 v26, 8192, v26          // P addr base
     
-    // Read 8 F32 values from P
+    // Read 8 F32 values from P (k=0..7 for first MFMA in this pass)
     ds_read_b64 v[28:29], v26
     v_add_u32_e32 v27, 8, v26
     ds_read_b64 v[30:31], v27
