@@ -40,7 +40,7 @@ def main():
     module_256t = ctypes.c_void_p()
     hip.hipModuleLoad(ctypes.byref(module_256t), co_256t.encode())
     func_256t = ctypes.c_void_p()
-    hip.hipModuleGetFunction(ctypes.byref(func_256t), module_256t, b"_ZN5aiter12fwd_fp8_256tE")
+    hip.hipModuleGetFunction(ctypes.byref(func_256t), module_256t, b"_ZN5aiter13fwd_fp8_256tE")
     
     start = ctypes.c_void_p()
     end = ctypes.c_void_p()

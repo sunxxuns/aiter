@@ -1,167 +1,157 @@
 #!/usr/bin/env python3
-"""
-Deep analysis of bank conflicts for FP8 QK MFMA.
-Find optimal swizzle pattern for zero bank conflicts.
-"""
+"""Analyze bank conflicts for FP8 ds_read_b64."""
 
-import numpy as np
-from collections import defaultdict
+def get_bank(byte_offset):
+    """Get LDS bank number for a byte offset (64 banks, 4 bytes each)."""
+    return (byte_offset >> 2) & 63
 
-def mfma_row_mapping(lane):
-    """MFMA A operand row mapping for 32x32x16"""
-    row16 = (lane & 3) + ((lane >> 3) & 3) * 4
-    row_hi = (lane >> 2) & 1
-    return row16 + row_hi * 16
-
-def xor_swizzle(offset):
-    """Current XOR swizzle"""
-    return offset ^ (((offset & 0x1ff) >> 7) << 3)
-
-def analyze_phase_access():
-    """Analyze which addresses each phase accesses"""
-    print("ds_read_b64 Phase Analysis for QK MFMA")
+def analyze_simple_rowmajor():
+    """Analyze bank conflicts with simple row-major layout."""
+    print("=" * 70)
+    print("Simple Row-Major Layout Analysis")
+    print("Layout: Q[r,c] at LDS[r*128 + c]")
+    print("Thread tid reads Q[tid%32, (tid//32)*8 : (tid//32)*8+8]")
     print("=" * 70)
     
-    # ds_read_b64 executes in 4 phases, 16 lanes each
-    # Each lane reads 8 bytes (2 banks worth)
+    # ds_read_b64 reads 8 bytes = 2 dwords from 2 consecutive banks
+    banks_used = {}  # bank -> list of threads
     
-    print("\nMFMA row mapping for lanes 0-15 (phase 0):")
-    print("-" * 50)
-    
-    rows_phase0 = []
-    for lane in range(16):
-        row = mfma_row_mapping(lane)
-        rows_phase0.append(row)
-        print(f"  Lane {lane:2d}: row {row:2d}")
-    
-    print(f"\nUnique rows in phase 0: {sorted(set(rows_phase0))}")
-    print(f"Row distribution: {len(set(rows_phase0))} unique out of 16")
-    
-    # For HD=128 row-major, row R starts at offset R*128
-    # So rows in phase 0 start at: row * 128
-    print("\nBase addresses (no swizzle) for phase 0:")
-    addrs = [r * 128 for r in rows_phase0]
-    banks = [(a // 4) % 32 for a in addrs]
-    print(f"  Addresses: {addrs}")
-    print(f"  Banks: {banks}")
-    print(f"  Unique banks: {len(set(banks))} out of 16 needed")
-    
-    # The problem: multiple rows map to same bank
-    bank_count = defaultdict(int)
-    for b in banks:
-        bank_count[b] += 1
-    conflicts = sum(c - 1 for c in bank_count.values() if c > 1)
-    print(f"  Bank conflicts: {conflicts}")
-
-def find_optimal_swizzle():
-    """Try to find a swizzle that eliminates bank conflicts"""
-    print("\n\nSearching for Optimal Swizzle")
-    print("=" * 70)
-    
-    # Get the rows accessed in phase 0
-    rows = [mfma_row_mapping(lane) for lane in range(16)]
-    base_addrs = [r * 128 for r in rows]  # K=0 column
-    
-    print(f"Rows accessed: {rows}")
-    print(f"Base addresses: {base_addrs}")
-    
-    # For zero bank conflicts, we need 16 addresses to map to 16 different banks
-    # Bank = (swizzled_addr // 4) % 32
-    
-    # Try different XOR patterns
-    best_conflicts = 16
-    best_pattern = None
-    
-    for xor_bits in range(16):  # Which bits to XOR from high to low
-        for shift in range(8):  # How much to shift
-            def test_swizzle(addr):
-                high_bits = (addr >> 7) & 0xf  # bits 7-10
-                xor_val = (high_bits & xor_bits) << shift
-                return addr ^ xor_val
-            
-            swizzled = [test_swizzle(a) for a in base_addrs]
-            banks = [(s // 4) % 32 for s in swizzled]
-            unique = len(set(banks))
-            conflicts = 16 - unique
-            
-            if conflicts < best_conflicts:
-                best_conflicts = conflicts
-                best_pattern = (xor_bits, shift)
-    
-    print(f"\nBest XOR pattern found: xor_bits={best_pattern[0]:04b}, shift={best_pattern[1]}")
-    print(f"Conflicts: {best_conflicts}")
-    
-    # Try row-based swizzle (add row-dependent offset)
-    print("\n\nTrying Row-Based Swizzle:")
-    print("-" * 50)
-    
-    for row_mult in [8, 16, 24, 32, 64, 128]:
-        def row_swizzle(addr, row):
-            return addr + (row * row_mult) % 512
+    for tid in range(64):
+        row = tid % 32
+        k_base = (tid // 32) * 8
+        offset = row * 128 + k_base
         
-        swizzled = [row_swizzle(base_addrs[i], rows[i]) for i in range(16)]
-        banks = [(s // 4) % 32 for s in swizzled]
-        unique = len(set(banks))
-        conflicts = 16 - unique
-        print(f"  row_mult={row_mult:3d}: {conflicts} conflicts, banks={banks[:8]}...")
+        # ds_read_b64 accesses 2 consecutive 4-byte chunks
+        bank0 = get_bank(offset)
+        bank1 = get_bank(offset + 4)
+        
+        for bank in [bank0, bank1]:
+            if bank not in banks_used:
+                banks_used[bank] = []
+            banks_used[bank].append(tid)
+    
+    print(f"\nBanks used: {len(banks_used)}")
+    
+    max_conflicts = max(len(tids) for tids in banks_used.values())
+    print(f"Max threads per bank: {max_conflicts}")
+    print(f"Bank conflict factor: {max_conflicts}x")
+    
+    if max_conflicts > 1:
+        print("\nConflicting banks:")
+        for bank, tids in sorted(banks_used.items()):
+            if len(tids) > 1:
+                print(f"  Bank {bank}: threads {tids}")
 
-def analyze_bf16_pattern():
-    """Analyze what BF16 does for bank-conflict-free access"""
-    print("\n\nBF16 Reference Pattern Analysis")
+def analyze_bf16_style_swizzle():
+    """Analyze BF16-style swizzle pattern for FP8."""
+    print("\n" + "=" * 70)
+    print("BF16-Style Swizzle Analysis (adapted for FP8)")
     print("=" * 70)
     
-    # BF16 uses buffer_load...lds with m0 offsets
-    # The m0 offset formula encodes both the destination LDS address
-    # and implicitly handles bank conflict avoidance
+    # BF16 v2 formula: 0x8200 + (tid>>5)*16 + (lane&1)*128 + (lane>>1)*1032
+    # For FP8, we need to adapt this for 8-byte reads instead of 4-byte
     
-    # BF16 swizzle for wave 0: base = 0x8200 = 33280
-    # Per-lane offset: (lane&1)*0x80 + (lane>>1)*0x408 + (lane>>5)*16
+    banks_used = {}
     
-    print("BF16 m0 offset formula: base + (lane&1)*0x80 + (lane>>1)*0x408 + (lane>>5)*16")
-    print()
+    for tid in range(64):
+        lane = tid & 31
+        # BF16 formula (byte addresses)
+        v2 = 0x8200 + (tid >> 5) * 16 + (lane & 1) * 128 + (lane >> 1) * 1032
+        
+        # For FP8, same formula but reads 8 bytes
+        bank0 = get_bank(v2)
+        bank1 = get_bank(v2 + 4)
+        
+        for bank in [bank0, bank1]:
+            if bank not in banks_used:
+                banks_used[bank] = []
+            banks_used[bank].append(tid)
+        
+        if tid < 8:
+            print(f"tid {tid}: v2=0x{v2:x}, banks={bank0},{bank1}")
     
-    base = 0x8200
-    for lane in range(16):
-        offset = base + (lane & 1) * 0x80 + (lane >> 1) * 0x408 + (lane >> 5) * 16
-        bank = (offset // 4) % 32
-        print(f"  Lane {lane:2d}: offset=0x{offset:04x} ({offset:5d}), bank={bank:2d}")
-    
-    # Check uniqueness
-    offsets = [base + (lane & 1) * 0x80 + (lane >> 1) * 0x408 + (lane >> 5) * 16 for lane in range(16)]
-    banks = [(o // 4) % 32 for o in offsets]
-    print(f"\nUnique banks: {len(set(banks))} (need 16 for zero conflicts)")
-    print(f"Banks: {sorted(set(banks))}")
+    print(f"\nBanks used: {len(banks_used)}")
+    max_conflicts = max(len(tids) for tids in banks_used.values())
+    print(f"Max threads per bank: {max_conflicts}")
+    print(f"Bank conflict factor: {max_conflicts}x")
 
 def propose_fp8_swizzle():
-    """Propose a swizzle pattern specifically for FP8 MFMA layout"""
-    print("\n\nProposed FP8-Specific Swizzle")
+    """Propose a swizzle pattern for FP8 that avoids bank conflicts."""
+    print("\n" + "=" * 70)
+    print("Proposed FP8 Swizzle (bank-conflict-free)")
     print("=" * 70)
     
-    rows = [mfma_row_mapping(lane) for lane in range(16)]
+    # Goal: 64 threads, each reads 8 bytes via ds_read_b64
+    # Each read touches 2 consecutive banks
+    # Need all 64 threads to hit different bank pairs
+    # 
+    # With 64 banks and 2 banks per read, max 32 concurrent reads without conflict
+    # But we have 64 threads, so some overlap is inevitable
+    # 
+    # Key insight: within a wavefront (64 threads), reads are serialized if 
+    # they hit the same bank. We want each bank touched by at most 1 thread.
+    # 
+    # Ideal: thread tid accesses banks (tid*2) and (tid*2+1)
+    # This requires offset = tid * 8, but we need MFMA-compatible layout
     
-    # The issue: rows are [0,1,2,3,16,17,18,19,4,5,6,7,20,21,22,23] for lanes 0-15
-    # With HD=128 stride, row R has base addr R*128
-    # Banks are (R*128/4) % 32 = (R*32) % 32 = 0 for all R!
+    # Alternative: use row XOR swizzle
+    # offset = row * 128 + k_base XOR (some function of row)
     
-    print("Problem: With HD=128 stride, all rows hit bank 0!")
-    print(f"  Rows: {rows}")
-    print(f"  Addresses: {[r*128 for r in rows]}")
-    print(f"  Banks (no swizzle): {[(r*128//4)%32 for r in rows]}")
+    banks_used = {}
     
-    # Solution: Use a different row stride in LDS that spreads banks
-    # Instead of row*128, use row*stride where stride ensures bank spreading
+    print("\nTrying XOR swizzle: offset = (row * 128 + k_base) XOR (row * 4)")
+    for tid in range(64):
+        row = tid % 32
+        k_base = (tid // 32) * 8
+        
+        # Simple XOR swizzle
+        base_offset = row * 128 + k_base
+        swizzle = (row & 0xF) * 8  # Spread based on low bits of row
+        offset = base_offset ^ swizzle
+        
+        bank0 = get_bank(offset)
+        bank1 = get_bank(offset + 4)
+        
+        for bank in [bank0, bank1]:
+            if bank not in banks_used:
+                banks_used[bank] = []
+            banks_used[bank].append(tid)
+        
+        if tid < 8:
+            print(f"tid {tid}: row={row}, k_base={k_base}, offset=0x{offset:x}, banks={bank0},{bank1}")
     
-    print("\nSolution: Use LDS stride that spreads banks")
-    for stride in [132, 136, 140, 144, 160, 192]:
-        addrs = [r * stride for r in rows]
-        banks = [(a // 4) % 32 for a in addrs]
-        unique = len(set(banks))
-        print(f"  Stride {stride}: {unique} unique banks, conflicts={16-unique}")
-        if unique == 16:
-            print(f"    -> ZERO CONFLICTS! Banks: {banks}")
+    max_conflicts = max(len(tids) for tids in banks_used.values())
+    print(f"\nMax threads per bank: {max_conflicts}")
+    print(f"Bank conflict factor: {max_conflicts}x")
+    
+    # Try another swizzle
+    print("\n" + "-" * 40)
+    print("Trying stride-132 layout:")
+    banks_used = {}
+    
+    for tid in range(64):
+        row = tid % 32
+        k_base = (tid // 32) * 8
+        
+        # Stride 132 (128 + 4) to shift banks between rows
+        offset = row * 132 + k_base
+        
+        bank0 = get_bank(offset)
+        bank1 = get_bank(offset + 4)
+        
+        for bank in [bank0, bank1]:
+            if bank not in banks_used:
+                banks_used[bank] = []
+            banks_used[bank].append(tid)
+        
+        if tid < 8:
+            print(f"tid {tid}: row={row}, k_base={k_base}, offset=0x{offset:x}, banks={bank0},{bank1}")
+    
+    max_conflicts = max(len(tids) for tids in banks_used.values())
+    print(f"\nMax threads per bank: {max_conflicts}")
+    print(f"Bank conflict factor: {max_conflicts}x")
 
 if __name__ == "__main__":
-    analyze_phase_access()
-    find_optimal_swizzle()
-    analyze_bf16_pattern()
+    analyze_simple_rowmajor()
+    analyze_bf16_style_swizzle()
     propose_fp8_swizzle()
