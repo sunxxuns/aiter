@@ -1,0 +1,83 @@
+# CODE MODEL STATUS - Updated 2025-01-15
+
+## CURRENT BEST: fwd_fp8_qk_preload.s
+- **Performance**: ~400 TF/s at H=40, SEQ=8192
+- **Numerics**: CORRECT (uniform and random tests pass)
+- **Layout**: pitch-136 (bank-conflict-free)
+- **Approach**: ds_read_b64 (plain reads, no TR8)
+
+## PERFORMANCE COMPARISON
+| Kernel | TF/s | Notes |
+|--------|------|-------|
+| BF16 full attention | 987 | Reference target |
+| fwd_fp8_qk_preload | ~400 | Best FP8 QK |
+| fwd_fp8_qk_8wave | ~427 | 8 waves, large SEQ only |
+| fwd_fp8_qk_swpipe | ~337 | Software pipelined |
+| fwd_fp8_qk_v8swizzle | N/A | WRONG numerics (TR8) |
+| fwd_fp8_qk_tr8scaled | N/A | WRONG numerics (TR8) |
+
+## KEY INSIGHT: FP8 QK at 400 TF/s is only 40% of BF16's 987 TF/s
+
+This is not acceptable. The gap indicates fundamental inefficiency.
+
+## ROOT CAUSE ANALYSIS
+
+### 1. BF16 uses buffer_load...lds (direct to LDS)
+```asm
+// BF16 pattern:
+s_mov_b32 m0, 0x8200 + wave*0x408
+buffer_load_dwordx4 v4, s[8:11], 0 offen lds  // Direct to LDS!
+```
+
+Our FP8 uses:
+```asm
+// Our pattern:
+buffer_load_dwordx4 v[20:23], ... offen       // To VGPR
+ds_write_b128 v53, v[20:23]                   // Then to LDS
+```
+
+The 2-step approach doubles memory instruction count.
+
+### 2. BF16 processes multiple Q-tiles per block
+- BF16 has 4 output tiles: v[32:47], v[48:63], v[64:79], v[80:95]
+- Each K load is used for 4× the MFMAs
+- Better amortization of load overhead
+
+Our FP8 does:
+- 1 output tile per block (v[0:15])
+- Each K load only used for 1 set of MFMAs
+
+### 3. BF16's swizzle pattern is for TR16 reads
+- BF16 uses complex m0 swizzle (0x8200 base, 0x408 wave stride)
+- Designed for `ds_read_b64` with specific interleaved access
+- NOT directly applicable to FP8/TR8
+
+## TR8 IS NOT THE PATH FORWARD
+Both TR8 kernels produce WRONG results:
+- fwd_fp8_qk_v8swizzle: 384 instead of 512 (uniform test)
+- fwd_fp8_qk_tr8scaled: 384 instead of 512 (uniform test)
+
+The BF16 swizzle pattern doesn't translate to TR8.
+
+## NEXT STEPS
+
+### Priority 1: Multiple Q-tiles per block
+- Process 2 Q-tiles (64 rows) per block
+- Use 32 additional VGPRs for second output tile
+- K data is shared between both tiles
+- Expected: ~2x MFMAs per K load
+
+### Priority 2: Proper buffer_load...lds
+- Need to understand how m0 works with buffer_load...lds
+- The destination appears to be m0 + lane-dependent offset
+- May need different LDS layout to match
+
+### Priority 3: Add full attention
+- QK + softmax + PV
+- This is what BF16 benchmarks (987 TF/s)
+- May see better efficiency with more work per block
+
+## FILES REFERENCE
+- Best kernel: `fwd_fp8_qk_preload.s` (400 TF/s, correct)
+- BF16 reference: `fwd_hd128_bf16.s` (987 TF/s)
+- TR8 attempts: `fwd_fp8_qk_v8swizzle.s`, `fwd_fp8_qk_tr8scaled.s` (broken)
