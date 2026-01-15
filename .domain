@@ -348,13 +348,45 @@ M7[ ............... ]       T15[ .   .   .   . ]
 
 ### Triton vs Our Approach
 
-| Aspect | Triton | Our Pitch-136 |
-|--------|--------|---------------|
-| **Write pattern** | Diagonal padding | Row + 8-byte pad |
-| **Read instruction** | `ds_read_tr8_b64` | `ds_read_b64` |
-| **Lane cooperation** | 16 lanes per tile | Independent |
-| **Bank conflicts** | Zero (diagonal) | Zero (pitch) |
-| **Complexity** | Higher (linear layout) | Simple (pitch formula) |
+| Aspect | Triton (gfx950 actual) | Our Pitch-136 |
+|--------|------------------------|---------------|
+| **Write pattern** | XOR swizzle (`v_bitop3_b32`) | Row + 8-byte pad |
+| **Read instruction** | `ds_read_u8` (byte-by-byte!) | `ds_read_b64` |
+| **Packing** | Manual with `v_or_b32` | Direct 64-bit read |
+| **Bank conflicts** | Zero (XOR swizzle) | 2-way (pitch) |
+| **Instruction count** | Higher (byte ops) | Lower (64-bit ops) |
+
+### ACTUAL Triton FP8 Strategy (from dumped assembly)
+
+**Surprising finding:** Triton does NOT use `ds_read_tr8_b64` for FP8 on gfx950!
+
+Instead:
+```asm
+; Triton reads FP8 bytes individually:
+ds_read_u8 v16, v10 offset:1024
+ds_read_u8 v17, v10 offset:1026
+ds_read_u8 v23, v10 offset:1028
+...
+
+; Then packs them manually:
+v_lshlrev_b16_e32 v31, 8, v31
+v_or_b32_e32 v23, v23, v31
+v_or_b32_sdwa v24, v24, v32 dst_sel:WORD_1 ...
+v_or_b32_sdwa v17, v23, v24 ...  ; Final packed FP8x8
+
+; Then feeds to MFMA:
+v_mfma_f32_32x32x16_fp8_fp8 a[0:15], v[16:17], v[12:13], 0
+```
+
+**Address calculation uses XOR swizzle:**
+```asm
+v_bitop3_b32 v6, v10, v8, s8 bitop3:0x6c  ; 3-input XOR pattern
+```
+
+This approach:
+- Trades instruction count for simpler layout
+- Avoids TR8's complex diagonal requirements
+- Uses XOR-based swizzle for bank conflict avoidance
 
 ### Key Triton Files for Reference
 
