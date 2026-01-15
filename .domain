@@ -68,10 +68,23 @@ The conflicts occur because `136 = 2*64 + 8`. For MFMA reads:
 - At small scale (seq=64): ~42.7% of kernel time
 - At target scale (seq=32128): ~22.3% of kernel time
 
-**Zero-Conflict Solution Found:**
-- Formula: `(row * 144 + k_off) XOR (row * 4)`
-- Achieves 64/64 unique banks (verified)
-- Requires XOR swizzle in both write and read paths
+**Zero-Conflict Solutions Analyzed (2025-01-15):**
+
+1. **Diagonal Padding** `row * 136 + k_off + (row % 2) * 4`:
+   - Theoretically zero conflicts
+   - BUT: Write row != Read row (different thread mappings)
+   - Result: 6x slower, still shows bank conflicts
+   - NOT RECOMMENDED
+
+2. **XOR Swizzle** `(row * 144 + k_off) XOR (row * 4)`:
+   - Achieves 64/64 unique banks
+   - More complex but row-agnostic
+   - Requires XOR in both write AND read paths
+   - RECOMMENDED if pursuing zero conflicts
+
+**Conclusion**: 2-way conflicts with pitch-136 cause ~22% overhead at scale.
+Zero-conflict requires complex layout changes. May not be worth it vs optimizing
+other parts of the kernel (softmax, PV multiplication).
 
 ### Address Formulas
 
