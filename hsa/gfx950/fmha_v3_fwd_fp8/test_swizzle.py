@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test FP8 QK MFMA with BF16-style swizzle layout."""
+"""Test FP8 full attention: O = softmax(Q @ K^T) @ V"""
 
 import torch
 import ctypes
@@ -12,10 +12,13 @@ _ = torch.zeros(1, device='cuda')
 
 # Build kernel
 print("Building fwd_fp8_swizzle.s...")
-os.system("cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8 && "
+ret = os.system("cd /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8 && "
           "clang -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 "
           "-c fwd_fp8_swizzle.s -o fwd_fp8_swizzle.o 2>&1 && "
           "ld.lld -shared -o fwd_fp8_swizzle.co fwd_fp8_swizzle.o 2>&1")
+if ret != 0:
+    print("Build failed!")
+    exit(1)
 
 # Load kernel
 module = ctypes.c_void_p()
@@ -32,64 +35,63 @@ if res != 0:
 
 print("Kernel loaded successfully")
 
-# Test 1: Uniform input
-print("\n=== Test 1: Uniform Q=K=1 ===")
-S = torch.zeros(64, 16, dtype=torch.float32, device='cuda')  # 64 lanes × 16 values
+# Test 1: Uniform input (Q=K=V=1)
+print("\n=== Test 1: Uniform Q=K=V=1 ===")
+O = torch.zeros(64, 16, dtype=torch.float32, device='cuda')  # 64 lanes × 16 values
 Q = torch.ones(32, 128, dtype=torch.float32, device='cuda').to(torch.float8_e4m3fn)
 K = torch.ones(32, 128, dtype=torch.float32, device='cuda').to(torch.float8_e4m3fn)
+V = torch.ones(32, 128, dtype=torch.float32, device='cuda').to(torch.float8_e4m3fn)
 
 args = [
-    ctypes.c_void_p(S.data_ptr()),
+    ctypes.c_void_p(O.data_ptr()),
     ctypes.c_void_p(Q.data_ptr()),
-    ctypes.c_void_p(K.data_ptr())
+    ctypes.c_void_p(K.data_ptr()),
+    ctypes.c_void_p(V.data_ptr())
 ]
-args_ptrs = (ctypes.c_void_p * 3)(*[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args])
+args_ptrs = (ctypes.c_void_p * 4)(*[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args])
 
-# Launch with 256 threads
-hip.hipModuleLaunchKernel(func, 1, 1, 1, 256, 1, 1, 16384, None, args_ptrs, None)
+hip.hipModuleLaunchKernel(func, 1, 1, 1, 256, 1, 1, 20480, None, args_ptrs, None)
 hip.hipDeviceSynchronize()
 err = hip.hipGetLastError()
 
 print(f"Error: {err}")
-print(f"P mean: {S.mean().item():.4f} (expected ~0.03125 = 1/32 for uniform)")
-print(f"P[0,:8]: {S[0,:8].tolist()}")
-print(f"P[32,:8]: {S[32,:8].tolist()}")
-print(f"NaN count: {torch.isnan(S).sum().item()}")
-print(f"Non-zero: {(S != 0).sum().item()} / {S.numel()}")
+print(f"O mean: {O.mean().item():.4f} (expected ~1.0 for uniform V)")
+print(f"O[0,:8]: {O[0,:8].tolist()}")
+print(f"O[32,:8]: {O[32,:8].tolist()}")
+print(f"NaN count: {torch.isnan(O).sum().item()}")
+print(f"Non-zero: {(O != 0).sum().item()} / {O.numel()}")
 
-# Check if all values are the same (uniform input should give uniform output)
-unique_vals = S[~torch.isnan(S)].unique()
-print(f"Unique values: {len(unique_vals)}")
-if len(unique_vals) <= 5:
-    print(f"  Values: {unique_vals.tolist()}")
-
-# Test 2: Check row sums (should be ~1.0 for softmax)
-print("\n=== Test 2: Verify row sums ===")
-# For softmax, each row should sum to 1.0
-# But our output is per-lane (16 values), need to aggregate across lanes
-# For now, just check that values are in valid probability range [0, 1]
-valid_probs = ((S >= 0) & (S <= 1)).sum().item()
-print(f"Values in [0,1]: {valid_probs} / {S.numel()}")
-
-# Test 3: Random input
-print("\n=== Test 3: Random input ===")
+# Test 2: Random input
+print("\n=== Test 2: Random input ===")
 torch.manual_seed(42)
 Q = torch.randn(32, 128, device='cuda').to(torch.float8_e4m3fn)
 K = torch.randn(32, 128, device='cuda').to(torch.float8_e4m3fn)
-S.zero_()
+V = torch.randn(32, 128, device='cuda').to(torch.float8_e4m3fn)
+O.zero_()
 
 args = [
-    ctypes.c_void_p(S.data_ptr()),
+    ctypes.c_void_p(O.data_ptr()),
     ctypes.c_void_p(Q.data_ptr()),
-    ctypes.c_void_p(K.data_ptr())
+    ctypes.c_void_p(K.data_ptr()),
+    ctypes.c_void_p(V.data_ptr())
 ]
-args_ptrs = (ctypes.c_void_p * 3)(*[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args])
+args_ptrs = (ctypes.c_void_p * 4)(*[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args])
 
-hip.hipModuleLaunchKernel(func, 1, 1, 1, 256, 1, 1, 16384, None, args_ptrs, None)
+hip.hipModuleLaunchKernel(func, 1, 1, 1, 256, 1, 1, 20480, None, args_ptrs, None)
 hip.hipDeviceSynchronize()
 
-print(f"P mean: {S.mean().item():.4f}")
-print(f"P range: [{S.min().item():.4f}, {S.max().item():.4f}]")
-print(f"NaN count: {torch.isnan(S).sum().item()}")
-valid_probs = ((S >= 0) & (S <= 1)).sum().item()
-print(f"Values in [0,1]: {valid_probs} / {S.numel()}")
+print(f"O mean: {O.mean().item():.4f}")
+print(f"O range: [{O.min().item():.4f}, {O.max().item():.4f}]")
+print(f"NaN count: {torch.isnan(O).sum().item()}")
+
+# Reference computation (simplified)
+print("\n=== Reference (softmax @ V) ===")
+Q_f32 = Q.to(torch.float32)
+K_f32 = K.to(torch.float32)
+V_f32 = V.to(torch.float32)
+scale = 1.0 / (128 ** 0.5)
+S = Q_f32 @ K_f32.T * scale
+P = torch.softmax(S, dim=-1)
+O_ref = P @ V_f32  # [32, 128]
+print(f"Ref O mean: {O_ref[:,:32].mean().item():.4f}")  # Only first 32 cols
+print(f"Ref O range: [{O_ref[:,:32].min().item():.4f}, {O_ref[:,:32].max().item():.4f}]")
