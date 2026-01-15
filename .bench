@@ -1,47 +1,29 @@
-# FP8 Flash Attention - Benchmarks
+# FP8 FMHA Benchmark Results
 
-## Status: Phase 2 Correctness Only
+## QK MFMA Performance (pipelined, pitch-136)
 
-Performance benchmarking not yet started.
-Current focus: K-tile loop implementation for seq_len > 32.
+| Shape | Blocks | Time | TF/s | vs BF16 QK |
+|-------|--------|------|------|------------|
+| H=40, Seq=4096 | 5120 | 0.70 ms | 244 | 84% |
+| H=40, Seq=8192 | 10240 | 2.37 ms | 290 | 100% |
 
----
+## BF16 Reference (full attention)
 
-## Benchmark Command
+| Shape | Time | TF/s |
+|-------|------|------|
+| H=40, Seq=4096 | 0.40 ms | 868 |
+| H=40, Seq=32130 | 20.8 ms | 1016 |
 
-```bash
-python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 32130
-```
+## Analysis
 
----
+- QK is ~1/3 of full attention FLOPS
+- FP8 QK matches BF16 QK throughput at seq=8192
+- To beat BF16: need >400 TF/s for QK (theoretical 2x with FP8)
+- Current bottleneck: not using buffer_load...lds (direct LDS load)
 
-## Target Performance
+## Next Steps
 
-| Config | BF16 Baseline | FP8 Target | Improvement |
-|--------|---------------|------------|-------------|
-| seq=32130 | ~1000 TF/s | >1300 TF/s | +30% |
-
----
-
-## Current Kernel Capabilities
-
-| Feature | Status |
-|---------|--------|
-| head_dim=128 | ✅ |
-| seq_len=32 (single tile) | ✅ |
-| seq_len>32 (K-loop) | 🔄 In Progress |
-| Batch/heads | Not yet |
-
----
-
-## Performance Expectations
-
-FP8 benefits:
-1. 2x throughput on FP8 MFMA vs BF16 MFMA
-2. 2x memory bandwidth (half element size)
-
-Overhead:
-1. FP8 conversion (`v_cvt_pk_fp8_f32`)
-2. F32 softmax maintained (same as BF16)
-
-Net expected: 30-50% TF/s improvement
+1. Add softmax to QK kernel
+2. Add PV MFMA (complete attention)
+3. Optimize with buffer_load...lds for higher throughput
+4. Target: >1300 TF/s full attention (30% faster than BF16)

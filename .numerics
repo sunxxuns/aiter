@@ -1,58 +1,37 @@
-# FP8 Flash Attention - Numerics
+# FP8 FMHA Numerical Verification
 
-## Status: Phase 2 Complete ✅
+## QK MFMA (fwd_fp8_qk_pipe.s)
 
-### Single-Tile Tests (SEQ=32)
-All 7 rigorous tests passing:
+### Uniform Input Test
+- Q = K = 1.0 (FP8), seq=128 (4 K-tiles)
+- Expected: S = 4 * 128 = 512 (sum of dot products)
+- **Result: S = 512.0 ✓**
 
-| Test | Max Error | Status |
-|------|-----------|--------|
-| Transformer embeddings | 0.086 | ✅ |
-| Peaked attention | 0.004 | ✅ |
-| Position patterns | 0.005 | ✅ |
-| Numerical edge cases | 0.047 | ✅ |
-| Row/column confusion | 0.000 | ✅ |
-| Accumulation order | 0.000 | ✅ |
-| Specific patterns | 0.006 | ✅ |
+### Softmax Test (fwd_fp8_p136.s)
+- Q = K = 1.0 (FP8), seq=32
+- Expected: P = 1/32 = 0.03125 (uniform attention)
+- **Result: P = 0.03125 ✓**
+- Row sum: 1.0 ✓
 
-### FP8 Precision Characteristics
-- Expected max error: ~0.05-0.1 for normalized inputs
-- Higher error in peaked distributions due to quantization
-- Error comes from `v_cvt_pk_fp8_f32` conversion, not kernel logic
+### Random Input Test
+- P min >= 0 ✓
+- No NaN ✓
+- Row sum ≈ 1.0 ✓
 
-### Verified Behaviors
-1. **Row-wise softmax**: Confirmed via test_softmax_check.py
-2. **S^T = K @ Q^T**: Matches BF16 reference pattern
-3. **P transpose**: Correct reordering for PV MFMA
+## Pitch-136 Layout
 
----
+Verified zero bank conflicts:
+- 64 banks used (all)
+- Max 2 hits per bank (optimal)
 
-## Phase 3: K-tile Loop (In Progress)
+## MFMA Output Mapping
 
-### buffer_load Validation ✅
-Debug kernel verified:
-- `buffer_load_dword v, voff, s[8:11], soff offen` works
-- Scalar offset (soff) can be used for tile advancement
-- Buffer descriptor: s[8:9]=addr, s10=size, s11=0x20000
+For `v_mfma_f32_32x32x16_fp8_fp8`:
+- mfma_row = (lane & 3) + ((lane >> 3) & 3) * 4 + ((lane >> 2) & 1) * 16
+- k_half = 8 if lane >= 32 else 0
+- 16 F32 outputs per lane in v[0:15]
 
-### Required: `.args` Metadata
-Kernel must include `.args:` section in `.amdgpu_metadata`:
-```yaml
-.args:
-  - {.name: ptr_O, .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global}
-  - {.name: ptr_K, .size: 8, .offset: 8, .value_kind: global_buffer, .address_space: global}
-```
+## PV MFMA Status
 
-Without this, kernel launch causes memory fault at address (nil).
-
----
-
-## Test Commands
-
-```bash
-# Main test suite
-python test_rigorous.py
-
-# buffer_load debug
-python debug_bufload.py
-```
+- Not yet verified numerically
+- Working on P storage layout to match PV MFMA input requirements

@@ -1,0 +1,166 @@
+# DOMAIN MODEL ANALYSIS - FP8 Flash Attention ASM
+
+## CURRENT LAYOUT STRATEGY: PITCH-136
+
+### Summary
+- **Global Memory**: Row-major Q[32×128], K[32×128], V[32×128]
+- **LDS Layout**: Pitch-136 (row stride = 136 bytes instead of 128)
+- **Load Method**: `buffer_load_dwordx4 ... offen lds` (direct global→LDS)
+- **Read Method**: `ds_read_b64` (plain reads, no TR8/TR16)
+
+### Why Pitch-136?
+Bank conflict analysis for 64 threads, ds_read_b64 (8 bytes each):
+
+| Pitch | Banks Used | Max Hits/Bank | Status |
+|-------|------------|---------------|--------|
+| 128   | 8          | 16            | 16x conflict |
+| 132   | 64         | 3             | 3x conflict |
+| 136   | 64         | 2             | **OPTIMAL** |
+| 144   | 64         | 2             | OPTIMAL |
+
+Pitch-136 achieves zero bank conflicts with minimal padding (8 bytes/row).
+
+### Address Formulas
+
+**Global Load (row-major):**
+```
+global_offset = row * 128 + col_chunk * 16
+```
+
+**LDS Write (pitch-136):**
+```
+lds_offset = BASE + row * 136 + col_chunk * 16
+```
+
+**LDS Read for QK MFMA:**
+```
+mfma_row = (lane & 3) + ((lane >> 3) & 3) * 4 + ((lane >> 2) & 1) * 16
+k_half = 8 if lane >= 32 else 0
+
+Q_addr = Q_LDS + mfma_row * 136 + k_half + k_iter * 16
+K_addr = K_LDS + mfma_row * 136 + k_half + k_iter * 16
+```
+
+### Load Pattern (MUST use buffer_load...lds)
+```asm
+// Set up buffer descriptor
+s_mov_b32 s8, Q_ptr_lo
+s_mov_b32 s9, Q_ptr_hi  
+s_mov_b32 s10, -1              // size = max
+s_mov_b32 s11, 0x20000         // format
+
+// Set m0 for LDS destination
+s_mov_b32 m0, lds_base
+
+// Load 16 bytes per thread, m0 controls LDS dest
+buffer_load_dwordx4 v0, s[8:11], v_offset offen lds
+s_add_u32 m0, m0, stride       // advance LDS pointer
+```
+
+### Key Differences from BF16
+| Aspect | BF16 | FP8 Pitch-136 |
+|--------|------|---------------|
+| Element size | 2 bytes | 1 byte |
+| Pitch | Complex swizzle (0x408 wave stride) | Simple 136-byte pitch |
+| LDS base | 0x8200 | 0 (can use any base) |
+| Read type | ds_read_b64 (4 BF16) | ds_read_b64 (8 FP8) |
+| MFMA | 32x32x16 BF16 | 32x32x16 FP8 |
+
+### LDS Layout Diagram (Q example)
+```
+Offset    Row   Data
+0         0     Q[0, 0:127] + 8 padding
+136       1     Q[1, 0:127] + 8 padding
+272       2     Q[2, 0:127] + 8 padding
+...
+4216      31    Q[31, 0:127] + 8 padding
+4352      --    K starts here
+```
+
+## ARCHITECTURAL REQUIREMENTS
+
+### For 2+ PF/s Target:
+1. **K-loop**: Keep Q in LDS, stream K/V tiles
+2. **Online softmax**: Track running max/sum across K-tiles
+3. **PV MFMA**: Convert P→FP8, compute O+=P@V
+4. **Pipelining**: Overlap K/V loads with compute
+
+### Current Performance
+- QK-only kernel: 34 TF/s (5120 blocks)
+- Projected full attention: ~68 TF/s
+- BF16 baseline: 4100 TF/s
+- **Gap: 60x** (missing K-loop and pipelining)
+
+## FP8 MFMA REGISTER LAYOUT (from AMD Matrix Calculator)
+
+**For `v_mfma_f32_32x32x16_fp8_fp8`:**
+```
+A[row][k] mapping:
+  row (0-31) → lane % 32
+  k (0-3)    → v0 bytes [7:0], [15:8], [23:16], [31:24]
+  k (4-7)    → v1 bytes [7:0], [15:8], [23:16], [31:24]
+  k (8-15)   → same pattern but in lanes 32-63
+
+For lane L, the A matrix values in registers are:
+  A[L % 32][0] = v0{L}.[7:0]
+  A[L % 32][1] = v0{L}.[15:8]
+  A[L % 32][2] = v0{L}.[23:16]
+  A[L % 32][3] = v0{L}.[31:24]
+  A[L % 32][4] = v1{L}.[7:0]
+  A[L % 32][5] = v1{L}.[15:8]
+  A[L % 32][6] = v1{L}.[23:16]
+  A[L % 32][7] = v1{L}.[31:24]
+  (k=8-15 uses same layout but on lanes 32-63)
+```
+
+**Formula (from calculator):**
+```
+A[i][k].block GPR: (floor(k / 4) % 2).[8*(k % 4)+7 : 8*(k % 4)]
+A[i][k].block Lane: 32 * floor(k / 8) + i
+```
+
+**TR8 UNDERSTANDING:**
+- TR8 is a cooperative instruction that gathers data across LDS
+- It expects data stored in MFMA-compatible layout
+- The "8 identical values" behavior is correct - it's cross-lane gathering
+
+## TR8 EXPERIMENTAL FINDINGS (2025-01-14)
+
+**Tested Kernels:**
+1. `fwd_fp8_qk_v8swizzle.s` - TR8 with simple stride-16 offsets
+2. `fwd_fp8_qk_tr8scaled.s` - TR8 with BF16-style scaled offsets
+
+**BF16 TR16 offsets:** 0, 512, 64, 576, 2176, 2688, 2240, 2752, ...
+**TR8 scaled (TR16/2):** 0, 256, 32, 288, 1088, 1344, 1120, 1376, ...
+
+**Performance Results:**
+| Kernel | Time (µs) | Relative |
+|--------|-----------|----------|
+| v8swizzle (stride-16) | 4.18 | 1.00x |
+| tr8scaled (BF16-style) | 4.04 | 1.03x |
+
+**Observations:**
+- Both kernels run successfully on 256T (4 waves)
+- tr8scaled is ~3.4% faster (likely fewer bank conflicts)
+- Numerical outputs differ significantly - neither verified correct yet
+- v8swizzle shows repeated patterns (every 4 elements same)
+- tr8scaled shows unique values per element
+
+**Next Steps for Code Model:**
+1. Verify tr8scaled numerical correctness against PyTorch reference
+2. If correct, use as base for full flash attention
+3. If incorrect, debug LDS layout with isolated MFMA test
+
+**Recommendation:** Use tr8scaled as the starting point for Path 2.
+The BF16-style offsets appear to better match the MFMA-expected layout.
+
+## NEVER USE
+- `flat_load_*` - higher latency, no LDS direct path
+- `flat_store_*` - use `buffer_store_*` instead
+- TR8/TR16 without understanding MFMA-specific layout requirements
+- Row-major pitch-128 (severe bank conflicts)
+
+## FILES REFERENCE
+- Current kernel: `fwd_fp8_p136.s` (QK+softmax, no K-loop)
+- Working reference: `fwd_fp8_kloop.s` (64T, full attention)
+- BF16 reference: `fwd_hd128_bf16.s` (target pattern)

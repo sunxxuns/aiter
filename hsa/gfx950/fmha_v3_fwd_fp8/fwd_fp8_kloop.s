@@ -1,6 +1,15 @@
 // FP8 Flash Attention with K-tile Loop and Online Softmax
 // O[32×128] = softmax(Q @ K^T / sqrt(d)) @ V
 //
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+// WARNING: This is a NON-PERFORMANT reference implementation!
+// - Uses simple row-major LDS layout (NO swizzle)
+// - Uses ds_read_b64 (plain reads, NOT TR8)
+// - Has severe bank conflicts (~16x slowdown)
+// - Only useful for numerical correctness verification
+// - DO NOT use as performance reference
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+//
 // Online softmax algorithm:
 //   running_max = -inf, running_sum = 0, O = 0
 //   for each K-tile:
