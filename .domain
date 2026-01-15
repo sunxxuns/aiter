@@ -409,20 +409,37 @@ B=1, H=40, S=32130             1293.9       649.6        668.1        1.99x
 
 ### WHY TRITON FP8 IS 2x FASTER: Different MFMA Instruction!
 
-| | BF16 Reference | Our FP8 Kernel | Triton FP8 |
-|---|---|---|---|
-| **Instruction** | `v_mfma_f32_32x32x16_bf16` | `v_mfma_f32_32x32x16_fp8_fp8` | `v_mfma_f32_32x32x64_f8f6f4` |
-| **K per instruction** | 16 | 16 | **64 (4x!)** |
-| **FLOPs/MFMA** | 32K | 32K | **128K** |
-| **Operand A** | 4 VGPRs (16 bf16) | 2 VGPRs (16 fp8) | 8 VGPRs (64 fp8) |
-| **Operand B** | 4 VGPRs (16 bf16) | 2 VGPRs (16 fp8) | 8 VGPRs (64 fp8) |
+**From AMD CDNA4 ISA (amd-instinct-cdna4-instruction-set-architecture.txt):**
+
+Two FP8 MFMA instruction families exist on gfx950:
+
+**1. Legacy FP8: `V_MFMA_F32_{*}_FP8_FP8`** (what we use)
+| Size | K | Cycles | VGPRs |
+|------|---|--------|-------|
+| 32x32x16 | 16 | 32 | 1+1 |
+
+**2. Unified F8F6F4: `V_MFMA_F32_32x32x64_F8F6F4`** (what Triton uses)
+| Size | K | Cycles | VGPRs |
+|------|---|--------|-------|
+| 32x32x64 | 64 | 64 | 8+8 |
+
+**Format selection (CBSZ/BLGP bits):**
+- `3'b000` = E4M3 (FP8) ← what we need
+- `3'b001` = E5M2 (BF8)
+- `3'b010` = E2M3 (FP6)
+- `3'b100` = E2M1 (FP4)
+
+**Efficiency comparison:**
+| Instruction | FLOPs | Cycles | FLOPs/cycle |
+|-------------|-------|--------|-------------|
+| `32x32x16_fp8_fp8` | 32K | 32 | **1K** |
+| `32x32x64_f8f6f4` | 128K | 64 | **2K** |
+
+**The F8F6F4 instruction is 2x more efficient per cycle!**
 
 **ROOT CAUSE OF OUR SLOW PERFORMANCE:**
-We're using `v_mfma_f32_32x32x16_fp8_fp8` which does only K=16 per instruction.
-Triton uses `v_mfma_f32_32x32x64_f8f6f4` which does K=64 per instruction!
-
-The `_f8f6f4` suffix indicates this is a unified instruction for fp8/fp6/fp4 formats.
-This is the key optimization we're missing - need to switch to K=64 MFMA!
+We're using `v_mfma_f32_32x32x16_fp8_fp8` (K=16, 32 cycles, 1K FLOPs/cycle)
+Triton uses `v_mfma_f32_32x32x64_f8f6f4` (K=64, 64 cycles, 2K FLOPs/cycle)
 
 ### Triton FP8 Pattern (from /tmp/triton_fmha_fp8_gfx950.s)
 ```asm
