@@ -437,6 +437,16 @@ Two FP8 MFMA instruction families exist on gfx950:
 
 **The F8F6F4 instruction is 2x more efficient per cycle!**
 
+**OUTPUT PRECISION: IDENTICAL (F32)**
+Both instructions accumulate into F32 (32-bit float):
+| Instruction | Input (A, B) | Output (C, D) |
+|-------------|--------------|---------------|
+| `V_MFMA_F32_32x32x16_FP8_FP8` | FP8 | **F32** (16 VGPRs) |
+| `V_MFMA_F32_32x32x64_F8F6F4` | FP8 | **F32** (16 VGPRs) |
+
+The `F32` in instruction name = accumulator/output type. No precision loss when
+switching instructions - both do FP8×FP8→F32 multiply-accumulate.
+
 **ROOT CAUSE OF OUR SLOW PERFORMANCE:**
 We're using `v_mfma_f32_32x32x16_fp8_fp8` (K=16, 32 cycles, 1K FLOPs/cycle)
 Triton uses `v_mfma_f32_32x32x64_f8f6f4` (K=64, 64 cycles, 2K FLOPs/cycle)
