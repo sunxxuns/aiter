@@ -46,14 +46,14 @@ args = [
 args_ptrs = (ctypes.c_void_p * 3)(*[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args])
 
 # Launch with 256 threads
-hip.hipModuleLaunchKernel(func, 1, 1, 1, 256, 1, 1, 65536, None, args_ptrs, None)
+hip.hipModuleLaunchKernel(func, 1, 1, 1, 256, 1, 1, 16384, None, args_ptrs, None)
 hip.hipDeviceSynchronize()
 err = hip.hipGetLastError()
 
 print(f"Error: {err}")
-print(f"S mean: {S.mean().item():.2f} (expected 128 for uniform FP8)")
-print(f"S[0,:8]: {S[0,:8].tolist()}")
-print(f"S[32,:8]: {S[32,:8].tolist()}")
+print(f"P mean: {S.mean().item():.4f} (expected ~0.03125 = 1/32 for uniform)")
+print(f"P[0,:8]: {S[0,:8].tolist()}")
+print(f"P[32,:8]: {S[32,:8].tolist()}")
 print(f"NaN count: {torch.isnan(S).sum().item()}")
 print(f"Non-zero: {(S != 0).sum().item()} / {S.numel()}")
 
@@ -63,8 +63,16 @@ print(f"Unique values: {len(unique_vals)}")
 if len(unique_vals) <= 5:
     print(f"  Values: {unique_vals.tolist()}")
 
-# Test 2: Random input
-print("\n=== Test 2: Random input ===")
+# Test 2: Check row sums (should be ~1.0 for softmax)
+print("\n=== Test 2: Verify row sums ===")
+# For softmax, each row should sum to 1.0
+# But our output is per-lane (16 values), need to aggregate across lanes
+# For now, just check that values are in valid probability range [0, 1]
+valid_probs = ((S >= 0) & (S <= 1)).sum().item()
+print(f"Values in [0,1]: {valid_probs} / {S.numel()}")
+
+# Test 3: Random input
+print("\n=== Test 3: Random input ===")
 torch.manual_seed(42)
 Q = torch.randn(32, 128, device='cuda').to(torch.float8_e4m3fn)
 K = torch.randn(32, 128, device='cuda').to(torch.float8_e4m3fn)
@@ -77,19 +85,11 @@ args = [
 ]
 args_ptrs = (ctypes.c_void_p * 3)(*[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args])
 
-hip.hipModuleLaunchKernel(func, 1, 1, 1, 256, 1, 1, 65536, None, args_ptrs, None)
+hip.hipModuleLaunchKernel(func, 1, 1, 1, 256, 1, 1, 16384, None, args_ptrs, None)
 hip.hipDeviceSynchronize()
 
-print(f"S mean: {S.mean().item():.4f}")
-print(f"S range: [{S.min().item():.2f}, {S.max().item():.2f}]")
+print(f"P mean: {S.mean().item():.4f}")
+print(f"P range: [{S.min().item():.4f}, {S.max().item():.4f}]")
 print(f"NaN count: {torch.isnan(S).sum().item()}")
-
-# Reference computation
-Q_f32 = Q.to(torch.float32)
-K_f32 = K.to(torch.float32)
-S_ref = Q_f32 @ K_f32.T  # [32, 32]
-
-# The output S is stored per-lane (16 values per lane for 64 lanes)
-# Need to reshape to compare
-print(f"\nReference S[0,:8]: {S_ref[0,:8].tolist()}")
-print(f"Note: Output layout may differ from reference row-major")
+valid_probs = ((S >= 0) & (S <= 1)).sum().item()
+print(f"Values in [0,1]: {valid_probs} / {S.numel()}")
