@@ -1,25 +1,40 @@
 # DOMAIN MODEL ANALYSIS - FP8 Flash Attention ASM
 
-## CURRENT STATUS: 1617 TF/s ACHIEVED (1.64x BF16!)
+## CURRENT STATUS: NUMERICAL BUG IN 4QTILE_V2 (2025-01-15)
 
-### Best Kernel: `fwd_fp8_qk_4qtile_v2.s`
-- **Performance**: 1617 TF/s at H=40, SEQ=32768
-- **vs BF16**: 1.64x faster than BF16 full attention (987 TF/s)
-- **Layout**: pitch-136 (bank-conflict-free)
-- **Architecture**: 4 waves × 64 threads, each wave handles 1 Q-tile (32 rows)
+### CRITICAL: 1617 TF/s claim has numerical issues!
 
-### Major Breakthrough: Wave Redundancy Bug Fix
+**Verification Results** (with random input):
+```
+fwd_fp8_qk_preload:   394.6 TF/s - NUMERICALLY CORRECT ✓
+fwd_fp8_qk_4qtile_v2: 1584.9 TF/s - NUMERICALLY WRONG ✗
+```
+
+**4qtile_v2 Bug Evidence:**
+- All-ones input: [0,0]=512 (correct), but mean=3.23 (should be 512)
+- Contains impossible negative values (-60, -56, etc.) with all-ones input
+- Random input: kernel range [-2374, 1925] vs expected [-11, 11]
+- Only 128 occurrences per unique value (suggests output layout bug)
+
+**Root Cause (suspected):**
+- Output store addresses wrong for non-wave-0 threads
+- Or accumulator initialization bug
+- Or LDS addressing mismatch between waves
+
+### ACTUAL Best Kernel: `fwd_fp8_qk_preload.s`
+- **Performance**: 394.6 TF/s at H=40, SEQ=32128
+- **Numerics**: CORRECT (verified with random input)
+- **Layout**: pitch-136
+- **Architecture**: 1 Q-tile (32 rows) per block
+
+### Wave Redundancy Bug (HISTORICAL - DO NOT USE 4qtile_v2 UNTIL FIXED)
 **The Bug** (in fwd_fp8_qk_4qtile.s):
 - All 4 waves computed IDENTICAL MFMAs
 - v200 = tid % 64 made all waves use same addresses
-- 3 out of 4 waves wasted doing redundant work
 
-**The Fix** (in fwd_fp8_qk_4qtile_v2.s):
-- Wave 0 → Q-tile 0 (rows 0-31)
-- Wave 1 → Q-tile 1 (rows 32-63)
-- Wave 2 → Q-tile 2 (rows 64-95)
-- Wave 3 → Q-tile 3 (rows 96-127)
-- Result: **4x speedup** (405 → 1617 TF/s)
+**Attempted Fix** (in fwd_fp8_qk_4qtile_v2.s):
+- Wave N → Q-tile N (each wave different 32 rows)
+- Achieves 1584 TF/s but NUMERICAL OUTPUT IS WRONG
 
 ## CURRENT LAYOUT STRATEGY: PITCH-136
 
@@ -48,7 +63,15 @@ The conflicts occur because `136 = 2*64 + 8`. For MFMA reads:
 - Example conflict: Lane 0 (row 0, off 0) and Lane 47 (row 15, off 8)
   - Both map to bank 0: (0*136+0)/4%64 = 0, (15*136+8)/4%64 = 0
 
-2-way conflicts have minimal performance impact on modern GPUs.
+**Bank Conflict Impact (measured with rocprof):**
+- SQ_LDS_BANK_CONFLICT: 2048 cycles per kernel
+- At small scale (seq=64): ~42.7% of kernel time
+- At target scale (seq=32128): ~22.3% of kernel time
+
+**Zero-Conflict Solution Found:**
+- Formula: `(row * 144 + k_off) XOR (row * 4)`
+- Achieves 64/64 unique banks (verified)
+- Requires XOR swizzle in both write and read paths
 
 ### Address Formulas
 
