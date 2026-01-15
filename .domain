@@ -181,13 +181,135 @@ The BF16-style offsets appear to better match the MFMA-expected layout.
 2. Use seq_len=32130 with H=40 heads
 3. This gives ~10B FLOPs → 5ms target for 2 PF/s
 
+## TRITON AMD BACKEND ANALYSIS (2025-01-15)
+
+### Triton's FP8 Swizzle Approach for gfx950 (CDNA4)
+
+**Key Instruction:** `ds_read_tr8_b64` (not TR64)
+
+```cpp
+// From triton TargetInfo.cpp - For FP8 (8-bit):
+instBitWidth = 64;            // 64 bits = 8 FP8 elements per instruction
+tileSize = 8;                 // 8 elements must be contiguous in LDS
+numLanesInShuffleGroup = 16;  // 16 lanes cooperate (warpSize/4 = 64/4)
+```
+
+### Triton's Diagonal Padding Strategy
+
+Instead of simple pitch-based layout, triton uses **diagonal padding** for bank conflict avoidance:
+
+```cpp
+// From triton Utility.cpp - Row arrangement in LDS:
+//  r0,  r4, r8, r12, r16, r20, r24, r28
+// pad,  r1, r5,  r9, r13, r17, r21, r25
+// r29, pad, r2,  r6, r10, r14, r18, r22
+// r26, r30, pad, r3 ....
+```
+
+**Padding Parameters:**
+- Padding interval: `warpSize * vecSize = 64 * 8 = 512 bytes`
+- Each row group wraps diagonally to avoid bank conflicts
+- Works with `ds_read_b128` (16 bytes) or `ds_read_b64` (8 bytes)
+
+### Linear Layout for ds_read_tr8_b64
+
+For `mfma_f32_32x32x16_fp8_fp8` (kWidth=16, mDim=32):
+
+```cpp
+// Register ownership - what elements thread 0 holds:
+registerBase = {
+    {1, 0},   // bit 0 of register → row +1
+    {2, 0},   // bit 1 of register → row +2
+    {4, 0},   // bit 2 of register → row +4
+    {0, 16},  // bit 3 of register → col +16
+    {0, 64},  // bit 4 of register → col +64 (for k > 64)
+    {0, 128}  // bit 5 of register → col +128 (for k > 128)
+}
+
+// Lane dimension - what elements are in register 0 of each lane:
+laneBase = {
+    {0, 1},   // lane bit 0 → col +1
+    {0, 2},   // lane bit 1 → col +2
+    {0, 4},   // lane bit 2 → col +4
+    {0, 8},   // lane bit 3 → col +8
+    {8, 0},   // lane bit 4 → row +8
+    {0, 32}   // lane bit 5 → col +32
+}
+```
+
+### TR8 Transpose Operation
+
+`ds_read_tr8_b64` performs a cooperative transposed load:
+1. **Input:** 8×16 tile in LDS (8 rows × 16 columns of FP8)
+2. **Operation:** 16 consecutive lanes load 64 bits each
+3. **Output:** Transposed - lane i receives column i from input
+
+```
+Loaded tile (input):      After transpose (output):
+    K0  K1  ... K15           R0  R1  R2  R3
+M0[ ............... ]   =>  T0 [ .   .   .   . ]
+M1[ ............... ]       T1 [ .   .   .   . ]
+M2[ ............... ]       ...
+M7[ ............... ]       T15[ .   .   .   . ]
+```
+
+### Triton vs Our Approach
+
+| Aspect | Triton | Our Pitch-136 |
+|--------|--------|---------------|
+| **Write pattern** | Diagonal padding | Row + 8-byte pad |
+| **Read instruction** | `ds_read_tr8_b64` | `ds_read_b64` |
+| **Lane cooperation** | 16 lanes per tile | Independent |
+| **Bank conflicts** | Zero (diagonal) | Zero (pitch) |
+| **Complexity** | Higher (linear layout) | Simple (pitch formula) |
+
+### Key Triton Files for Reference
+
+```
+triton/third_party/amd/lib/TritonAMDGPUToLLVM/MemoryOpToLLVM.cpp
+  - lowerDsReadTr() - generates ds_read_tr8_b64 calls
+  - TransLocalLoadOpConversion - pattern matching
+
+triton/third_party/amd/lib/TritonAMDGPUTransforms/Utility.cpp
+  - composePaddedLayoutForAsyncCopyCDNA4() - diagonal padding logic
+
+triton/lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp
+  - chooseDotDsReadTrLayout() - compute layout for ds_read_tr
+```
+
+### Triton's FP8 MFMA Support
+
+```cpp
+// From MfmaGroup.cpp - FP8 MFMA variants:
+mfma_f32_32x32x16_fp8_fp8  // 32×32 output, k=16, uses 8 lanes
+mfma_f32_16x16x32_fp8_fp8  // 16×16 output, k=32, uses 8 lanes
+```
+
+### Implications for Code Model
+
+1. **Our pitch-136 is valid** - different but achieves same bank-conflict-free goal
+2. **TR8 requires matching write pattern** - can't use with arbitrary LDS layout
+3. **Triton's diagonal padding is complex** - not worth implementing unless needed
+4. **Current 1617 TF/s with 4-Q-tile is excellent** - already beats BF16
+
+### If Implementing Triton-Style TR8
+
+Would need to:
+1. Change LDS write to diagonal pattern (not row-major)
+2. Compute addresses using linear layout formulas
+3. Use `ds_read_tr8_b64` instead of `ds_read_b64`
+4. May not provide benefit over current approach
+
+**Recommendation:** Stick with pitch-136 + ds_read_b64 unless profiling shows bottleneck.
+
 ## NEVER USE
 - `flat_load_*` - higher latency, no LDS direct path
 - `flat_store_*` - use `buffer_store_*` instead
-- TR8/TR16 without understanding MFMA-specific layout requirements
+- TR8/TR16 without matching diagonal write pattern
 - Row-major pitch-128 (severe bank conflicts)
 
 ## FILES REFERENCE
-- Current kernel: `fwd_fp8_p136.s` (QK+softmax, no K-loop)
+- **Best kernel**: `fwd_fp8_qk_4qtile_v2.s` (1617 TF/s, correct)
 - Working reference: `fwd_fp8_kloop.s` (64T, full attention)
 - BF16 reference: `fwd_hd128_bf16.s` (target pattern)
+- Multi-block: `fwd_fp8_qk_multiblock.s` (388 TF/s at scale)
