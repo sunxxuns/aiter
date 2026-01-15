@@ -388,6 +388,62 @@ This approach:
 - Avoids TR8's complex diagonal requirements
 - Uses XOR-based swizzle for bank conflict avoidance
 
+### TRITON FP8 PERFORMANCE BENCHMARK (MI350 gfx950)
+
+Tested 2025-01-15:
+```
+Config                         FP8 TF/s     FP16 TF/s    BF16 TF/s    FP8/FP16  
+B=1, H=40, S=4096              1046.6       584.5        607.1        1.79x
+B=1, H=40, S=8192              1234.6       613.4        646.6        2.01x
+B=1, H=40, S=16384             1259.6       633.3        667.5        1.99x
+B=1, H=1, S=32130              765.1        480.4        481.0        1.59x
+B=1, H=40, S=32130             1293.9       649.6        668.1        1.99x
+```
+
+**CRITICAL INSIGHT:**
+- Triton FP8 achieves **1294 TF/s** at target shape (B=1, H=40, S=32130)
+- **2x speedup** over FP16/BF16 - FP8's theoretical 2x MFMA throughput is realizable!
+- Our BF16 ASM achieves 1016 TF/s for the same shape
+- **FP8 ASM TARGET: >1300 TF/s** (to match/beat Triton FP8)
+- Single-head case (H=1) is bandwidth-limited: only 765 TF/s
+
+### WHY TRITON FP8 IS 2x FASTER: Different MFMA Instruction!
+
+| | BF16 Reference | Our FP8 Kernel | Triton FP8 |
+|---|---|---|---|
+| **Instruction** | `v_mfma_f32_32x32x16_bf16` | `v_mfma_f32_32x32x16_fp8_fp8` | `v_mfma_f32_32x32x64_f8f6f4` |
+| **K per instruction** | 16 | 16 | **64 (4x!)** |
+| **FLOPs/MFMA** | 32K | 32K | **128K** |
+| **Operand A** | 4 VGPRs (16 bf16) | 2 VGPRs (16 fp8) | 8 VGPRs (64 fp8) |
+| **Operand B** | 4 VGPRs (16 bf16) | 2 VGPRs (16 fp8) | 8 VGPRs (64 fp8) |
+
+**ROOT CAUSE OF OUR SLOW PERFORMANCE:**
+We're using `v_mfma_f32_32x32x16_fp8_fp8` which does only K=16 per instruction.
+Triton uses `v_mfma_f32_32x32x64_f8f6f4` which does K=64 per instruction!
+
+The `_f8f6f4` suffix indicates this is a unified instruction for fp8/fp6/fp4 formats.
+This is the key optimization we're missing - need to switch to K=64 MFMA!
+
+### Triton FP8 Pattern (from /tmp/triton_fmha_fp8_gfx950.s)
+```asm
+; QK MFMA with ds_read_b128 for K operand:
+ds_read_b128 v[68:71], v145
+ds_read_b128 v[64:67], v72
+v_mfma_f32_32x32x64_f8f6f4 v[80:95], v[64:71], v[120:127], v[96:111]
+
+; P×V MFMA with ds_read_b64_tr_b8 for V operand (transposed!):
+ds_read_b64_tr_b8 v[72:73], v144
+ds_read_b64_tr_b8 v[74:75], v144 offset:1088
+ds_read_b64_tr_b8 v[76:77], v144 offset:4096
+ds_read_b64_tr_b8 v[78:79], v144 offset:5184
+v_mfma_f32_32x32x64_f8f6f4 v[48:63], v[72:79], v[64:71], v[48:63]
+```
+
+**ACTION REQUIRED:**
+1. Switch from `v_mfma_f32_32x32x16_fp8_fp8` to `v_mfma_f32_32x32x64_f8f6f4`
+2. Use `ds_read_b64_tr_b8` for transposed operands (like V in P×V)
+3. Use `ds_read_b128` for non-transposed operands (like K in QK)
+
 ### Key Triton Files for Reference
 
 ```
