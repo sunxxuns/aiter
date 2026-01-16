@@ -1,10 +1,17 @@
 # DOMAIN MODEL ANALYSIS - FP8 Flash Attention ASM
 
-## REAL BENCHMARK RESULTS (2025-01-16)
+## VERIFIED BENCHMARK RESULTS (2025-01-16)
 
-### Verified Multi-Block Performance
+### Triton FP8 Flash Attention (bench_triton_direct.py)
 
-**Using bench_v11.py with grid=(252, 1, 1) for S=32130:**
+| Config | FP8 TF/s | FP16 TF/s | BF16 TF/s | FP8/FP16 |
+|--------|----------|-----------|-----------|----------|
+| B=1, H=40, S=4096 | 1049 | 593 | 610 | 1.77x |
+| B=1, H=40, S=8192 | 1228 | 614 | 634 | 2.00x |
+| B=1, H=40, S=16384 | 1258 | 633 | 669 | 1.99x |
+| **B=1, H=40, S=32130** | **1289** | 649 | 669 | **1.99x** |
+
+### Our FP8 QK-only Kernel (bench_v11.py)
 
 | Config | Time (ms) | TF/s |
 |--------|-----------|------|
@@ -13,13 +20,16 @@
 
 ### Performance Gap Analysis
 
-| Kernel | TF/s | Status |
-|--------|------|--------|
-| **Our FP8 QK-only** | **386** | Current (verified) |
-| BF16 full attention | ~1000 | Reference |
-| Triton FP8 full attention | ~1300 | Target |
+| Kernel | TF/s | vs Triton FP8 |
+|--------|------|---------------|
+| **Our FP8 QK-only** | **386** | 30% |
+| Triton FP8 full attention | **1289** | 100% (target) |
+| Triton FP16/BF16 | ~660 | 51% |
 
-**Gap: 3.4x improvement needed (386 → 1300 TF/s)**
+**Gap: 3.3x improvement needed (386 → 1289 TF/s)**
+
+**Key insight**: Triton FP8 achieves exactly 2x speedup over FP16/BF16,
+matching the K=64 MFMA efficiency gain predicted by ISA analysis.
 
 ### Root Causes of Slow Performance
 
