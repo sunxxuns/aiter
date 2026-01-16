@@ -1,14 +1,44 @@
 # DOMAIN MODEL ANALYSIS - FP8 Flash Attention ASM
 
-## CRITICAL: BENCHMARKING BUG (2025-01-16)
+## REAL BENCHMARK RESULTS (2025-01-16)
 
-### Single-Block Benchmark = INVALID Results!
+### Verified Multi-Block Performance
 
-**THE BUG**: Previous benchmarks launched only 1 block instead of all blocks.
-- Claimed 1617 TF/s is **INVALID** - based on single block timing
-- Single block doesn't represent real workload or memory pressure
+**Using bench_v11.py with grid=(252, 1, 1) for S=32130:**
 
-**CORRECT GRID SIZE for Flash Attention:**
+| Config | Time (ms) | TF/s |
+|--------|-----------|------|
+| Single head, S=32130 | 0.702 | **376** |
+| H=40 heads, S=32130 | 27.39 | **386** |
+
+### Performance Gap Analysis
+
+| Kernel | TF/s | Status |
+|--------|------|--------|
+| **Our FP8 QK-only** | **386** | Current (verified) |
+| BF16 full attention | ~1000 | Reference |
+| Triton FP8 full attention | ~1300 | Target |
+
+**Gap: 3.4x improvement needed (386 → 1300 TF/s)**
+
+### Root Causes of Slow Performance
+
+1. **Using K=16 MFMA instead of K=64** (2x efficiency loss)
+   - Our: `v_mfma_f32_32x32x16_fp8_fp8` → 1K FLOPs/cycle
+   - Triton: `v_mfma_f32_32x32x64_f8f6f4` → 2K FLOPs/cycle
+
+2. **No K-loop** - only processing 1 K-tile per block
+
+3. **Potential bank conflicts** - pitch-136 has 2-way conflicts
+
+4. **No pipelining** - not overlapping memory with compute
+
+---
+
+## CORRECT GRID SIZE (CRITICAL)
+
+**MUST use full grid, not single block!**
+
 ```python
 # For shape (B, H, S, D) with Q_rows_per_block rows per block:
 grid_x = math.ceil(S / Q_rows_per_block)  # Q-tile blocks
@@ -28,13 +58,12 @@ flops = 4 * B * H * S * S * D
 flops_qk = 2 * B * H * S * S * D
 ```
 
-**ANY benchmark with single block is WRONG and must be re-run!**
-
 ---
 
-## CURRENT STATUS: NUMERICAL BUG IN 4QTILE_V2 (2025-01-15)
+## HISTORICAL: Invalid 1617 TF/s Claim
 
-### CRITICAL: 1617 TF/s claim has numerical issues AND wrong grid!
+The previous "1617 TF/s" was from single-block benchmark (grid=1,1,1).
+This is **INVALID** and does not represent real performance.
 
 **Verification Results** (with random input):
 ```
