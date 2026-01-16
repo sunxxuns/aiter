@@ -38,21 +38,26 @@ Each wave computes a different Q-tile:
 
 Result: **4x speedup** (405 → 1617 TF/s)
 
-## PERFORMANCE COMPARISON
+## PERFORMANCE COMPARISON (CORRECTED)
 | Kernel | TF/s | Notes |
 |--------|------|-------|
-| **fwd_fp8_qk_4qtile_v2** | **1617** | **BEST - fixed wave usage** |
-| BF16 full attention | 987 | Reference target |
-| fwd_fp8_qk_4qtile (buggy) | 405 | 4 waves redundant |
-| fwd_fp8_qk_preload | ~400 | 1 Q-tile per block |
-| fwd_fp8_qk_8wave | ~427 | 8 waves, large SEQ |
+| fwd_fp8_qk_4qtile_v11 | **386** | Multi-block verified |
+| BF16 full attention | ~1000 | Reference |
+| Triton FP8 full attention | ~1300 | Target |
 
-## KEY RESULT: **INVALID - NEEDS RE-BENCHMARK**
+**Previous claims of 1617 TF/s were INVALID (single-block benchmark)**
 
-~~FP8 QK at 1617 TF/s is 1.64x BF16's 987 TF/s~~ **WRONG!**
+## KEY RESULT: FP8 QK at 386 TF/s (multi-block verified)
 
-The 1617 TF/s was measured with single-block launch (grid=1,1,1).
-Real performance is unknown until proper grid benchmark is run.
+**Real performance**: 386 TF/s with proper multi-block grid
+**Target**: 1300+ TF/s (Triton FP8 full attention)
+**Gap**: 3.4x improvement needed
+
+**Root causes of slow performance:**
+1. Using K=16 MFMA instead of K=64 MFMA (2x loss)
+2. No k-loop (only 1 K-tile per block)
+3. Potential bank conflicts
+4. No pipelining
 
 ## ARCHITECTURE DETAILS
 
@@ -76,17 +81,23 @@ Real performance is unknown until proper grid benchmark is run.
 - K_LDS_B: 21760
 - Total: 28672 bytes
 
-## BENCHMARK RESULTS (H=40, d=128) - **INVALID: SINGLE BLOCK!**
-| SEQ | Time (us) | TF/s | Status |
-|-----|-----------|------|--------|
-| 2048 | 43.5 | 988 | **INVALID** |
-| 4096 | 131.7 | 1304 | **INVALID** |
-| 8192 | 499.1 | 1377 | **INVALID** |
-| 16384 | 1702.8 | 1614 | **INVALID** |
-| 32768 | 6799.3 | 1617 | **INVALID** |
+## BENCHMARK RESULTS (CORRECT MULTI-BLOCK - 2025-01-16)
 
-**These benchmarks used grid=(1,1,1) instead of proper grid size!**
-Must re-run with: `grid = (ceil(S/128), B*H, 1)`
+**Using bench_v11.py with grid=(252, 1, 1) for S=32130:**
+
+| Config | Time (ms) | TF/s | Notes |
+|--------|-----------|------|-------|
+| Single head, S=32130 | 0.702 | **376.3** | 252 blocks |
+| H=40 heads, S=32130 | 27.39 | **385.9** | Sequential launches |
+
+**Comparison:**
+| Kernel | TF/s | Status |
+|--------|------|--------|
+| Our FP8 QK-only | 386 | Multi-block verified |
+| BF16 full attention | ~1000 | Reference |
+| Triton FP8 full attention | ~1300 | Target |
+
+**Gap analysis**: We're at 386 TF/s, need 1300+ TF/s (3.4x improvement needed)
 
 ## NEXT STEPS
 
