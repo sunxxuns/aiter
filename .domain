@@ -1,8 +1,40 @@
 # DOMAIN MODEL ANALYSIS - FP8 Flash Attention ASM
 
+## CRITICAL: BENCHMARKING BUG (2025-01-16)
+
+### Single-Block Benchmark = INVALID Results!
+
+**THE BUG**: Previous benchmarks launched only 1 block instead of all blocks.
+- Claimed 1617 TF/s is **INVALID** - based on single block timing
+- Single block doesn't represent real workload or memory pressure
+
+**CORRECT GRID SIZE for Flash Attention:**
+```python
+# For shape (B, H, S, D) with Q_rows_per_block rows per block:
+grid_x = math.ceil(S / Q_rows_per_block)  # Q-tile blocks
+grid_y = B * H                             # batch × heads
+grid_z = 1
+
+# Example: B=1, H=40, S=32130, Q_rows=128 (256T kernel)
+# grid = (252, 40, 1) = 10,080 blocks total
+```
+
+**FLOPs Calculation:**
+```python
+# Full attention: QK + softmax + PV
+flops = 4 * B * H * S * S * D
+
+# QK-only stage
+flops_qk = 2 * B * H * S * S * D
+```
+
+**ANY benchmark with single block is WRONG and must be re-run!**
+
+---
+
 ## CURRENT STATUS: NUMERICAL BUG IN 4QTILE_V2 (2025-01-15)
 
-### CRITICAL: 1617 TF/s claim has numerical issues!
+### CRITICAL: 1617 TF/s claim has numerical issues AND wrong grid!
 
 **Verification Results** (with random input):
 ```

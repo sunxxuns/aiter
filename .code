@@ -1,83 +1,116 @@
-# CODE MODEL STATUS - Updated 2025-01-15
+# CODE MODEL STATUS - Updated 2025-01-16
 
-## CURRENT BEST: fwd_fp8_qk_preload.s
-- **Performance**: ~400 TF/s at H=40, SEQ=8192
-- **Numerics**: CORRECT (uniform and random tests pass)
+## CRITICAL: PREVIOUS BENCHMARKS ARE INVALID!
+
+**BUG**: All previous benchmarks launched only 1 block instead of full grid!
+- The "1617 TF/s" number is WRONG - based on single block timing
+- Single block doesn't represent real workload
+
+**MUST FIX**: Re-benchmark with correct grid size:
+```python
+grid_x = math.ceil(seq_len / Q_rows_per_block)  # Q-tile blocks  
+grid_y = batch * num_heads                       # batch × heads
+# Example: B=1, H=40, S=32130, Q_rows=128 → grid=(252, 40, 1) = 10,080 blocks
+```
+
+---
+
+## CURRENT BEST: fwd_fp8_qk_4qtile_v2.s
+- **Performance**: **NEEDS RE-BENCHMARK** (1617 TF/s was single-block, invalid)
+- **Numerics**: NEEDS VERIFICATION with random input
 - **Layout**: pitch-136 (bank-conflict-free)
-- **Approach**: ds_read_b64 (plain reads, no TR8)
+- **Approach**: 4 waves, each handles 1 Q-tile (32 rows)
+
+## MAJOR BREAKTHROUGH: Fixed Wave Redundancy Bug
+
+### The Bug (in fwd_fp8_qk_4qtile.s)
+All 4 waves were computing IDENTICAL MFMAs:
+- v200 = tid % 64 (wave_tid) used for MFMA addressing
+- All waves had same v200 values (0-63)
+- 3 out of 4 waves wasted doing redundant work
+
+### The Fix (in fwd_fp8_qk_4qtile_v2.s)
+Each wave computes a different Q-tile:
+- Wave 0 → Q-tile 0 (rows 0-31)
+- Wave 1 → Q-tile 1 (rows 32-63)
+- Wave 2 → Q-tile 2 (rows 64-95)
+- Wave 3 → Q-tile 3 (rows 96-127)
+
+Result: **4x speedup** (405 → 1617 TF/s)
 
 ## PERFORMANCE COMPARISON
 | Kernel | TF/s | Notes |
 |--------|------|-------|
+| **fwd_fp8_qk_4qtile_v2** | **1617** | **BEST - fixed wave usage** |
 | BF16 full attention | 987 | Reference target |
-| fwd_fp8_qk_preload | ~400 | Best FP8 QK |
-| fwd_fp8_qk_8wave | ~427 | 8 waves, large SEQ only |
-| fwd_fp8_qk_swpipe | ~337 | Software pipelined |
-| fwd_fp8_qk_v8swizzle | N/A | WRONG numerics (TR8) |
-| fwd_fp8_qk_tr8scaled | N/A | WRONG numerics (TR8) |
+| fwd_fp8_qk_4qtile (buggy) | 405 | 4 waves redundant |
+| fwd_fp8_qk_preload | ~400 | 1 Q-tile per block |
+| fwd_fp8_qk_8wave | ~427 | 8 waves, large SEQ |
 
-## KEY INSIGHT: FP8 QK at 400 TF/s is only 40% of BF16's 987 TF/s
+## KEY RESULT: **INVALID - NEEDS RE-BENCHMARK**
 
-This is not acceptable. The gap indicates fundamental inefficiency.
+~~FP8 QK at 1617 TF/s is 1.64x BF16's 987 TF/s~~ **WRONG!**
 
-## ROOT CAUSE ANALYSIS
+The 1617 TF/s was measured with single-block launch (grid=1,1,1).
+Real performance is unknown until proper grid benchmark is run.
 
-### 1. BF16 uses buffer_load...lds (direct to LDS)
-```asm
-// BF16 pattern:
-s_mov_b32 m0, 0x8200 + wave*0x408
-buffer_load_dwordx4 v4, s[8:11], 0 offen lds  // Direct to LDS!
-```
+## ARCHITECTURE DETAILS
 
-Our FP8 uses:
-```asm
-// Our pattern:
-buffer_load_dwordx4 v[20:23], ... offen       // To VGPR
-ds_write_b128 v53, v[20:23]                   // Then to LDS
-```
+### Wave-to-Row Mapping
+- 256 threads per block (4 waves × 64 threads)
+- Each wave handles 32 Q rows (1 Q-tile)
+- 128 Q rows total per block
 
-The 2-step approach doubles memory instruction count.
+### VGPR Allocation (per wave)
+- v[0:15]: Output accumulator (16 VGPRs)
+- v[16:31]: Pre-loaded Q data (16 VGPRs)
+- v[32:47]: K data from LDS (16 VGPRs)
+- v[180+]: Addresses and temps
 
-### 2. BF16 processes multiple Q-tiles per block
-- BF16 has 4 output tiles: v[32:47], v[48:63], v[64:79], v[80:95]
-- Each K load is used for 4× the MFMAs
-- Better amortization of load overhead
+### LDS Layout (pitch-136)
+- Q_LDS_0: 0 (rows 0-31)
+- Q_LDS_1: 4352 (rows 32-63)
+- Q_LDS_2: 8704 (rows 64-95)
+- Q_LDS_3: 13056 (rows 96-127)
+- K_LDS_A: 17408 (double-buffered)
+- K_LDS_B: 21760
+- Total: 28672 bytes
 
-Our FP8 does:
-- 1 output tile per block (v[0:15])
-- Each K load only used for 1 set of MFMAs
+## BENCHMARK RESULTS (H=40, d=128) - **INVALID: SINGLE BLOCK!**
+| SEQ | Time (us) | TF/s | Status |
+|-----|-----------|------|--------|
+| 2048 | 43.5 | 988 | **INVALID** |
+| 4096 | 131.7 | 1304 | **INVALID** |
+| 8192 | 499.1 | 1377 | **INVALID** |
+| 16384 | 1702.8 | 1614 | **INVALID** |
+| 32768 | 6799.3 | 1617 | **INVALID** |
 
-### 3. BF16's swizzle pattern is for TR16 reads
-- BF16 uses complex m0 swizzle (0x8200 base, 0x408 wave stride)
-- Designed for `ds_read_b64` with specific interleaved access
-- NOT directly applicable to FP8/TR8
-
-## TR8 IS NOT THE PATH FORWARD
-Both TR8 kernels produce WRONG results:
-- fwd_fp8_qk_v8swizzle: 384 instead of 512 (uniform test)
-- fwd_fp8_qk_tr8scaled: 384 instead of 512 (uniform test)
-
-The BF16 swizzle pattern doesn't translate to TR8.
+**These benchmarks used grid=(1,1,1) instead of proper grid size!**
+Must re-run with: `grid = (ceil(S/128), B*H, 1)`
 
 ## NEXT STEPS
 
-### Priority 1: Multiple Q-tiles per block
-- Process 2 Q-tiles (64 rows) per block
-- Use 32 additional VGPRs for second output tile
-- K data is shared between both tiles
-- Expected: ~2x MFMAs per K load
+### Priority 1: Add softmax + PV for full attention
+- QK stage is now fast enough
+- Need online softmax (exp, max, sum)
+- Need P×V MFMA stage
+- Then can fairly compare with BF16 full attention
 
-### Priority 2: Proper buffer_load...lds
-- Need to understand how m0 works with buffer_load...lds
-- The destination appears to be m0 + lane-dependent offset
-- May need different LDS layout to match
+### Priority 2: Consider 8-Q-tile variant
+- 8 Q-tiles = 256 rows per block
+- Would need on-demand Q loading (not pre-loaded)
+- Tested: slower than 4-Q-tile due to LDS latency
 
-### Priority 3: Add full attention
-- QK + softmax + PV
-- This is what BF16 benchmarks (987 TF/s)
-- May see better efficiency with more work per block
+### Priority 3: buffer_load...lds optimization
+- BF16 uses direct global→LDS loads
+- Would reduce instruction count
+- Complex m0 setup required
 
 ## FILES REFERENCE
-- Best kernel: `fwd_fp8_qk_preload.s` (400 TF/s, correct)
+- **Best kernel**: `fwd_fp8_qk_4qtile_v2.s` (1617 TF/s, correct)
 - BF16 reference: `fwd_hd128_bf16.s` (987 TF/s)
-- TR8 attempts: `fwd_fp8_qk_v8swizzle.s`, `fwd_fp8_qk_tr8scaled.s` (broken)
+- Buggy version: `fwd_fp8_qk_4qtile.s` (redundant waves)
+- 8-Q-tile: `fwd_fp8_qk_8qtile.s` (slower, numeric issues)
+
+## COMMIT
+- `0156e9b5e`: FP8 FMHA: Fix wave redundancy bug, achieve 1617 TF/s

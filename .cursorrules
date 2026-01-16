@@ -24,6 +24,42 @@ read past lessnons recorded in .lessons
   - `cd 3rdparty/composable_kernel/example/ck_tile/01_fmha && python3 generate.py --targets gfx950 --api fwd --receipt 100 --optdim 128 --filter "*fp8*" --output_dir /tmp/ck_fmha_gen`
   - then compile with `hipcc --offload-arch=gfx950 --save-temps` to dump the device `.s`.
 
+###CRITICAL: Performance Bug Found (2025-01-16)###
+
+**rocprofv3 shows: SQ_LDS_BANK_CONFLICT = 1920 cycles per block!**
+
+**Single block analysis:**
+- Duration: 5.8 µs (5800 ns)
+- LDS bank conflicts: 1920 cycles
+- At 2.2 GHz: 1920 / 2.2e9 = 873 ns spent on bank conflicts
+- **15% of kernel time is LDS bank conflicts alone!**
+
+**ROOT CAUSES (ordered by impact):**
+
+1. **Our kernel only does 1 K-tile, not full attention**
+   - We process: 4 Q-tiles × 1 K-tile = 1 MFMA set per block
+   - Full attention: 4 Q-tiles × 1005 K-tiles × 2 (QK+PV) per head
+   - We're measuring 1/2000th of full attention work!
+   
+2. **LDS bank conflicts (stride-128 = 16-way conflicts)**
+   - rocprof shows 1920 conflict cycles per block
+   - Need pitch-136 or XOR swizzle for bank-conflict-free
+
+3. **Using K=16 MFMA instead of K=64 MFMA**
+   - v_mfma_f32_32x32x16_fp8_fp8: 1K FLOPs/cycle
+   - v_mfma_f32_32x32x64_f8f6f4: 2K FLOPs/cycle (2x more efficient!)
+
+4. **Not pipelining memory with compute**
+   - BF16 uses buffer_load...lds (direct global→LDS)
+   - We use buffer_load → VGPR → ds_write
+
+**To match Triton's 1294 TF/s we need:**
+1. Loop over all K tiles (not just 1)
+2. Add softmax computation
+3. Add P×V multiplication
+4. Fix LDS bank conflicts (pitch or swizzle)
+5. Consider switching to K=64 MFMA
+
 ###CRITICAL: Python Debug Buffer Bug - WASTED HOURS OF DEBUGGING!###
 When reading uint32 values from a float32 debug buffer in Python:
 
@@ -50,6 +86,33 @@ to benchmark tf/s use python /sgl-workspace/sglang/benchmark/kernels/bench_mi350
 this is the shape we are aiming for
 this is how we bench bf16 flash attn kernel around 1000TF/s, fp8 should at least have 30% more
 divide the diffcult task into small tasks and make the numeric right
+
+###CRITICAL: BENCHMARKING GRID SIZE###
+**ALWAYS launch ALL blocks, not just 1 block!**
+
+For flash attention with shape (batch=B, heads=H, seq_len=S, head_dim=D):
+```
+Q_rows_per_block = 128  # for 256T kernel (4 Q-tiles × 32 rows)
+grid_x = ceil(S / Q_rows_per_block)  # number of Q-tile blocks
+grid_y = B * H                        # one per batch×head
+grid_z = 1
+
+# Example: B=1, H=40, S=32130, Q_rows=128
+# grid = (252, 40, 1) = 10,080 blocks total
+```
+
+**Single-block benchmarks are INVALID** - they don't reflect:
+- Full memory bandwidth pressure
+- Real occupancy and scheduling
+- Proper FLOPs calculation
+
+FLOPs formula for flash attention:
+```
+flops = 4 * B * H * S * S * D  # QK + softmax + PV
+# For QK-only: flops = 2 * B * H * S * S * D
+```
+
+Any benchmark showing >1000 TF/s with single block launch is WRONG.
 ### hill climbing strategy ###
 -refer to .milestone to understand roadmap and the current phase
 -adding/revising .s file to implement
