@@ -31,6 +31,137 @@
 **Key insight**: Triton FP8 achieves exactly 2x speedup over FP16/BF16,
 matching the K=64 MFMA efficiency gain predicted by ISA analysis.
 
+---
+
+## TRITON FP8 ASSEMBLY ANALYSIS (triton_fp8_fmha.s)
+
+### Kernel Configuration
+- **Threads**: 256 (4 warps)
+- **BLOCK_M**: 128 (Q rows per block)
+- **BLOCK_N**: 64 (K/V cols per iteration)
+- **HEAD_DIM**: 128
+- **VGPRs**: 168
+- **SGPRs**: 58
+- **LDS**: ~24KB (Q:16KB + K/V:8KB)
+
+### Main Loop Structure (LBB0_5, lines 316-726)
+
+```
+for k_offset = 0 to N_CTX step 64:
+    1. Load K[k_offset:k_offset+64] → LDS
+    2. QK MFMA (4x v_mfma_f32_32x32x64_f8f6f4)
+    3. Online Softmax (max, exp, sum)
+    4. Load V[k_offset:k_offset+64] → LDS  
+    5. PV MFMA (4x v_mfma_f32_32x32x64_f8f6f4)
+```
+
+### Stage 1: K Load (lines 320-345)
+```asm
+global_load_dwordx4 v[66:69], v[66:67], off  ; 16 bytes/thread
+global_load_dwordx4 v[70:73], v[70:71], off  ; 16 bytes/thread
+; ... barrier ...
+ds_write_b128 v142, v[66:69]                 ; Write to LDS
+ds_write_b128 v142, v[70:73] offset:4096     ; 4KB apart
+```
+
+### Stage 2: QK MFMA (lines 346-373)
+```asm
+; Read Q from LDS (pre-loaded at kernel start)
+ds_read_b128 v[70:73], v146                  ; Q tile 0
+ds_read_b128 v[66:69], v74                   ; Q tile 1
+ds_read_b128 v[160:163], v74 offset:4096     ; Q tile 2
+ds_read_b128 v[164:167], v146 offset:4096    ; Q tile 3
+
+; 4x K=64 MFMA for QK
+v_mfma_f32_32x32x64_f8f6f4 v[82:97], v[66:73], v[122:129], v[98:113]
+v_mfma_f32_32x32x64_f8f6f4 v[66:81], v[160:167], v[122:129], v[98:113]
+; ... 2 more after loading K tiles ...
+v_mfma_f32_32x32x64_f8f6f4 v[82:97], v[98:105], v[114:121], v[82:97]
+v_mfma_f32_32x32x64_f8f6f4 v[66:81], v[106:113], v[114:121], v[66:81]
+```
+
+### Stage 3: Online Softmax (lines 378-600)
+```asm
+; Row-wise max (using v_max3_f32 for efficiency!)
+v_max_f32_e32 v106, v83, v83
+v_max3_f32 v106, v106, v84, v85              ; Compare 3 at once
+v_max3_f32 v106, v106, v86, v87
+; ... continues for all 32 elements ...
+
+; Cross-lane reduction
+v_permlane32_swap_b32_e32 v106, v107         ; Swap between lane groups
+v_max_f32_e32 v106, v106, v107
+
+; Compute qk * scale - max
+v_fma_f32 v82, v143, v82, -v157              ; v143 = qk_scale
+
+; Exponential
+v_exp_f32_e32 v82, v82
+
+; Sum for normalization (interleaved with exp)
+v_add_f32_e32 v106, v82, v83
+v_add_f32_e32 v106, v84, v106
+```
+
+### Stage 4: PV MFMA (lines 679-724)
+```asm
+; Load V using TRANSPOSED reads (ds_read_b64_tr_b8)!
+ds_read_b64_tr_b8 v[74:75], v145
+ds_read_b64_tr_b8 v[76:77], v145 offset:1088
+ds_read_b64_tr_b8 v[78:79], v145 offset:4096
+ds_read_b64_tr_b8 v[80:81], v145 offset:5184
+
+; P conversion for FP8 (v_cndmask for packing)
+v_cndmask_b32_e32 v68, v69, v82, vcc
+
+; 4x K=64 MFMA for PV (output to different accumulator tiles)
+v_mfma_f32_32x32x64_f8f6f4 v[50:65], v[74:81], v[66:73], v[50:65]
+v_mfma_f32_32x32x64_f8f6f4 v[34:49], v[74:81], v[66:73], v[34:49]
+v_mfma_f32_32x32x64_f8f6f4 v[18:33], v[74:81], v[66:73], v[18:33]
+v_mfma_f32_32x32x64_f8f6f4 v[2:17], v[74:81], v[66:73], v[2:17]
+```
+
+### Loop Control (lines 691, 705, 726)
+```asm
+s_add_i32 s8, s8, 64           ; k_offset += 64
+s_cmp_gt_i32 s19, s8           ; if (N_CTX > k_offset)
+s_cbranch_scc1 .LBB0_5         ; continue loop
+```
+
+### Key Optimizations in Triton
+
+| Optimization | Triton | Our Kernel |
+|--------------|--------|------------|
+| **MFMA K dim** | K=64 (2K FLOPs/cycle) | K=16 (1K FLOPs/cycle) |
+| **LDS read** | `ds_read_b128` (128-bit) | `ds_read_b64` (64-bit) |
+| **V read** | `ds_read_b64_tr_b8` (transposed) | N/A |
+| **Max reduce** | `v_max3_f32` (3-way) | `v_max_f32` (2-way) |
+| **Cross-lane** | `v_permlane32_swap_b32` | None |
+| **Full attention** | QK + softmax + PV | QK only |
+
+### LDS Layout
+```
+Offset 0:     Q tiles (16KB, loaded once at start)
+Offset 0:     K tile A (4KB, alternating)
+Offset 4096:  K tile B (4KB, alternating)
+              V uses same space as K after QK done
+```
+
+### VGPR Allocation
+```
+v[2:17]:   Output accumulator (tile 0)
+v[18:33]:  Output accumulator (tile 1)
+v[34:49]:  Output accumulator (tile 2)
+v[50:65]:  Output accumulator (tile 3)
+v[66:81]:  QK result / P values
+v[82:97]:  QK result (second tile)
+v[98:121]: Q data from LDS
+v[122:129]: K data from LDS
+v[139]:    l_i (sum accumulator)
+v[143]:    qk_scale constant
+v[157]:    m_i (max accumulator)
+```
+
 ### Root Causes of Slow Performance
 
 1. **Using K=16 MFMA instead of K=64** (2x efficiency loss)
