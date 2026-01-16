@@ -1,127 +1,184 @@
 # CODE MODEL STATUS - Updated 2025-01-16
 
-## CRITICAL: PREVIOUS BENCHMARKS ARE INVALID!
+## CURRENT APPROACH: Adapt Triton's FP8 Flash Attention Assembly
 
-**BUG**: All previous benchmarks launched only 1 block instead of full grid!
-- The "1617 TF/s" number is WRONG - based on single block timing
-- Single block doesn't represent real workload
+### Decision
+Start from Triton's working 1298 TF/s kernel and clean it up for our use.
 
-**MUST FIX**: Re-benchmark with correct grid size:
-```python
-grid_x = math.ceil(seq_len / Q_rows_per_block)  # Q-tile blocks  
-grid_y = batch * num_heads                       # batch × heads
-# Example: B=1, H=40, S=32130, Q_rows=128 → grid=(252, 40, 1) = 10,080 blocks
+### Source File
+- **Input**: `triton_fp8_fmha.s` (2073 lines, dumped from Triton cache)
+- **Output**: `fwd_fp8_triton_based.s` (cleaned up, standalone kernel)
+
+---
+
+## TRITON FP8 ANALYSIS (1298 TF/s at B=1, H=40, S=32130)
+
+### Key Differences from Our Kernel
+
+| Aspect | Triton (1298 TF/s) | Our v2 (386 TF/s) |
+|--------|-------------------|-------------------|
+| **MFMA** | `v_mfma_f32_32x32x64_f8f6f4` (K=64) | `v_mfma_f32_32x32x16_fp8_fp8` (K=16) |
+| **Efficiency** | **2K FLOPs/cycle** | 1K FLOPs/cycle |
+| **LDS read** | `ds_read_b128` (128-bit) | `ds_read_b64` (64-bit) |
+| **V transpose** | `ds_read_b64_tr_b8` | N/A |
+| **Full attention** | Yes (QK + softmax + PV) | QK only |
+
+### Critical Insight
+Triton's 2x speedup comes from **K=64 MFMA instruction**, not scheduling.
+- `v_mfma_f32_32x32x64_f8f6f4`: 128K FLOPs in 64 cycles = 2K FLOPs/cycle
+- `v_mfma_f32_32x32x16_fp8_fp8`: 32K FLOPs in 32 cycles = 1K FLOPs/cycle
+
+### Triton Assembly Patterns
+
+**MFMA (8 occurrences in main loop):**
+```asm
+v_mfma_f32_32x32x64_f8f6f4 v[82:97], v[66:73], v[122:129], v[98:113]
+v_mfma_f32_32x32x64_f8f6f4 v[66:81], v[160:167], v[122:129], v[98:113]
+```
+
+**LDS Reads:**
+```asm
+ds_read_b128 v[118:121], v5          ; 128-bit read for QK
+ds_read_b64_tr_b8 v[74:75], v145     ; transposed read for PV
+```
+
+**LDS Writes:**
+```asm
+ds_write_b128 v142, v[4:7]           ; 128-bit write
 ```
 
 ---
 
-## CURRENT BEST: fwd_fp8_qk_4qtile_v2.s
-- **Performance**: **NEEDS RE-BENCHMARK** (1617 TF/s was single-block, invalid)
-- **Numerics**: NEEDS VERIFICATION with random input
-- **Layout**: pitch-136 (bank-conflict-free)
-- **Approach**: 4 waves, each handles 1 Q-tile (32 rows)
+## PROGRESS (2025-01-16)
 
-## MAJOR BREAKTHROUGH: Fixed Wave Redundancy Bug
+### K=64 MFMA Verified Working
+- Created `test_mfma_k64.s` - minimal test for `v_mfma_f32_32x32x64_f8f6f4`
+- **RESULT**: All-ones test passes (64 FP8 ones × 64 FP8 ones = 64.0)
+- K=64 MFMA operand layout confirmed: 8 VGPRs per operand (64 FP8 elements)
 
-### The Bug (in fwd_fp8_qk_4qtile.s)
-All 4 waves were computing IDENTICAL MFMAs:
-- v200 = tid % 64 (wave_tid) used for MFMA addressing
-- All waves had same v200 values (0-63)
-- 3 out of 4 waves wasted doing redundant work
+### Triton Assembly Dumped
+- File: `triton_fp8_fmha.s` (2073 lines)
+- Key patterns identified:
+  - Uses `ds_read_b128` (128-bit LDS reads)
+  - Uses `ds_read_b64_tr_b8` for transposed reads (V operand)
+  - QK uses 4 MFMAs, PV uses 4 MFMAs per iteration
 
-### The Fix (in fwd_fp8_qk_4qtile_v2.s)
-Each wave computes a different Q-tile:
-- Wave 0 → Q-tile 0 (rows 0-31)
-- Wave 1 → Q-tile 1 (rows 32-63)
-- Wave 2 → Q-tile 2 (rows 64-95)
-- Wave 3 → Q-tile 3 (rows 96-127)
+### MFMA K=64 Operand Layout
+```
+v_mfma_f32_32x32x64_f8f6f4 D[0:15], A[0:7], B[0:7], C[0:15]
+- A[32,64]: 32 rows × 64 cols, 8 VGPRs
+- B[32,64]: 32 rows × 64 cols (transposed), 8 VGPRs  
+- C/D[32,32]: 32 rows × 32 cols, 16 VGPRs
+- Each lane L holds row (L % 32)'s data
+- 64 FP8 packed: 8 FP8 per VGPR
+```
 
-Result: **4x speedup** (405 → 1617 TF/s)
+## TRITON HSACO DIRECT CALL - BLOCKED (verified 2025-01-16)
 
-## PERFORMANCE COMPARISON (CORRECTED)
-| Kernel | TF/s | Notes |
-|--------|------|-------|
-| fwd_fp8_qk_4qtile_v11 | **386** | Multi-block verified |
-| BF16 full attention | ~1000 | Reference |
-| Triton FP8 full attention | ~1300 | Target |
+Multiple attempts to call Triton's compiled HSACO directly all failed with segfaults:
 
-**Previous claims of 1617 TF/s were INVALID (single-block benchmark)**
+**Why it fails:**
+1. Triton generates specialized launcher code (`__triton_launcher.*.so`)
+2. Argument marshaling includes extra bookkeeping beyond visible metadata
+3. N_CTX is a constexpr - baked into kernel at compile time
+   - kernarg_size=120 bytes but Python passes 124 bytes worth of args
+   - The kernel expects N_CTX=1024 specifically (from assembly dump)
+4. Dynamic LDS allocation not matching runtime expectations
 
-## KEY RESULT: FP8 QK at 386 TF/s (multi-block verified)
+**Attempted fixes:**
+- Different argument layouts (4 variations)
+- Different LDS sizes (0, 16KB, 24KB, 32KB, 64KB)
+- Matching exact tensor shapes from assembly dump (1024 seq_len)
+- All resulted in segmentation faults
 
-**Real performance**: 386 TF/s with proper multi-block grid
-**Target**: 1300+ TF/s (Triton FP8 full attention)
-**Gap**: 3.4x improvement needed
+**Decision**: Don't try to call Triton HSACO directly. Instead:
+1. Use Triton through Python for reference (1289 TF/s verified)
+2. Build our own kernel applying Triton's key optimizations
 
-**Root causes of slow performance:**
-1. Using K=16 MFMA instead of K=64 MFMA (2x loss)
-2. No k-loop (only 1 K-tile per block)
-3. Potential bank conflicts
-4. No pipelining
+## CURRENT STATUS
 
-## ARCHITECTURE DETAILS
+### K=64 MFMA QK Kernel - WORKING (single K-tile)
+- `fwd_fp8_k64_v3.co` correctly computes Q[32,128] × K[32,128]^T
+- MFMA values are correct (verified with sorted value comparison)  
+- Output layout is permuted (not row-major), needs permlane fix
+- Single tile: 128.0 for all-ones ✓
 
-### Wave-to-Row Mapping
-- 256 threads per block (4 waves × 64 threads)
-- Each wave handles 32 Q rows (1 Q-tile)
-- 128 Q rows total per block
+### K-tile Loop - BLOCKED (deep debugging needed)
+Multiple K-tiles crash even with:
+- Scalar offset (soffset) approach
+- VGPR offset approach  
+- Pointer update approach
+- Fully unrolled code with separate descriptors
 
-### VGPR Allocation (per wave)
-- v[0:15]: Output accumulator (16 VGPRs)
-- v[16:31]: Pre-loaded Q data (16 VGPRs)
-- v[32:47]: K data from LDS (16 VGPRs)
-- v[180+]: Addresses and temps
+Key finding: Shifting K pointer from Python WORKS, but any in-kernel
+offset modification causes crashes. This suggests:
+1. Buffer descriptor format might need special handling for 64-thread parallel access
+2. OR there's an alignment/page boundary issue with the K tensor
+3. OR buffer_load with non-zero offset behaves differently than expected on gfx950
 
-### LDS Layout (pitch-136)
-- Q_LDS_0: 0 (rows 0-31)
-- Q_LDS_1: 4352 (rows 32-63)
-- Q_LDS_2: 8704 (rows 64-95)
-- Q_LDS_3: 13056 (rows 96-127)
-- K_LDS_A: 17408 (double-buffered)
-- K_LDS_B: 21760
-- Total: 28672 bytes
+BF16 reference uses `buffer_load ... lds` (direct to LDS) pattern which we haven't tried.
 
-## BENCHMARK RESULTS (CORRECT MULTI-BLOCK - 2025-01-16)
+## KEY FINDINGS
 
-**Using bench_v11.py with grid=(252, 1, 1) for S=32130:**
+1. **Single K-tile MFMA works** - fwd_fp8_k64_v3.co produces correct values
+2. **Python pointer shifting works** - can process multiple K-tiles by shifting K_ptr from Python
+3. **In-kernel offset modification crashes** - any offset >= 4096 causes memory access fault
+4. **Even buffer_load ... lds crashes** - the issue is NOT specific to the load pattern
 
-| Config | Time (ms) | TF/s | Notes |
-|--------|-----------|------|-------|
-| Single head, S=32130 | 0.702 | **376.3** | 252 blocks |
-| H=40 heads, S=32130 | 27.39 | **385.9** | Sequential launches |
+This suggests either:
+- gfx950-specific behavior with buffer descriptors  
+- Some alignment/page boundary issue
+- A fundamental misunderstanding of the instruction behavior
 
-**Comparison:**
-| Kernel | TF/s | Status |
-|--------|------|--------|
-| Our FP8 QK-only | 386 | Multi-block verified |
-| BF16 full attention | ~1000 | Reference |
-| Triton FP8 full attention | ~1300 | Target |
+## RECOMMENDED PATH FORWARD
 
-**Gap analysis**: We're at 386 TF/s, need 1300+ TF/s (3.4x improvement needed)
+### Option 1: Focus on Full Pipeline First (RECOMMENDED)
+1. Use single-tile kernels to implement:
+   - Softmax (max, exp, sum reduction)
+   - P×V multiplication with transposed V
+2. Validate end-to-end numerics with small sequences
+3. Return to K-loop optimization later
 
-## NEXT STEPS
+### Option 2: Deep Debug K-loop
+1. Study BF16 kernel's exact buffer descriptor setup
+2. Check if `buffer_load ... lds` requires specific m0/descriptor patterns
+3. Test with hipcc-generated code to compare
 
-### Priority 1: Add softmax + PV for full attention
-- QK stage is now fast enough
-- Need online softmax (exp, max, sum)
-- Need P×V MFMA stage
-- Then can fairly compare with BF16 full attention
+### Option 3: Use Triton as Reference Implementation
+- Triton achieves 1298 TF/s with its K-loop
+- Focus on understanding WHY Triton works but our asm doesn't
+- May require studying Triton's LLVM IR → asm translation
 
-### Priority 2: Consider 8-Q-tile variant
-- 8 Q-tiles = 256 rows per block
-- Would need on-demand Q loading (not pre-loaded)
-- Tested: slower than 4-Q-tile due to LDS latency
+---
 
-### Priority 3: buffer_load...lds optimization
-- BF16 uses direct global→LDS loads
-- Would reduce instruction count
-- Complex m0 setup required
+## BENCHMARK TARGETS
 
-## FILES REFERENCE
-- **Best kernel**: `fwd_fp8_qk_4qtile_v2.s` (1617 TF/s, correct)
-- BF16 reference: `fwd_hd128_bf16.s` (987 TF/s)
-- Buggy version: `fwd_fp8_qk_4qtile.s` (redundant waves)
-- 8-Q-tile: `fwd_fp8_qk_8qtile.s` (slower, numeric issues)
+| Metric | Current | Target |
+|--------|---------|--------|
+| TF/s (QK only) | 386 | N/A |
+| TF/s (full attention) | N/A | 1300+ |
+| vs BF16 | 0.39x | 1.3x |
+| vs Triton FP8 | 0.30x | 1.0x |
 
-## COMMIT
-- `0156e9b5e`: FP8 FMHA: Fix wave redundancy bug, achieve 1617 TF/s
+---
+
+## FILES
+
+- `triton_fp8_fmha.s` - Dumped Triton assembly (source)
+- `fwd_fp8_triton_based.s` - Our cleaned up version (target)
+- `bench_triton_target.py` - Benchmark script for Triton
+- `dump_triton_asm.py` - Script to dump Triton assembly
+
+---
+
+## VERIFIED PERFORMANCE (2025-01-16)
+
+**Triton FP8 Flash Attention:**
+```
+B=1, H=40, S=32130, D=128: 1298.6 TF/s (FP8), 651.9 TF/s (FP16)
+```
+
+**Our kernel (v11 multi-block):**
+```
+H=40 heads, S=32130: 385.9 TF/s
+```
