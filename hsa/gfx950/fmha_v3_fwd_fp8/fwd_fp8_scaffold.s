@@ -281,19 +281,14 @@ PREFETCH_DONE:
     ds_read_b64_tr_b8 v[44:45], v5 offset:96
 
     // Convert P (v[32:47]) to FP8 packed (v48-v55)
+    v_mov_b32_e32 v59, 0x05040100
     v_cvt_pk_fp8_f32 v48, v32, v33
-    v_and_b32_e32 v48, 0xFFFF, v48
     v_cvt_pk_fp8_f32 v49, v34, v35
-    v_lshlrev_b32_e32 v49, 16, v49
-    v_and_b32_e32 v49, 0xFFFF0000, v49
-    v_or_b32_e32 v48, v48, v49
+    v_perm_b32 v48, v48, v49, v59
 
     v_cvt_pk_fp8_f32 v49, v36, v37
-    v_and_b32_e32 v49, 0xFFFF, v49
     v_cvt_pk_fp8_f32 v50, v38, v39
-    v_lshlrev_b32_e32 v50, 16, v50
-    v_and_b32_e32 v50, 0xFFFF0000, v50
-    v_or_b32_e32 v49, v49, v50
+    v_perm_b32 v49, v49, v50, v59
     s_waitcnt lgkmcnt(0)
 
     v_accvgpr_write_b32 a0, v48
