@@ -431,6 +431,27 @@ INSIGHT: TR8 base swizzle helps stability; perf still <2 PF/s.
 NEXT: Reduce MFMA count or add deeper pipelining.
 BLOCKER: None.
 
+=== TURN 2026-01-19 01:23 ===
+ACTION: Ran rocprofv3 --stats --hip-trace on scaffold.
+RESULT: 12.61 ms @ B=1,H=40,S=32130,D=128 → 1676 TF/s eq, 1684 TF/s exec.
+INSIGHT: Profiling overhead minimal; scaffold perf consistent.
+NEXT: Continue optimizing K=16 PV path or move to fused softmax.
+BLOCKER: None.
+
+=== TURN 2026-01-19 01:30 ===
+ACTION: Collected PMC counters via rocprofv3 --pmc.
+RESULT: 12.77 ms @ B=1,H=40,S=32130,D=128 → 1656 TF/s eq, 1664 TF/s exec.
+PMCs (avg): SQ_LDS_BANK_CONFLICT ~0.46% GUI, L2 hit ~91.3%.
+NEXT: Use PMC data to guide K/V layout and pipelining.
+BLOCKER: None.
+
+=== TURN 2026-01-19 02:10 ===
+ACTION: Tried BF16-style pipelining (wait+barrier at loop start, prefetch after MFMA).
+RESULT: Perf regressed to 17.7 ms; reverted to prefetch-before-compute.
+INSIGHT: Current overlap strategy is better; explicit loop-start barrier stalls.
+NEXT: Explore deeper multi-stage pipeline or reduce PV overhead.
+BLOCKER: None.
+
 === TURN 2026-01-18 (code model - fused kernel) ===
 ACTION: Created fwd_fp8_fused.s skeleton for online softmax + PV
 RESULT: Compiles and runs, outputs NaN (PV not implemented)
@@ -461,3 +482,73 @@ REMAINING_ISSUES:
   3. V read addresses may not match MFMA input layout
 NEXT: Implement proper cross-lane row_max reduction
 BLOCKER: Complex lane permutation for row-wise max
+
+=== TURN 2026-01-19 (code model - flash kernel) ===
+ACTION: Created fwd_fp8_flash.s from scaffold, renamed kernel, built and tested
+RESULT: 14.23 ms, 1485.9 TF/s (14% above Triton's 1294 TF/s)
+INSIGHT: Scaffold architecture proven. Ready to add softmax.
+NEXT: Add online softmax while maintaining TF/s > 1300
+BLOCKER: None
+
+=== TURN 2026-01-19 07:05 ===
+ACTION: Reworked P packing to use v_perm_b32 selector (fewer VALU ops).
+RESULT: 10.76 ms avg @ B=1,H=40,S=32130,D=128 → 1964.8 TF/s eq, 1974.3 TF/s exec.
+INSIGHT: v_perm_b32 packing cuts ~6 VALU ops per tile; net +0.8% perf.
+NEXT: Validate PMCs for MFMA share; consider further PV packing or LDS read cuts.
+BLOCKER: None
+
+=== TURN 2026-01-19 07:40 ===
+ACTION: Tried reducing V-read overhead (ds_read_b128_tr_b8, v_mad base+offsets).
+RESULT: ds_read_b128_tr_b8 unsupported; v_mad base regressed (~10.86 ms); reverted.
+INSIGHT: TR8 reads must stay b64; base math changes didn't help.
+NEXT: Explore other PV reuse ideas or broader layout changes.
+BLOCKER: None
+
+=== TURN 2026-01-19 08:05 ===
+ACTION: Tried PV K=64 with Triton-like swizzle offsets and padded V LDS.
+RESULT: Regressed to ~11.51 ms (1837 TF/s eq); reverted to K=16 PV (10.78 ms).
+INSIGHT: K=64 PV still slower; offsets/padding not enough without full swizzle/store redesign.
+NEXT: Consider full Triton swizzle layout for V store+read if pursuing K=64.
+BLOCKER: Need exact swizzle for V LDS layout (Triton).
+
+=== TURN 2026-01-19 08:35 ===
+ACTION: Implemented Triton-style V LDS swizzle (bitop3 store + XOR read bases) for K=64 PV.
+RESULT: 12.74 ms (1660 TF/s eq); reverted to K=16 PV (10.78 ms).
+INSIGHT: K=64 PV with swizzled reads still slower in scaffold.
+NEXT: Keep K=16 PV; consider layout changes only when integrating softmax.
+BLOCKER: None
+
+=== TURN 2026-01-19 10:01 ===
+ACTION: Paired K-loop to process two K tiles; K=64 PV via TR8 reads; updated LDS layout; rebuilt and ran test_scaffold.py.
+RESULT: 8.03 ms @ B=1,H=40,S=32130,D=128 → 2632.4 TF/s eq, 2647.8 TF/s exec.
+INSIGHT: Two-tile PV K=64 cuts MFMA count and boosts perf past 2 PF/s.
+NEXT: Validate with rocprofv3 PMCs and check LDS conflicts.
+BLOCKER: None
+
+=== TURN 2026-01-19 10:06 ===
+ACTION: Ran rocprofv3 PMCs (core + MFMA) on scaffold K64 pair.
+RESULT: 8.09–8.11 ms, 2606–2613 TF/s eq; PMCs collected in rocprofv3_k64pair.
+INSIGHT: MFMA and LDS instruction counts stable across dispatches; bank conflicts measurable.
+NEXT: Parse conflicts vs. GUI and compare to prior 2-stage baseline.
+BLOCKER: None
+
+=== TURN 2026-01-19 19:25 ===
+ACTION: Built QK debug kernel + numerics tests; masked FP8 packing; probed identity/K=0 cases.
+RESULT: NaNs fixed for random inputs (max_err ~0.47); QK debug still mismatches identity (row 16 repeats).
+INSIGHT: K/B operand layout likely wrong (column mapping missing); TR8 K read alone not sufficient.
+NEXT: Derive correct Q/K LDS layout for MFMA B operand (likely TR8 interleaved).
+BLOCKER: Need confirmed MFMA B layout for K=64 FP8.
+
+=== TURN 2026-01-19 19:43 ===
+ACTION: Backed up QK debug; switched Q+K to TR8 interleaved layout with ds_write_b8 scatter and ds_read_b64_tr_b8 for both.
+RESULT: QK identity still wrong (non-zeros on 8-stride grid, scale 8/16); random max_err worsened.
+INSIGHT: TR8 base/offset mapping still incorrect; need empirical TR8 gather mapping before fixing layout.
+NEXT: Use TR8 layout tests to derive correct base/offsets and update debug kernel.
+BLOCKER: Unknown correct TR8 base mapping for K=64 FP8 MFMA.
+
+=== TURN 2026-01-19 19:50 ===
+ACTION: Ran TR8 probe kernel with interleaved LDS layout and base_offset sweep.
+RESULT: ds_read_b64_tr_b8 returns repeated bytes (broadcast-like), not sequential k values.
+INSIGHT: TR8 is cooperative; base offsets 0..7 do not yield k=0..7; need mapping table.
+NEXT: Derive exact base/offset mapping from probe and update QK debug layout.
+BLOCKER: None

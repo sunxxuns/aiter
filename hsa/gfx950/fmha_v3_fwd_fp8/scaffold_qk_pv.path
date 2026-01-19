@@ -1,8 +1,8 @@
 STATUS: testing
-APPROACH: QK + PV scaffold kernel (no softmax) to validate layout/load TF/s
-KEY_PARAMS: Q/K pitch=132, V row-major, K_TILE=32, grid=(Q, B*H, 1)
+APPROACH: Pairwise K-loop with K=64 PV over two tiles
+KEY_PARAMS: Q pitch=132, K/V row-major, K_TILE=32 (paired), V_LDS0/1 contiguous
 TEST_RESULT:
   - Build: PASS
-  - B=1 H=40 S=32130 D=128: 12.65 ms, 1671 TF/s eq, 1679 TF/s exec
-  - PV uses K=16 MFMA with TR8 base swizzle (bank-conflict-free)
-NEXT_STEP: Reduce MFMA count and pipeline to reach ≥2 PF/s.
+  - B=1 H=40 S=32130 D=128: 8.03 ms, 2632 TF/s eq, 2648 TF/s exec
+  - PV uses K=64 MFMA with TR8 V reads across two tiles
+NEXT_STEP: Compare LDS conflict rate vs prior 2-stage baseline.

@@ -31,6 +31,8 @@ def main():
     if num_q_blocks % 2 != 0:
         num_q_blocks += 1
     num_k_tiles = (S + 31) // 32
+    if num_k_tiles % 2 != 0:
+        num_k_tiles += 1
     S_q = num_q_blocks * 128
     S_k = num_k_tiles * 32
 
@@ -117,7 +119,7 @@ def main():
 
     # FLOPs actually executed by this scaffold
     pv_k = int(os.environ.get("SCAFFOLD_PV_K", "64"))
-    pv_mfma = int(os.environ.get("SCAFFOLD_PV_MFMA", "4"))
+    pv_mfma = int(os.environ.get("SCAFFOLD_PV_MFMA", "2"))
     qk_flops = 2.0 * 32 * 32 * 64 * 2  # 2× MFMA K=64
     pv_flops = pv_mfma * 2.0 * 32 * 32 * pv_k
     waves_per_block = block[0] // 64

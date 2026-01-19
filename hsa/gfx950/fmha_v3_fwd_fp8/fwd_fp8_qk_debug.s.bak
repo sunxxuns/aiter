@@ -1,0 +1,263 @@
+.amdgcn_target "amdgcn-amd-amdhsa--gfx950:xnack-"
+
+.set Q_LDS, 0                 // 128×132
+.set K_LDS, 16896             // 32×128
+.set LDS_SIZE, 20992          // Q + K
+
+.text
+.globl _fwd_fp8_qk_debug
+.p2align 8
+.type _fwd_fp8_qk_debug,@function
+
+_fwd_fp8_qk_debug:
+    s_mov_b64 exec, -1
+
+    // ------------------------------------------------------------------------
+    // Load kernel arguments
+    // ------------------------------------------------------------------------
+    s_load_dwordx2 s[4:5], s[0:1], 0      // O_ptr (float32)
+    s_load_dwordx2 s[8:9], s[0:1], 8      // Q_ptr (fp8)
+    s_load_dwordx2 s[12:13], s[0:1], 16   // K_ptr (fp8)
+    s_waitcnt lgkmcnt(0)
+    s_barrier
+
+    // Buffer descriptors (size=-1, flags=0x20000)
+    s_mov_b32 s6, -1
+    s_mov_b32 s7, 0x20000
+    s_mov_b32 s10, -1
+    s_mov_b32 s11, 0x20000
+    s_mov_b32 s14, -1
+    s_mov_b32 s15, 0x20000
+
+    // ------------------------------------------------------------------------
+    // Thread indexing (256 threads)
+    // ------------------------------------------------------------------------
+    v_mov_b32_e32 v60, v0                // tid (0-255)
+    v_lshrrev_b32_e32 v9, 6, v60         // wave_id = tid / 64 (0-3)
+    v_and_b32_e32 v10, 63, v60           // lane_id = tid % 64
+
+    // ------------------------------------------------------------------------
+    // Load Q tile to LDS (pitch=132)
+    // ------------------------------------------------------------------------
+    v_lshlrev_b32_e32 v1, 6, v60         // tid * 64 bytes
+    v_mov_b32_e32 v2, v1                 // Q global offset
+
+    buffer_load_dwordx4 v[4:7], v2, s[8:11], 0 offen
+    v_add_u32_e32 v3, 16, v2
+    buffer_load_dwordx4 v[8:11], v3, s[8:11], 0 offen
+    v_add_u32_e32 v3, 32, v2
+    buffer_load_dwordx4 v[12:15], v3, s[8:11], 0 offen
+    v_add_u32_e32 v3, 48, v2
+    buffer_load_dwordx4 v[16:19], v3, s[8:11], 0 offen
+    s_waitcnt vmcnt(0)
+
+    // Q LDS address: row = tid >> 1, col = (tid & 1) * 64
+    v_lshrrev_b32_e32 v11, 1, v60        // row
+    v_lshlrev_b32_e32 v12, 7, v11        // row * 128
+    v_lshlrev_b32_e32 v11, 2, v11        // row * 4
+    v_add_u32_e32 v12, v12, v11          // row * 132
+    v_and_b32_e32 v11, 1, v60
+    v_lshlrev_b32_e32 v11, 6, v11        // col = (tid & 1) * 64
+    v_add_u32_e32 v12, v12, v11
+    v_add_u32_e32 v12, Q_LDS, v12
+
+    ds_write_b128 v12, v[4:7]
+    v_add_u32_e32 v12, 16, v12
+    ds_write_b128 v12, v[8:11]
+    v_add_u32_e32 v12, 16, v12
+    ds_write_b128 v12, v[12:15]
+    v_add_u32_e32 v12, 16, v12
+    ds_write_b128 v12, v[16:19]
+
+    // ------------------------------------------------------------------------
+    // Load K tile to LDS (TR8 interleaved layout)
+    // ------------------------------------------------------------------------
+    v_lshlrev_b32_e32 v13, 4, v60        // tid * 16 bytes
+    v_mov_b32_e32 v14, v13               // K global offset
+    buffer_load_dwordx4 v[20:23], v14, s[12:15], 0 offen
+    s_waitcnt vmcnt(0)
+
+    // row = tid / 8, k_chunk = tid % 8
+    v_lshrrev_b32_e32 v15, 3, v60        // row
+    v_and_b32_e32 v16, 7, v60            // k_chunk
+    v_and_b32_e32 v17, 7, v15            // row_in_block = row % 8
+    v_lshrrev_b32_e32 v18, 3, v15        // block = row / 8
+    v_lshlrev_b32_e32 v18, 10, v18       // block_base = block * 1024
+    v_lshlrev_b32_e32 v19, 7, v16        // k_base = k_chunk * 128
+    v_add_u32_e32 v19, v19, v17
+    v_add_u32_e32 v19, v19, v18          // base = row_in_block + block_base + k_base
+    v_add_u32_e32 v19, K_LDS, v19
+
+    // Scatter 16 bytes with stride 8
+    v_bfe_u32 v24, v20, 0, 8
+    ds_write_b8 v19, v24
+    v_add_u32_e32 v25, 8, v19
+    v_bfe_u32 v24, v20, 8, 8
+    ds_write_b8 v25, v24
+    v_add_u32_e32 v25, 16, v19
+    v_bfe_u32 v24, v20, 16, 8
+    ds_write_b8 v25, v24
+    v_add_u32_e32 v25, 24, v19
+    v_bfe_u32 v24, v20, 24, 8
+    ds_write_b8 v25, v24
+
+    v_add_u32_e32 v25, 32, v19
+    v_bfe_u32 v24, v21, 0, 8
+    ds_write_b8 v25, v24
+    v_add_u32_e32 v25, 40, v19
+    v_bfe_u32 v24, v21, 8, 8
+    ds_write_b8 v25, v24
+    v_add_u32_e32 v25, 48, v19
+    v_bfe_u32 v24, v21, 16, 8
+    ds_write_b8 v25, v24
+    v_add_u32_e32 v25, 56, v19
+    v_bfe_u32 v24, v21, 24, 8
+    ds_write_b8 v25, v24
+
+    v_add_u32_e32 v25, 64, v19
+    v_bfe_u32 v24, v22, 0, 8
+    ds_write_b8 v25, v24
+    v_add_u32_e32 v25, 72, v19
+    v_bfe_u32 v24, v22, 8, 8
+    ds_write_b8 v25, v24
+    v_add_u32_e32 v25, 80, v19
+    v_bfe_u32 v24, v22, 16, 8
+    ds_write_b8 v25, v24
+    v_add_u32_e32 v25, 88, v19
+    v_bfe_u32 v24, v22, 24, 8
+    ds_write_b8 v25, v24
+
+    v_add_u32_e32 v25, 96, v19
+    v_bfe_u32 v24, v23, 0, 8
+    ds_write_b8 v25, v24
+    v_add_u32_e32 v25, 104, v19
+    v_bfe_u32 v24, v23, 8, 8
+    ds_write_b8 v25, v24
+    v_add_u32_e32 v25, 112, v19
+    v_bfe_u32 v24, v23, 16, 8
+    ds_write_b8 v25, v24
+    v_add_u32_e32 v25, 120, v19
+    v_bfe_u32 v24, v23, 24, 8
+    ds_write_b8 v25, v24
+
+    s_waitcnt lgkmcnt(0)
+    s_barrier
+
+    // ------------------------------------------------------------------------
+    // Compute MFMA LDS read addresses
+    // ------------------------------------------------------------------------
+    v_and_b32_e32 v11, 15, v10           // lane & 15
+    v_lshrrev_b32_e32 v12, 4, v10
+    v_and_b32_e32 v12, 1, v12
+    v_lshlrev_b32_e32 v12, 4, v12
+    v_add_u32_e32 v13, v11, v12          // mfma_row
+
+    v_lshlrev_b32_e32 v14, 7, v13        // row * 128
+    v_lshlrev_b32_e32 v15, 2, v13        // row * 4
+    v_add_u32_e32 v14, v14, v15          // Q row offset (132)
+    v_lshlrev_b32_e32 v18, 7, v13        // K row offset (128)
+
+    v_cmp_ge_u32_e64 vcc, v10, 32
+    v_cndmask_b32_e64 v11, 0, 16, vcc    // k_off1
+    v_cndmask_b32_e64 v12, 32, 48, vcc   // k_off2
+
+    // Q base: wave_id * 4224
+    v_lshlrev_b32_e32 v17, 12, v9
+    v_lshlrev_b32_e32 v19, 7, v9
+    v_add_u32_e32 v17, v17, v19
+    v_add_u32_e32 v17, Q_LDS, v17
+
+    v_add_u32_e32 v58, v17, v14          // Q base + row
+    v_add_u32_e32 v24, v58, v11          // Q addr1
+    v_add_u32_e32 v25, v58, v12          // Q addr2
+
+    // TR8 base for K reads (interleaved layout)
+    v_and_b32_e32 v2, 31, v10            // row (N)
+    v_lshrrev_b32_e32 v3, 5, v10         // lane_hi (0/1)
+    v_and_b32_e32 v4, 7, v2              // row_in_block
+    v_lshrrev_b32_e32 v5, 3, v2          // block = row / 8
+    v_lshlrev_b32_e32 v5, 10, v5         // block_base = block * 1024
+    v_lshlrev_b32_e32 v6, 8, v3          // lane_hi * 256
+    v_add_u32_e32 v27, v4, v5
+    v_add_u32_e32 v27, v27, v6
+    v_add_u32_e32 v27, K_LDS, v27        // base for K
+
+    // ------------------------------------------------------------------------
+    // QK MFMA (K=64 × 2)
+    // ------------------------------------------------------------------------
+    .irp i, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47
+        v_mov_b32_e32 v\i, 0
+    .endr
+
+    ds_read_b128 v[16:19], v24
+    ds_read_b128 v[20:23], v25
+    ds_read_b64_tr_b8 v[32:33], v27 offset:0
+    ds_read_b64_tr_b8 v[34:35], v27 offset:64
+    ds_read_b64_tr_b8 v[36:37], v27 offset:128
+    ds_read_b64_tr_b8 v[38:39], v27 offset:192
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[16:23], v[32:39], v[32:47]
+
+    ds_read_b128 v[16:19], v24 offset:64
+    ds_read_b128 v[20:23], v25 offset:64
+    v_add_u32_e32 v28, 512, v27
+    ds_read_b64_tr_b8 v[32:33], v28 offset:0
+    ds_read_b64_tr_b8 v[34:35], v28 offset:64
+    ds_read_b64_tr_b8 v[36:37], v28 offset:128
+    ds_read_b64_tr_b8 v[38:39], v28 offset:192
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[16:23], v[32:39], v[32:47]
+
+    // ------------------------------------------------------------------------
+    // Store QK output (16 floats per thread)
+    // ------------------------------------------------------------------------
+    v_lshlrev_b32_e32 v50, 6, v60        // tid * 64 bytes
+    v_mov_b32_e32 v51, v50
+
+    buffer_store_dwordx4 v[32:35], v51, s[4:7], 0 offen
+    v_add_u32_e32 v52, 16, v51
+    buffer_store_dwordx4 v[36:39], v52, s[4:7], 0 offen
+    v_add_u32_e32 v52, 32, v51
+    buffer_store_dwordx4 v[40:43], v52, s[4:7], 0 offen
+    v_add_u32_e32 v52, 48, v51
+    buffer_store_dwordx4 v[44:47], v52, s[4:7], 0 offen
+
+    s_waitcnt vmcnt(0)
+    s_endpgm
+
+.rodata
+.p2align 6
+.amdhsa_kernel _fwd_fp8_qk_debug
+    .amdhsa_group_segment_fixed_size 20992
+    .amdhsa_private_segment_fixed_size 0
+    .amdhsa_kernarg_size 24
+    .amdhsa_user_sgpr_count 2
+    .amdhsa_user_sgpr_kernarg_segment_ptr 1
+    .amdhsa_system_sgpr_workgroup_id_x 1
+    .amdhsa_system_sgpr_workgroup_id_y 1
+    .amdhsa_system_vgpr_workitem_id 0
+    .amdhsa_next_free_vgpr 220
+    .amdhsa_next_free_sgpr 30
+    .amdhsa_accum_offset 220
+.end_amdhsa_kernel
+
+.amdgpu_metadata
+---
+amdhsa.version: [1, 2]
+amdhsa.kernels:
+  - .name: _fwd_fp8_qk_debug
+    .symbol: _fwd_fp8_qk_debug.kd
+    .kernarg_segment_size: 24
+    .group_segment_fixed_size: 20992
+    .private_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .wavefront_size: 64
+    .sgpr_count: 30
+    .vgpr_count: 220
+    .max_flat_workgroup_size: 256
+    .args:
+      - {.name: O_ptr, .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global}
+      - {.name: Q_ptr, .size: 8, .offset: 8, .value_kind: global_buffer, .address_space: global}
+      - {.name: K_ptr, .size: 8, .offset: 16, .value_kind: global_buffer, .address_space: global}
+...
+.end_amdgpu_metadata

@@ -9,9 +9,9 @@
 .set Q_LDS, 0                 // Q tile 0
 .set Q_LDS1, 16896            // Q tile 1 (128×132)
 .set K_LDS0, 33792            // 32×128 (row-major)
-.set V_LDS0, 37888            // 32×128 (row-major)
-.set K_LDS1, 41984            // ping-pong
-.set V_LDS1, 46080            // ping-pong
+.set K_LDS1, 37888            // ping-pong
+.set V_LDS0, 41984            // 32×128 (row-major, contiguous with V_LDS1)
+.set V_LDS1, 46080            // ping-pong (V_LDS0 + 4096)
 .set LDS_SIZE, 50176          // aligned
 
 .text
@@ -181,57 +181,42 @@ _fwd_fp8_scaffold:
     // ------------------------------------------------------------------------
     // K-tile loop: QK + PV (no softmax)
     // ------------------------------------------------------------------------
-    s_mov_b32 s30, 0                     // tile_idx
+    v_mov_b32_e32 v59, 0x05040100        // selector for v_perm_b32
+    s_mov_b32 s30, 0                     // tile_idx (pair)
     s_mov_b32 s31, 0                     // K/V tile soffset
 
-    // Preload tile 0 into buffer 0 (all threads, masked vaddr)
+    // Preload tiles 0/1 into K_LDS0/1 and V_LDS0/1
     v_mov_b32_e32 v13, v61
     s_mov_b32 m0, K_LDS0
     buffer_load_dwordx4 v13, s[12:15], s31 offen lds
     s_mov_b32 m0, V_LDS0
     buffer_load_dwordx4 v13, s[16:19], s31 offen lds
+
+    s_add_u32 s34, s31, 4096
+    v_mov_b32_e32 v13, v61
+    s_mov_b32 m0, K_LDS1
+    buffer_load_dwordx4 v13, s[12:15], s34 offen lds
+    s_mov_b32 m0, V_LDS1
+    buffer_load_dwordx4 v13, s[16:19], s34 offen lds
     s_waitcnt vmcnt(0)
 
 K_LOOP:
+    s_waitcnt vmcnt(0)
+    s_barrier
     s_cmp_ge_u32 s30, s20
     s_cbranch_scc1 K_LOOP_END
 
-    // Select ping-pong LDS base for current tile
-    v_mov_b32_e32 v28, s30
-    v_and_b32_e32 v28, 1, v28
-    v_cmp_eq_u32_e64 vcc, v28, 0
-    v_mov_b32_e32 v29, s40                      // K_LDS0
-    v_mov_b32_e32 v31, s41                      // K_LDS1
-    v_cndmask_b32_e64 v29, v31, v29, vcc        // K base
-    v_mov_b32_e32 v56, s42                      // V_LDS0
-    v_mov_b32_e32 v57, s43                      // V_LDS1
-    v_cndmask_b32_e64 v56, v57, v56, vcc        // V base
+    // Tile pair bases (V_LDS0/V_LDS1 are contiguous for K=64)
+    v_mov_b32_e32 v29, s40                      // K tile0 base
+    v_mov_b32_e32 v31, s41                      // K tile1 base
+    v_mov_b32_e32 v56, s42                      // V base (tile0)
 
-    // Compute Q/K read addresses for this tile
+    // Compute Q/K read addresses for tile 0
     v_add_u32_e32 v26, v29, v18                 // K base + row
     v_add_u32_e32 v27, v26, v11                 // K addr1
     v_add_u32_e32 v28, v26, v12                 // K addr2
 
-    // Prefetch next tile into other buffer (if any)
-    s_add_u32 s34, s30, 1
-    s_cmp_ge_u32 s34, s20
-    s_cbranch_scc1 PREFETCH_DONE
-
-    s_and_b32 s35, s30, 1
-    s_cmp_eq_u32 s35, 0
-    s_cselect_b32 s36, s41, s40          // other K base
-    s_cselect_b32 s37, s43, s42          // other V base
-    s_add_u32 s38, s31, 4096             // next tile offset
-
-    v_mov_b32_e32 v13, v61
-    s_mov_b32 m0, s36
-    buffer_load_dwordx4 v13, s[12:15], s38 offen lds
-    s_mov_b32 m0, s37
-    buffer_load_dwordx4 v13, s[16:19], s38 offen lds
-
-PREFETCH_DONE:
-
-    // QK MFMA (K=64 × 2)
+    // QK MFMA (K=64 × 2) for tile 0
     .irp i, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47
         v_mov_b32_e32 v\i, 0
     .endr
@@ -249,9 +234,80 @@ PREFETCH_DONE:
     s_waitcnt lgkmcnt(0)
     v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
 
-    // V tile already prefetched into LDS (ping-pong)
+    // Pack P0 (tile 0) to FP8 (v48-v51)
+    v_cvt_pk_fp8_f32 v48, v32, v33
+    v_and_b32_e32 v48, 0xFFFF, v48
+    v_cvt_pk_fp8_f32 v49, v34, v35
+    v_and_b32_e32 v49, 0xFFFF, v49
+    v_perm_b32 v48, v48, v49, v59
 
-    // PV MFMA using TR8 V reads (K=16 MFMA, scaffold only)
+    v_cvt_pk_fp8_f32 v49, v36, v37
+    v_and_b32_e32 v49, 0xFFFF, v49
+    v_cvt_pk_fp8_f32 v50, v38, v39
+    v_and_b32_e32 v50, 0xFFFF, v50
+    v_perm_b32 v49, v49, v50, v59
+
+    v_cvt_pk_fp8_f32 v50, v40, v41
+    v_and_b32_e32 v50, 0xFFFF, v50
+    v_cvt_pk_fp8_f32 v51, v42, v43
+    v_and_b32_e32 v51, 0xFFFF, v51
+    v_perm_b32 v50, v50, v51, v59
+
+    v_cvt_pk_fp8_f32 v51, v44, v45
+    v_and_b32_e32 v51, 0xFFFF, v51
+    v_cvt_pk_fp8_f32 v52, v46, v47
+    v_and_b32_e32 v52, 0xFFFF, v52
+    v_perm_b32 v51, v51, v52, v59
+
+    // Compute Q/K read addresses for tile 1
+    v_add_u32_e32 v26, v31, v18                 // K base + row
+    v_add_u32_e32 v27, v26, v11                 // K addr1
+    v_add_u32_e32 v28, v26, v12                 // K addr2
+
+    // QK MFMA (K=64 × 2) for tile 1
+    .irp i, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47
+        v_mov_b32_e32 v\i, 0
+    .endr
+    ds_read_b128 v[0:3], v24
+    ds_read_b128 v[4:7], v25
+    ds_read_b128 v[16:19], v27
+    ds_read_b128 v[20:23], v28
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
+
+    ds_read_b128 v[0:3], v24 offset:64
+    ds_read_b128 v[4:7], v25 offset:64
+    ds_read_b128 v[16:19], v27 offset:64
+    ds_read_b128 v[20:23], v28 offset:64
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
+
+    // Pack P1 (tile 1) to FP8 (v52-v55)
+    v_cvt_pk_fp8_f32 v52, v32, v33
+    v_and_b32_e32 v52, 0xFFFF, v52
+    v_cvt_pk_fp8_f32 v53, v34, v35
+    v_and_b32_e32 v53, 0xFFFF, v53
+    v_perm_b32 v52, v52, v53, v59
+
+    v_cvt_pk_fp8_f32 v53, v36, v37
+    v_and_b32_e32 v53, 0xFFFF, v53
+    v_cvt_pk_fp8_f32 v54, v38, v39
+    v_and_b32_e32 v54, 0xFFFF, v54
+    v_perm_b32 v53, v53, v54, v59
+
+    v_cvt_pk_fp8_f32 v54, v40, v41
+    v_and_b32_e32 v54, 0xFFFF, v54
+    v_cvt_pk_fp8_f32 v55, v42, v43
+    v_and_b32_e32 v55, 0xFFFF, v55
+    v_perm_b32 v54, v54, v55, v59
+
+    v_cvt_pk_fp8_f32 v55, v44, v45
+    v_and_b32_e32 v55, 0xFFFF, v55
+    v_cvt_pk_fp8_f32 v57, v46, v47
+    v_and_b32_e32 v57, 0xFFFF, v57
+    v_perm_b32 v55, v55, v57, v59
+
+    // PV MFMA using TR8 V reads (K=64, tiles 0+1)
     // Use bank-conflict-free TR8 base: (lane%32)*128 + (lane/32)*32
     v_and_b32_e32 v2, 31, v10
     v_lshrrev_b32_e32 v3, 5, v10
@@ -259,55 +315,62 @@ PREFETCH_DONE:
     v_lshlrev_b32_e32 v5, 5, v3
     v_add_u32_e32 v6, v4, v5
 
-    .macro READ_V_TR8_4COL k_row_offset
-        v_add_u32_e32 v5, v56, v6
-        v_add_u32_e32 v5, \k_row_offset, v5
-        ds_read_b64_tr_b8 v[30:31], v5 offset:0
-        ds_read_b64_tr_b8 v[32:33], v5 offset:32
-        ds_read_b64_tr_b8 v[34:35], v5 offset:64
-        ds_read_b64_tr_b8 v[36:37], v5 offset:96
-    .endm
-
-    // K-pass 0 (k=0..15) + K-pass 1 (k=16..31), batch V reads
-    READ_V_TR8_4COL 0
-    // second pass into v38:45
-    v_lshlrev_b32_e32 v5, 10, v3
-    v_add_u32_e32 v5, v5, v2
-    v_add_u32_e32 v5, v56, v5
-    v_add_u32_e32 v5, 2048, v5
-    ds_read_b64_tr_b8 v[38:39], v5 offset:0
-    ds_read_b64_tr_b8 v[40:41], v5 offset:32
-    ds_read_b64_tr_b8 v[42:43], v5 offset:64
-    ds_read_b64_tr_b8 v[44:45], v5 offset:96
-
-    // Convert P (v[32:47]) to FP8 packed (v48-v55)
-    v_mov_b32_e32 v59, 0x05040100
-    v_cvt_pk_fp8_f32 v48, v32, v33
-    v_cvt_pk_fp8_f32 v49, v34, v35
-    v_perm_b32 v48, v48, v49, v59
-
-    v_cvt_pk_fp8_f32 v49, v36, v37
-    v_cvt_pk_fp8_f32 v50, v38, v39
-    v_perm_b32 v49, v49, v50, v59
+    v_add_u32_e32 v7, v56, v6
+    ds_read_b64_tr_b8 v[0:1], v7 offset:0
+    ds_read_b64_tr_b8 v[2:3], v7 offset:512
+    ds_read_b64_tr_b8 v[4:5], v7 offset:1024
+    ds_read_b64_tr_b8 v[6:7], v7 offset:1536
     s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[64:79], v[0:7], v[48:55], v[64:79]
 
-    v_accvgpr_write_b32 a0, v48
-    v_accvgpr_write_b32 a1, v49
-    s_nop 1
-    // K-pass 0
-    v_mfma_f32_32x32x16_fp8_fp8 v[64:79], a[0:1], v[30:31], v[64:79]
-    v_mfma_f32_32x32x16_fp8_fp8 v[80:95], a[0:1], v[32:33], v[80:95]
-    v_mfma_f32_32x32x16_fp8_fp8 v[96:111], a[0:1], v[34:35], v[96:111]
-    v_mfma_f32_32x32x16_fp8_fp8 v[112:127], a[0:1], v[36:37], v[112:127]
-    // K-pass 1 (reuse same P)
-    v_mfma_f32_32x32x16_fp8_fp8 v[64:79], a[0:1], v[38:39], v[64:79]
-    v_mfma_f32_32x32x16_fp8_fp8 v[80:95], a[0:1], v[40:41], v[80:95]
-    v_mfma_f32_32x32x16_fp8_fp8 v[96:111], a[0:1], v[42:43], v[96:111]
-    v_mfma_f32_32x32x16_fp8_fp8 v[112:127], a[0:1], v[44:45], v[112:127]
+    v_add_u32_e32 v7, 32, v7
+    ds_read_b64_tr_b8 v[0:1], v7 offset:0
+    ds_read_b64_tr_b8 v[2:3], v7 offset:512
+    ds_read_b64_tr_b8 v[4:5], v7 offset:1024
+    ds_read_b64_tr_b8 v[6:7], v7 offset:1536
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[80:95], v[0:7], v[48:55], v[80:95]
 
-    // Advance to next K/V tile
-    s_add_u32 s31, s31, 4096
-    s_add_u32 s30, s30, 1
+    v_add_u32_e32 v7, 32, v7
+    ds_read_b64_tr_b8 v[0:1], v7 offset:0
+    ds_read_b64_tr_b8 v[2:3], v7 offset:512
+    ds_read_b64_tr_b8 v[4:5], v7 offset:1024
+    ds_read_b64_tr_b8 v[6:7], v7 offset:1536
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[96:111], v[0:7], v[48:55], v[96:111]
+
+    v_add_u32_e32 v7, 32, v7
+    ds_read_b64_tr_b8 v[0:1], v7 offset:0
+    ds_read_b64_tr_b8 v[2:3], v7 offset:512
+    ds_read_b64_tr_b8 v[4:5], v7 offset:1024
+    ds_read_b64_tr_b8 v[6:7], v7 offset:1536
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[112:127], v[0:7], v[48:55], v[112:127]
+
+    // Prefetch next tile pair (if any)
+    s_add_u32 s34, s30, 2
+    s_cmp_ge_u32 s34, s20
+    s_cbranch_scc1 PREFETCH_DONE
+
+    s_add_u32 s38, s31, 8192
+    s_add_u32 s39, s31, 12288
+
+    v_mov_b32_e32 v13, v61
+    s_mov_b32 m0, K_LDS0
+    buffer_load_dwordx4 v13, s[12:15], s38 offen lds
+    s_mov_b32 m0, V_LDS0
+    buffer_load_dwordx4 v13, s[16:19], s38 offen lds
+
+    v_mov_b32_e32 v13, v61
+    s_mov_b32 m0, K_LDS1
+    buffer_load_dwordx4 v13, s[12:15], s39 offen lds
+    s_mov_b32 m0, V_LDS1
+    buffer_load_dwordx4 v13, s[16:19], s39 offen lds
+
+PREFETCH_DONE:
+    // Advance to next K/V tile pair
+    s_add_u32 s31, s31, 8192
+    s_add_u32 s30, s30, 2
     s_branch K_LOOP
 
 K_LOOP_END:
