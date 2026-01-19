@@ -1,17 +1,142 @@
-# CODE MODEL STATUS - Updated 2025-01-16
+# CODE MODEL STATUS - Updated 2025-01-18
 
-## CURRENT APPROACH: Adapt Triton's FP8 Flash Attention Assembly
+=== TURN 2025-01-18 09:00 ===
+ACTION: Tested fwd_fp8_k64_256t.s multi-block kernel
+RESULT: FAIL numerics, perf 498.8 TF/s
+INSIGHT: Domain model was right - LDS addressing has issues
 
-### Decision
-Start from Triton's working 1298 TF/s kernel and clean it up for our use.
+=== TURN 2025-01-18 09:30 ===
+ACTION: Tried stride-136 LDS layout
+RESULT: Perf DROPPED to 260 TF/s due to v_mul_lo_u32 overhead
+INSIGHT: Simple stride padding makes it worse. Need XOR swizzle like Triton (single-cycle v_xor_b32)
 
-### Source File
-- **Input**: `triton_fp8_fmha.s` (2073 lines, dumped from Triton cache)
-- **Output**: `fwd_fp8_triton_based.s` (cleaned up, standalone kernel)
+=== TURN 2025-01-18 10:00 ===
+ACTION: Fixed K=64 MFMA thread-to-row mapping
+  - Changed row formula from (lane>>5)&1 to (lane>>4)&1
+  - row = (lane & 15) + ((lane >> 4) & 1) << 4
+  - Added separate k_offset for v0-v3 vs v4-v7
+RESULT: Partial success - all-ones test PASSES (128.0 everywhere)
+  - Perf 475 TF/s
+  - All-ones: PASS! Correct 128.0 everywhere
+  - Identity pattern: shows columns 0-15 correct, columns 16-31 have issues
+  - Missing cols: 16, 18, 20, 22, 24, 26, 28, 30 (even cols 16-30)
+INSIGHT: The MFMA math is correct (all-ones works), but K operand addressing for rows 16-31 is wrong
+NEXT: Debug K LDS read for threads that access K rows 16-31
+BLOCKER: Threads 16-31 read K row (thread-1) instead of correct K row
+
+=== TURN 2025-01-18 11:30 ===
+ACTION: Attempted XOR swizzle for bank conflict elimination
+RESULT: FAIL - performance dropped to 271 TF/s because write/read patterns don't match
+  - Q write uses row = tid/2 (linear)
+  - Q read uses row = MFMA mapping (different!)
+  - XOR swizzle must use same row index for both write and read
+INSIGHT: Need to either:
+  1. Fix write pattern to match MFMA read pattern, OR
+  2. Compute inverse mapping in read to match linear write
+REVERTED: Back to baseline 474 TF/s without swizzle
+BLOCKER: XOR swizzle requires matching write/read row calculations
 
 ---
 
-## TRITON FP8 ANALYSIS (1298 TF/s at B=1, H=40, S=32130)
+## ROCPROF RESULTS (2025-01-18)
+
+| Metric | Value |
+|--------|-------|
+| Duration | 22.0-22.3 ms |
+| Grid | 2,580,480 (252×40×256) |
+| LDS | 40960 bytes (spec: 20480) |
+| arch_vgpr | 112 |
+| sgpr | 48 |
+
+**Performance: 475 TF/s (target 1294 TF/s = 2.7x gap)**
+
+Possible bottlenecks:
+1. LDS bank conflicts (stride-128 = 16x conflicts)
+2. Memory latency not hidden (no pipelining)
+3. Numerical bug causing wrong data paths
+
+---
+
+## SESSION SUMMARY 2025-01-18
+
+### KEY PROGRESS
+1. Multi-block kernel runs (498 TF/s before changes, 475 TF/s after)
+2. **All-ones test PASSES** - proves MFMA computation is fundamentally correct
+3. Identified specific bug: threads 16-31 read K[row-1] instead of K[row]
+
+### CURRENT KERNEL STATE
+File: `fwd_fp8_k64_256t.s`
+- Multi-block support working (grid, head selection)
+- K=64 MFMA instruction working
+- K-loop working
+- Row formula implemented: row = (lane & 15) + ((lane >> 4) & 1) << 4
+
+### BUG ANALYSIS
+Test: Q=ones, K[j, :]=j+1 → Output[i,j] should be (j+1)*128
+
+Results:
+- Threads 0-15: output cols 0-15 CORRECT
+- Threads 16-31: output cols 15,17,19,19,19,21,... (wrong pattern)
+- Thread 16 should output col 16 (value 2176) but outputs col 15 (value 2048)
+
+The row calculation appears correct when traced manually:
+- lane=16: row = (16&15) + ((16>>4)&1)<<4 = 0 + 16 = 16
+
+But output shows thread 16 computes with K row 15, not row 16.
+
+### QUESTIONS FOR DOMAIN MODEL
+1. Is there something special about K=64 MFMA thread-to-data layout for srcB (K operand)?
+2. Does the ds_read for srcB have different semantics than srcA?
+3. Should we compare exact Triton LDS addresses byte-by-byte with our addresses?
+4. Could there be a VGPR clobbering issue between K load and MFMA?
+
+### FILES
+- `fwd_fp8_k64_256t.s` - Current kernel (numerics wrong)
+- `test_multiblock.py` - Numerical test
+- `multiblock.path` - Current approach status
+
+---
+
+# CODE MODEL STATUS - Updated 2025-01-16
+
+## SESSION SUMMARY (2025-01-16)
+
+### ACCOMPLISHED
+1. **K-loop with K=64 MFMA WORKING!**
+   - Created `fwd_fp8_k64_kloop_acc.s` with correct K-tile iteration
+   - Key fix: Use v[80:95] for accumulators (v[0:15] gets corrupted)
+   - Numerically verified: max_diff=0.0014, correlation=1.0
+
+2. **Root cause of K-loop crash identified:**
+   - `buffer_load` to VGPRs after MFMA → CRASHES
+   - Solution: Use high VGPR range for accumulators to avoid pipeline conflict
+
+3. **Benchmark baselines established:**
+   - BF16 ASM: 1016 TF/s at S=32130, H=40
+   - Triton FP8: 1294 TF/s (TARGET TO BEAT)
+   - Current FP8 ASM: ~0.6 TF/s (single-block, no swizzle)
+
+### PERFORMANCE GAP: >2000x
+| Issue | Impact | Solution |
+|-------|--------|----------|
+| Single-block only | No parallelism | Add workgroup_id for Q-tile selection |
+| Bank conflicts | ~16x slowdown | BF16-style swizzle pattern |
+| No pipelining | Memory latency | buffer_load...lds + double buffer |
+
+### NEXT STEPS TO REACH 1300+ TF/s
+1. Add multi-block support (workgroup_id_x for Q-tile, workgroup_id_y for head)
+2. Implement BF16-style LDS swizzle (m0=0x8200, stride 0x2040)
+3. Use buffer_load...lds for direct global→LDS loads
+4. Pipeline memory loads with MFMA compute
+
+### KEY FILES
+- `fwd_fp8_k64_kloop_acc.co` - Working K-loop with K=64 MFMA (QK only, single-block)
+- `fwd_fp8_kloop.co` - Full attention (non-performant reference)
+- `bench_triton_direct.py` - Triton FP8 benchmark (1294 TF/s)
+
+---
+
+## TRITON FP8 ANALYSIS (1294 TF/s at B=1, H=40, S=32130)
 
 ### Key Differences from Our Kernel
 
@@ -73,112 +198,266 @@ v_mfma_f32_32x32x64_f8f6f4 D[0:15], A[0:7], B[0:7], C[0:15]
 - 64 FP8 packed: 8 FP8 per VGPR
 ```
 
-## TRITON HSACO DIRECT CALL - BLOCKED (verified 2025-01-16)
+## TRITON HSACO DIRECT CALL - ROOT CAUSE FOUND (2025-01-16)
 
-Multiple attempts to call Triton's compiled HSACO directly all failed with segfaults:
+**ROOT CAUSE: Kernarg Preloading**
 
-**Why it fails:**
-1. Triton generates specialized launcher code (`__triton_launcher.*.so`)
-2. Argument marshaling includes extra bookkeeping beyond visible metadata
-3. N_CTX is a constexpr - baked into kernel at compile time
-   - kernarg_size=120 bytes but Python passes 124 bytes worth of args
-   - The kernel expects N_CTX=1024 specifically (from assembly dump)
-4. Dynamic LDS allocation not matching runtime expectations
+The Triton kernel uses `.amdhsa_kernarg_preload_length 14` which preloads 56 bytes
+into s[2:15] at kernel start. This preloading mechanism is INCOMPATIBLE with
+`hipModuleLaunchKernel` - it causes illegal instruction errors.
 
-**Attempted fixes:**
-- Different argument layouts (4 variations)
-- Different LDS sizes (0, 16KB, 24KB, 32KB, 64KB)
-- Matching exact tensor shapes from assembly dump (1024 seq_len)
-- All resulted in segmentation faults
+**Verification tests:**
+| Kernel Type          | Preload | Result            |
+|---------------------|---------|-------------------|
+| Our minimal kernel  | 0       | WORKS             |
+| Multi-arg kernel    | 0       | WORKS             |
+| Same + preload=2    | 2       | ILLEGAL_INSTRUCTION |
+| Triton kernel       | 14      | Memory fault      |
 
-**Decision**: Don't try to call Triton HSACO directly. Instead:
-1. Use Triton through Python for reference (1289 TF/s verified)
-2. Build our own kernel applying Triton's key optimizations
+**Other findings:**
+- Don't pass explicit padding args - HIP auto-aligns
+- N_CTX is at kernarg boundary, may be constexpr
+- Metadata shows global_buffer at 104/112 (mystery)
 
-## CURRENT STATUS
+**To launch Triton HSACO directly, must:**
+1. Set `.amdhsa_kernarg_preload_length` to 0
+2. Add explicit `s_load` for preloaded args (bytes 0-55)
+3. Adjust SGPR assignments throughout kernel (significant effort)
 
-### K=64 MFMA QK Kernel - WORKING (single K-tile)
-- `fwd_fp8_k64_v3.co` correctly computes Q[32,128] × K[32,128]^T
-- MFMA values are correct (verified with sorted value comparison)  
-- Output layout is permuted (not row-major), needs permlane fix
-- Single tile: 128.0 for all-ones ✓
+**Decision**: 
+- Use Triton via Python for benchmarks (1289 TF/s verified)
+- For custom kernel, apply Triton patterns (K=64 MFMA, etc.) from scratch
 
-### K-tile Loop - BLOCKED (deep debugging needed)
-Multiple K-tiles crash even with:
-- Scalar offset (soffset) approach
-- VGPR offset approach  
-- Pointer update approach
-- Fully unrolled code with separate descriptors
+## MILESTONE ACHIEVED: K-LOOP WORKING (2025-01-16)
 
-Key finding: Shifting K pointer from Python WORKS, but any in-kernel
-offset modification causes crashes. This suggests:
-1. Buffer descriptor format might need special handling for 64-thread parallel access
-2. OR there's an alignment/page boundary issue with the K tensor
-3. OR buffer_load with non-zero offset behaves differently than expected on gfx950
+**Working kernel:** `fwd_fp8_k64_kloop_acc.co`
+- Uses K=64 MFMA (v_mfma_f32_32x32x64_f8f6f4) - 2x efficiency
+- K-loop iterates over K-tiles with soffset pattern
+- Numerically correct (max_diff=0.0014, correlation=1.0)
+- Tested with 1, 2, 4, 8, ... 256 K-tiles
 
-BF16 reference uses `buffer_load ... lds` (direct to LDS) pattern which we haven't tried.
+**Key fixes:**
+1. Use v[80:95] for MFMA accumulators (v[0:15] gets corrupted)
+2. Use v[150:165] for K load data (separate from MFMA operands)
+3. soffset for K-tile offset: `buffer_load ... s20 offen` with s20 += 4096
 
-## KEY FINDINGS
+**Benchmarks (verified 2025-01-16):**
+| Kernel | S=32130, H=40 | Notes |
+|--------|---------------|-------|
+| BF16 ASM FMHA | 1016 TF/s | Baseline |
+| Triton FP8 | 1294 TF/s | 2x over FP16/BF16 |
+| FP8 ASM (current) | ~0.6 TF/s | Single-block, no swizzle |
+| FP8 ASM target | >1300 TF/s | To beat Triton |
 
-1. **Single K-tile MFMA works** - fwd_fp8_k64_v3.co produces correct values
-2. **Python pointer shifting works** - can process multiple K-tiles by shifting K_ptr from Python
-3. **In-kernel offset modification crashes** - any offset >= 4096 causes memory access fault
-4. **Even buffer_load ... lds crashes** - the issue is NOT specific to the load pattern
+**Performance gap analysis:**
+- Current FP8 ASM is >2000x slower than Triton
+- Root causes: 1) Single-block only, 2) Bank conflicts, 3) No pipelining
+- K-loop with K=64 MFMA is working but needs swizzle + multi-block
 
-This suggests either:
-- gfx950-specific behavior with buffer descriptors  
-- Some alignment/page boundary issue
-- A fundamental misunderstanding of the instruction behavior
+**Next steps:**
+1. Integrate fwd_fp8_kloop.co with sglang benchmark framework
+2. Add proper grid scaling for multi-head/multi-batch
+3. Profile and optimize K=64 MFMA throughput
 
-## RECOMMENDED PATH FORWARD
+**KEY FILES:**
+- `fwd_fp8_k64_kloop_acc.s` - Working K-loop with K=64 MFMA (QK only)
+- `fwd_fp8_kloop.s` - Full attention (QK + softmax + PV)
+- `test_kloop_attn.py` - Numerical accuracy test
 
-### Option 1: Focus on Full Pipeline First (RECOMMENDED)
-1. Use single-tile kernels to implement:
-   - Softmax (max, exp, sum reduction)
-   - P×V multiplication with transposed V
-2. Validate end-to-end numerics with small sequences
-3. Return to K-loop optimization later
+## CURRENT STATUS - K-LOOP SOLVED
 
-### Option 2: Deep Debug K-loop
-1. Study BF16 kernel's exact buffer descriptor setup
-2. Check if `buffer_load ... lds` requires specific m0/descriptor patterns
-3. Test with hipcc-generated code to compare
+### K=64 MFMA K-Loop - WORKING
+- `fwd_fp8_k64_kloop_acc.co` correctly processes multiple K-tiles
+- Uses K=64 MFMA (v_mfma_f32_32x32x64_f8f6f4) - 2x efficiency over K=16
+- Numerically verified with random input
 
-### Option 3: Use Triton as Reference Implementation
-- Triton achieves 1298 TF/s with its K-loop
-- Focus on understanding WHY Triton works but our asm doesn't
-- May require studying Triton's LLVM IR → asm translation
+### Test Results
+| Tiles | Expected | Actual | Status |
+|-------|----------|--------|--------|
+| 1 | 128 | 128.0 | ✓ |
+| 2 | 256 | 256.0 | ✓ |
+| 4 | 512 | 512.0 | ✓ |
+| Random | - | max_diff=0.0014 | ✓ |
 
----
-
-## BENCHMARK TARGETS
-
-| Metric | Current | Target |
-|--------|---------|--------|
-| TF/s (QK only) | 386 | N/A |
-| TF/s (full attention) | N/A | 1300+ |
-| vs BF16 | 0.39x | 1.3x |
-| vs Triton FP8 | 0.30x | 1.0x |
+### Root Cause of Previous Crashes
+v[0:15] was being corrupted when used as MFMA accumulators in a loop.
+**Solution:** Use v[80:95] for accumulators instead.
 
 ---
 
-## FILES
+## BENCHMARK RESULTS (2025-01-16)
 
-- `triton_fp8_fmha.s` - Dumped Triton assembly (source)
-- `fwd_fp8_triton_based.s` - Our cleaned up version (target)
-- `bench_triton_target.py` - Benchmark script for Triton
-- `dump_triton_asm.py` - Script to dump Triton assembly
+| Kernel | TF/s | Notes |
+|--------|------|-------|
+| **Triton FP8** | **1294** | Target to beat |
+| BF16 ASM | 1016 | Baseline |
+| FP8 ASM (current) | ~0.6 | Single-block, no swizzle |
+
+### Performance Gap Analysis
+Current FP8 ASM is >2000x slower due to:
+1. **Single-block only** - No parallelism across Q-tiles/heads
+2. **Bank conflicts** - No LDS swizzle pattern
+3. **No pipelining** - Memory latency not hidden
 
 ---
 
-## VERIFIED PERFORMANCE (2025-01-16)
+## PATH TO 1300+ TF/s
 
-**Triton FP8 Flash Attention:**
-```
-B=1, H=40, S=32130, D=128: 1298.6 TF/s (FP8), 651.9 TF/s (FP16)
-```
+### Phase 1: Multi-block Support
+- Add workgroup_id_x for Q-tile selection
+- Add workgroup_id_y for head selection
+- Compute Q/O offsets from block indices
 
-**Our kernel (v11 multi-block):**
-```
-H=40 heads, S=32130: 385.9 TF/s
-```
+### Phase 2: Bank Conflict Elimination
+- Implement BF16-style swizzle (m0=0x8200, stride 0x2040)
+- Or use XOR-based swizzle for simpler implementation
+
+### Phase 3: Memory Pipelining
+- Use buffer_load...lds for direct global→LDS loads
+- Double-buffer K tiles to overlap load with compute
+
+---
+
+=== TURN 2026-01-18 12:45 ===
+ACTION: Fixed QK tile kernel layout (pitch-132), added K-tile grouping and rigorous numeric test.
+RESULT: PASS rigorous tests (max_err ≤ 7.6e-6) for S=128/256, H=1/2; QK-only TF/s ~143.
+INSIGHT: QK-only is bandwidth-bound due to full S×S output; correctness verified for padded shapes.
+NEXT: Fuse online softmax + PV or reduce output bandwidth.
+BLOCKER: None.
+
+=== TURN 2026-01-18 (code model verification) ===
+ACTION: Rebuilt and verified fwd_fp8_k64_256t kernel
+RESULT: PASS all rigorous tests
+  - random_S128_H1: max_err 3.8e-6
+  - random_S256_H1: max_err 7.6e-6
+  - random_S128_H2: max_err 7.6e-6
+  - ones_S128_H1: exact match
+  - identity_S128_H1: exact match
+  - Performance: 142.8 TF/s (QK-only, bandwidth-bound)
+INSIGHT: Pitch-132 LDS layout + correct thread mapping = numerically correct
+NEXT: Fuse online softmax + PV to avoid full QK output
+BLOCKER: None
+
+=== TURN 2026-01-18 (rocprof analysis) ===
+ACTION: Profiled kernel with rocprof --stats
+RESULT: Confirmed output bandwidth bottleneck
+  - Duration: 74.3 ms
+  - Total output: 41.62 GB (full QK matrix)
+  - Output bandwidth: 560 GB/s (10.6% HBM utilization)
+  - Compute utilization: 0.68% (only!)
+  - arch_vgpr: 112, sgpr: 48, LDS: 42496 (reported)
+INSIGHT: Writing S×S matrix is 250x more data than S×D output
+  - Current: 1B elements per head (S×S = 32130²)
+  - With fusion: 4M elements per head (S×D = 32130×128)
+NEXT: Implement online softmax + PV fusion to eliminate S×S output
+BLOCKER: Major kernel restructuring required
+
+## KEY FILES
+
+| File | Purpose |
+|------|---------|
+| `fwd_fp8_k64_kloop_acc.co` | Working K-loop, QK only, single-block |
+| `fwd_fp8_kloop.co` | Full attention (non-performant reference) |
+| `bench_triton_direct.py` | Triton FP8 benchmark |
+| `fwd_hd128_bf16.s` | BF16 reference (swizzle patterns) |
+
+=== TURN 2026-01-18 13:30 ===
+ACTION: Updated end-to-end reference kernel layout and stores.
+RESULT: Not tested yet (needs compile + numeric check).
+INSIGHT: Q/K now use pitch-132 LDS; output stores use buffer_store (no flat_store).
+NEXT: Update kernel offsets to support multi-block/head and validate numerics.
+BLOCKER: None.
+
+=== TURN 2026-01-18 14:05 ===
+ACTION: Rebuilt fwd_fp8_kloop.s, ran S=32 correctness test.
+RESULT: PASS (max_err ~1.36e-3 vs FP32 ref) for single-tile case.
+INSIGHT: Pitch-132 Q/K + buffer_store works; still single-block and V row-major.
+NEXT: Add head/q-block offsets and move V to TR8 reads for PV.
+BLOCKER: None.
+
+=== TURN 2026-01-18 15:10 ===
+ACTION: Implemented PV MFMA in fwd_fp8_fused.s (FP8 K=16), added P→LDS store and MFMA-based O stores; rebuilt and ran test_fused.py.
+RESULT: Kernel runs but output still contains NaNs (first few elements), max_err NaN.
+INSIGHT: Softmax row-wise reduction is still per-thread; missing cross-lane max/sum likely causing instability.
+NEXT: Implement wave-level row_max/row_sum reduction (per row) before exp.
+BLOCKER: None.
+
+=== TURN 2026-01-18 16:05 ===
+ACTION: Added QK+PV scaffold kernel and perf test (no softmax).
+RESULT: Scaffold added, not yet benchmarked.
+INSIGHT: Uses pitch-132 Q/K, TR8 V reads, vector stores for O.
+NEXT: Build fwd_fp8_scaffold.s and run test_scaffold.py for TF/s.
+BLOCKER: None.
+
+=== TURN 2026-01-18 16:25 ===
+ACTION: Built fwd_fp8_scaffold and ran test_scaffold.py.
+RESULT: 55.6 ms @ B=1,H=40,S=32130,D=128 → ~380 TF/s (theoretical).
+INSIGHT: QK+PV scaffold is far below 1300 TF/s; V path likely bottleneck.
+NEXT: Rework V LDS layout + TR8 reads, add load/compute pipelining.
+BLOCKER: None.
+
+=== TURN 2026-01-18 17:05 ===
+ACTION: Added ping-pong prefetch and K=64 PV MFMA in scaffold.
+RESULT: 45.9 ms @ B=1,H=40,S=32130,D=128 → ~460 TF/s (theoretical).
+INSIGHT: Prefetch + K=64 MFMA helps but still far from 2 PF/s target.
+NEXT: Reduce VGPR pressure and explore multi-Q-tile reuse of K/V.
+BLOCKER: None.
+
+=== TURN 2026-01-18 17:45 ===
+ACTION: Fixed tid clobber in scaffold and rebenchmarked.
+RESULT: 27.7 ms @ B=1,H=40,S=32130,D=128 → ~763 TF/s (theoretical).
+INSIGHT: Preserving tid enabled correct stores; big perf jump.
+NEXT: Increase reuse (multi-Q tile per block) to approach 2 PF/s.
+BLOCKER: None.
+
+=== TURN 2026-01-18 18:20 ===
+ACTION: Switched scaffold to 2 Q tiles/block, row-major K/V in LDS, removed per-tile barriers.
+RESULT: 12.4 ms @ B=1,H=40,S=32130,D=128 → ~1700 TF/s (theoretical).
+INSIGHT: PV uses K=64 MFMA (2× PV compute), so raw compute rate >2.5 PF/s.
+NEXT: Validate K=32/16 PV path without losing throughput.
+BLOCKER: None.
+
+=== TURN 2026-01-18 18:55 ===
+ACTION: Optimized K=16 PV path with batched TR8 reads (both K passes).
+RESULT: 12.5 ms @ B=1,H=40,S=32130,D=128 → 1685 TF/s eq, 1693 TF/s exec.
+INSIGHT: Correct PV K=16 still below 2 PF/s; needs ~16% improvement.
+NEXT: Explore zero-padded K=64 or deeper pipelining for K=16.
+BLOCKER: None.
+
+=== TURN 2026-01-18 19:20 ===
+ACTION: Swizzled TR8 base for V reads (bank-conflict-free mapping).
+RESULT: 12.65 ms @ B=1,H=40,S=32130,D=128 → 1671 TF/s eq, 1679 TF/s exec.
+INSIGHT: TR8 base swizzle helps stability; perf still <2 PF/s.
+NEXT: Reduce MFMA count or add deeper pipelining.
+BLOCKER: None.
+
+=== TURN 2026-01-18 (code model - fused kernel) ===
+ACTION: Created fwd_fp8_fused.s skeleton for online softmax + PV
+RESULT: Compiles and runs, outputs NaN (PV not implemented)
+FILES: fwd_fp8_fused.s, fused.path, test_fused.py
+
+=== TURN 2026-01-18 (Triton PV analysis) ===
+ACTION: Analyzed triton_fp8_fmha.s to understand PV MFMA approach
+RESULT: Triton uses FP8 K=64 MFMA for PV (not BF16!)
+KEY_DISCOVERY:
+  - v_cvt_scalef32_pk_fp8_f32: converts P from f32 → fp8 (scale=1.0)
+  - ds_read_b64_tr_b8: transposed FP8 read of V from LDS
+  - Same v_mfma_f32_32x32x64_f8f6f4 for both QK and PV
+
+=== TURN 2026-01-18 (PV implementation) ===
+ACTION: Implemented P→FP8 conversion, V transposed read, PV MFMA in fwd_fp8_fused.s
+RESULT: Kernel produces output but values are WRONG
+  - All 256 threads now produce output
+  - Some values ~2.0 (close to expected), others very negative (-18304)
+  - Root cause: cross-lane row_max reduction NOT implemented
+IMPLEMENTED:
+  - v_cvt_scalef32_pk_fp8_f32 for P conversion
+  - ds_read_b64_tr_b8 for V transposed read
+  - 4× v_mfma_f32_32x32x64_f8f6f4 for PV (head_dim chunks)
+  - Full O store (all 4 accumulators)
+REMAINING_ISSUES:
+  1. Cross-lane row_max reduction (need v_permlane32_swap or ds_bpermute)
+  2. P uses 4 VGPRs (16 fp8) but K=64 needs 8 VGPRs (32 fp8)
+  3. V read addresses may not match MFMA input layout
+NEXT: Implement proper cross-lane row_max reduction
+BLOCKER: Complex lane permutation for row-wise max

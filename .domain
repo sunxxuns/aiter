@@ -1,776 +1,617 @@
-# DOMAIN MODEL ANALYSIS - FP8 Flash Attention ASM
+# DOMAIN MODEL ANALYSIS - FP8 K=64 MFMA Multi-Block Kernel
 
-## VERIFIED BENCHMARK RESULTS (2025-01-16)
+## CURRENT BLOCKER
+Code model has created `fwd_fp8_k64_256t.s` with multi-block support, but the LDS addressing uses stride-128 which causes 16x bank conflicts.
 
-### Triton FP8 Flash Attention (bench_triton_direct.py)
+**ACTION REQUIRED**: Implement bank-conflict-free LDS addressing using one of:
+1. **Stride-132** (simplest) - see "RECOMMENDED IMPLEMENTATION" section below
+2. **Diagonal padding** (matches Triton) - see "Triton Diagonal Padding Strategy" section below
 
-| Config | FP8 TF/s | FP16 TF/s | BF16 TF/s | FP8/FP16 |
-|--------|----------|-----------|-----------|----------|
-| B=1, H=40, S=4096 | 1049 | 593 | 610 | 1.77x |
-| B=1, H=40, S=8192 | 1228 | 614 | 634 | 2.00x |
-| B=1, H=40, S=16384 | 1258 | 633 | 669 | 1.99x |
-| **B=1, H=40, S=32130** | **1289** | 649 | 669 | **1.99x** |
-
-### Our FP8 QK-only Kernel (bench_v11.py)
-
-| Config | Time (ms) | TF/s |
-|--------|-----------|------|
-| Single head, S=32130 | 0.702 | **376** |
-| H=40 heads, S=32130 | 27.39 | **386** |
-
-### Performance Gap Analysis
-
-| Kernel | TF/s | vs Triton FP8 |
-|--------|------|---------------|
-| **Our FP8 QK-only** | **386** | 30% |
-| Triton FP8 full attention | **1289** | 100% (target) |
-| Triton FP16/BF16 | ~660 | 51% |
-
-**Gap: 3.3x improvement needed (386 → 1289 TF/s)**
-
-**Key insight**: Triton FP8 achieves exactly 2x speedup over FP16/BF16,
-matching the K=64 MFMA efficiency gain predicted by ISA analysis.
+The kernel structure is correct. Only the LDS addressing pattern needs fixing.
 
 ---
 
-## TRITON FP8 ASSEMBLY ANALYSIS (triton_fp8_fmha.s)
+## PROVEN FACT: K=64 FP8 MFMA Thread-to-Data Mapping (ISA Doc)
 
-### Kernel Configuration
-- **Threads**: 256 (4 warps)
-- **BLOCK_M**: 128 (Q rows per block)
-- **BLOCK_N**: 64 (K/V cols per iteration)
-- **HEAD_DIM**: 128
-- **VGPRs**: 168
-- **SGPRs**: 58
-- **LDS**: ~24KB (Q:16KB + K/V:8KB)
+**CLAIM**: The V_MFMA_F32_32x32x64_F8F6F4 instruction has a specific interleaved thread-to-data layout that differs from K=16.
 
-### Main Loop Structure (LBB0_5, lines 316-726)
+**EVIDENCE**: CDNA4 ISA doc lines 3153-3175, section "Dense Matrix Layouts: 8-bit and Smaller"
 
+**LAYOUT FOR FP8 32x32x64**:
 ```
-for k_offset = 0 to N_CTX step 64:
-    1. Load K[k_offset:k_offset+64] → LDS
-    2. QK MFMA (4x v_mfma_f32_32x32x64_f8f6f4)
-    3. Online Softmax (max, exp, sum)
-    4. Load V[k_offset:k_offset+64] → LDS  
-    5. PV MFMA (4x v_mfma_f32_32x32x64_f8f6f4)
+A[32][64] and B[64][32] layout in 8 VGPRs:
+
+         v0-v3 (first 4 VGPRs)           v4-v7 (last 4 VGPRs)
+Thread   M/N dimension    k dimension    k dimension
+------   -------------    -----------    -----------
+0-15     M/N = [0-15]     k = [0-15]     k = [32-47]
+16-31    M/N = [16-31]    k = [0-15]     k = [32-47]
+32-47    M/N = [0-15]     k = [16-31]    k = [48-63]
+48-63    M/N = [16-31]    k = [16-31]    k = [48-63]
 ```
 
-### Stage 1: K Load (lines 320-345)
+**FORMULA FOR THREAD t (0-63)**:
+- M/N row = (t % 16) + 16 * ((t / 32) % 2)
+- k range depends on thread group and VGPR index
+
+---
+
+## PROVEN FACT: Triton XOR Swizzle Pattern for LDS Addressing
+
+**CLAIM**: Triton achieves 1294 TF/s using XOR-based swizzle for bank-conflict-free LDS access with K=64 MFMA.
+
+**EVIDENCE**: triton_fp8_fmha.s lines 159-211
+
+**PATTERN**:
 ```asm
-global_load_dwordx4 v[66:69], v[66:67], off  ; 16 bytes/thread
-global_load_dwordx4 v[70:73], v[70:71], off  ; 16 bytes/thread
-; ... barrier ...
-ds_write_b128 v142, v[66:69]                 ; Write to LDS
-ds_write_b128 v142, v[70:73] offset:4096     ; 4KB apart
+; Base computation (lines 159-160)
+v_bitop3_b32 v4, v5, v11, v4 bitop3:0x36    ; XOR of three values
+v_xor_b32_e32 v5, 0x60, v4                  ; +96 offset
+
+; Two ds_read_b128 per operand half (lines 164-165)
+ds_read_b128 v[118:121], v5                 ; 16 bytes from addr v5
+ds_read_b128 v[114:117], v6                 ; 16 bytes from addr v6
+
+; Additional XOR offsets used (lines 200-211):
+v_xor_b32_e32 v11, 32, v144                 ; 32
+v_xor_b32_e32 v12, 64, v144                 ; 64
+v_xor_b32_e32 v13, 0x60, v144               ; 96
+v_xor_b32_e32 v15, 0x460, v10               ; 1120
+v_xor_b32_e32 v16, 0x1020, v10              ; 4128
+v_xor_b32_e32 v17, 0x1460, v10              ; 5216
 ```
 
-### Stage 2: QK MFMA (lines 346-373)
+**KEY INSIGHT**: Triton uses TWO DIFFERENT swizzled addresses for each ds_read_b128 pair that form the 32-byte MFMA operand. The bitop3:0x36 is XOR (A⊕B⊕C).
+
+---
+
+## PROVEN FACT: ds_read_b64_tr_b8 for Transposed V Matrix
+
+**CLAIM**: Triton uses `ds_read_b64_tr_b8` for PV multiplication to read V matrix transposed directly from LDS.
+
+**EVIDENCE**: triton_fp8_fmha.s lines 679-682, 697-700
+
 ```asm
-; Read Q from LDS (pre-loaded at kernel start)
-ds_read_b128 v[70:73], v146                  ; Q tile 0
-ds_read_b128 v[66:69], v74                   ; Q tile 1
-ds_read_b128 v[160:163], v74 offset:4096     ; Q tile 2
-ds_read_b128 v[164:167], v146 offset:4096    ; Q tile 3
-
-; 4x K=64 MFMA for QK
-v_mfma_f32_32x32x64_f8f6f4 v[82:97], v[66:73], v[122:129], v[98:113]
-v_mfma_f32_32x32x64_f8f6f4 v[66:81], v[160:167], v[122:129], v[98:113]
-; ... 2 more after loading K tiles ...
-v_mfma_f32_32x32x64_f8f6f4 v[82:97], v[98:105], v[114:121], v[82:97]
-v_mfma_f32_32x32x64_f8f6f4 v[66:81], v[106:113], v[114:121], v[66:81]
-```
-
-### Stage 3: Online Softmax (lines 378-600)
-```asm
-; Row-wise max (using v_max3_f32 for efficiency!)
-v_max_f32_e32 v106, v83, v83
-v_max3_f32 v106, v106, v84, v85              ; Compare 3 at once
-v_max3_f32 v106, v106, v86, v87
-; ... continues for all 32 elements ...
-
-; Cross-lane reduction
-v_permlane32_swap_b32_e32 v106, v107         ; Swap between lane groups
-v_max_f32_e32 v106, v106, v107
-
-; Compute qk * scale - max
-v_fma_f32 v82, v143, v82, -v157              ; v143 = qk_scale
-
-; Exponential
-v_exp_f32_e32 v82, v82
-
-; Sum for normalization (interleaved with exp)
-v_add_f32_e32 v106, v82, v83
-v_add_f32_e32 v106, v84, v106
-```
-
-### Stage 4: PV MFMA (lines 679-724)
-```asm
-; Load V using TRANSPOSED reads (ds_read_b64_tr_b8)!
 ds_read_b64_tr_b8 v[74:75], v145
 ds_read_b64_tr_b8 v[76:77], v145 offset:1088
 ds_read_b64_tr_b8 v[78:79], v145 offset:4096
 ds_read_b64_tr_b8 v[80:81], v145 offset:5184
-
-; P conversion for FP8 (v_cndmask for packing)
-v_cndmask_b32_e32 v68, v69, v82, vcc
-
-; 4x K=64 MFMA for PV (output to different accumulator tiles)
-v_mfma_f32_32x32x64_f8f6f4 v[50:65], v[74:81], v[66:73], v[50:65]
-v_mfma_f32_32x32x64_f8f6f4 v[34:49], v[74:81], v[66:73], v[34:49]
-v_mfma_f32_32x32x64_f8f6f4 v[18:33], v[74:81], v[66:73], v[18:33]
-v_mfma_f32_32x32x64_f8f6f4 v[2:17], v[74:81], v[66:73], v[2:17]
 ```
 
-### Loop Control (lines 691, 705, 726)
-```asm
-s_add_i32 s8, s8, 64           ; k_offset += 64
-s_cmp_gt_i32 s19, s8           ; if (N_CTX > k_offset)
-s_cbranch_scc1 .LBB0_5         ; continue loop
-```
-
-### Key Optimizations in Triton
-
-| Optimization | Triton | Our Kernel |
-|--------------|--------|------------|
-| **MFMA K dim** | K=64 (2K FLOPs/cycle) | K=16 (1K FLOPs/cycle) |
-| **LDS read** | `ds_read_b128` (128-bit) | `ds_read_b64` (64-bit) |
-| **V read** | `ds_read_b64_tr_b8` (transposed) | N/A |
-| **Max reduce** | `v_max3_f32` (3-way) | `v_max_f32` (2-way) |
-| **Cross-lane** | `v_permlane32_swap_b32` | None |
-| **Full attention** | QK + softmax + PV | QK only |
-
-### LDS Layout
-```
-Offset 0:     Q tiles (16KB, loaded once at start)
-Offset 0:     K tile A (4KB, alternating)
-Offset 4096:  K tile B (4KB, alternating)
-              V uses same space as K after QK done
-```
-
-### VGPR Allocation
-```
-v[2:17]:   Output accumulator (tile 0)
-v[18:33]:  Output accumulator (tile 1)
-v[34:49]:  Output accumulator (tile 2)
-v[50:65]:  Output accumulator (tile 3)
-v[66:81]:  QK result / P values
-v[82:97]:  QK result (second tile)
-v[98:121]: Q data from LDS
-v[122:129]: K data from LDS
-v[139]:    l_i (sum accumulator)
-v[143]:    qk_scale constant
-v[157]:    m_i (max accumulator)
-```
-
-### Root Causes of Slow Performance
-
-1. **Using K=16 MFMA instead of K=64** (2x efficiency loss)
-   - Our: `v_mfma_f32_32x32x16_fp8_fp8` → 1K FLOPs/cycle
-   - Triton: `v_mfma_f32_32x32x64_f8f6f4` → 2K FLOPs/cycle
-
-2. **No K-loop** - only processing 1 K-tile per block
-
-3. **Potential bank conflicts** - pitch-136 has 2-way conflicts
-
-4. **No pipelining** - not overlapping memory with compute
+**NOTE**: The `_tr_b8` suffix indicates transposed 8-bit read. This avoids explicit transpose operations for FP8 matrices.
 
 ---
 
-## CORRECT GRID SIZE (CRITICAL)
+## ISSUE: Current Kernel LDS Addressing
 
-**MUST use full grid, not single block!**
+**CLAIM**: The code model's `fwd_fp8_k64_256t.s` uses simple linear LDS addressing that doesn't match K=64 MFMA requirements.
 
-```python
-# For shape (B, H, S, D) with Q_rows_per_block rows per block:
-grid_x = math.ceil(S / Q_rows_per_block)  # Q-tile blocks
-grid_y = B * H                             # batch × heads
-grid_z = 1
+**EVIDENCE**: fwd_fp8_k64_256t.s lines 125-137
 
-# Example: B=1, H=40, S=32130, Q_rows=128 (256T kernel)
-# grid = (252, 40, 1) = 10,080 blocks total
+```asm
+; Current pattern:
+v_and_b32_e32 v203, 31, v202         // lane % 32
+v_lshrrev_b32_e32 v204, 5, v202      // lane / 32
+v_lshlrev_b32_e32 v205, 7, v203      // (lane % 32) * 128
+v_lshlrev_b32_e32 v206, 5, v204      // (lane / 32) * 32
+v_add_u32_e32 v207, v205, v206       // base offset
+
+; This gives: addr = (lane % 32) * 128 + (lane / 32) * 32
+; Lane 0: addr = 0
+; Lane 1: addr = 128 (SAME BANK as lane 0!)
+; Lane 32: addr = 32
 ```
 
-**FLOPs Calculation:**
-```python
-# Full attention: QK + softmax + PV
-flops = 4 * B * H * S * S * D
+**PROBLEM 1**: Stride-128 causes 16x bank conflicts (128 bytes = 4 banks × 32 = full conflict cycle)
 
-# QK-only stage
-flops_qk = 2 * B * H * S * S * D
-```
+**PROBLEM 2**: The linear layout doesn't match ISA's interleaved thread-to-k mapping
 
 ---
 
-## HISTORICAL: Invalid 1617 TF/s Claim
+## ISSUE: K-tile Semantics Confusion
 
-The previous "1617 TF/s" was from single-block benchmark (grid=1,1,1).
-This is **INVALID** and does not represent real performance.
+**OBSERVATION**: Current kernel loads K[32 rows, 128 cols] per tile (4096 bytes), but the QK^T computation needs:
+- Q: [128 rows, 128 cols] loaded once per block
+- K: [S rows, 128 cols] loaded in chunks of 32 rows
 
-**Verification Results** (with random input):
+**CURRENT K-LOOP**: Iterates over 32-row K chunks, doing 2 MFMAs per chunk (first 64 cols, then second 64 cols of head_dim).
+
+**ACCUMULATION**: Each wave's v[80:95] accumulates the dot products. This accumulates Q×K^T correctly as:
 ```
-fwd_fp8_qk_preload:   394.6 TF/s - NUMERICALLY CORRECT ✓
-fwd_fp8_qk_4qtile_v2: 1584.9 TF/s - NUMERICALLY WRONG ✗
-```
-
-**4qtile_v2 Bug Evidence:**
-- All-ones input: [0,0]=512 (correct), but mean=3.23 (should be 512)
-- Contains impossible negative values (-60, -56, etc.) with all-ones input
-- Random input: kernel range [-2374, 1925] vs expected [-11, 11]
-- Only 128 occurrences per unique value (suggests output layout bug)
-
-**Root Cause (suspected):**
-- Output store addresses wrong for non-wave-0 threads
-- Or accumulator initialization bug
-- Or LDS addressing mismatch between waves
-
-### ACTUAL Best Kernel: `fwd_fp8_qk_preload.s`
-- **Performance**: 394.6 TF/s at H=40, SEQ=32128
-- **Numerics**: CORRECT (verified with random input)
-- **Layout**: pitch-136
-- **Architecture**: 1 Q-tile (32 rows) per block
-
-### Wave Redundancy Bug (HISTORICAL - DO NOT USE 4qtile_v2 UNTIL FIXED)
-**The Bug** (in fwd_fp8_qk_4qtile.s):
-- All 4 waves computed IDENTICAL MFMAs
-- v200 = tid % 64 made all waves use same addresses
-
-**Attempted Fix** (in fwd_fp8_qk_4qtile_v2.s):
-- Wave N → Q-tile N (each wave different 32 rows)
-- Achieves 1584 TF/s but NUMERICAL OUTPUT IS WRONG
-
-## CURRENT LAYOUT STRATEGY: PITCH-136
-
-### Summary
-- **Global Memory**: Row-major Q[128×128], K[seq×128] per block
-- **LDS Layout**: Pitch-136 (row stride = 136 bytes instead of 128)
-- **Load Method**: `buffer_load_dwordx4 ... offen` + `ds_write_b128`
-- **Read Method**: `ds_read_b64` (plain reads, no TR8/TR16)
-
-### Why Pitch-136?
-Bank conflict analysis for 64 threads, ds_read_b64 (8 bytes each):
-
-| Pitch | Banks Used | Max Hits/Bank | Status |
-|-------|------------|---------------|--------|
-| 128   | 4          | 16            | BAD (16-way) |
-| 132   | 34         | 2             | GOOD (2-way) |
-| 136   | 32         | 2             | GOOD (2-way) |
-| 140   | 54         | 2             | GOOD (2-way) |
-| 144   | 32         | 2             | GOOD (2-way) |
-| 256   | 2          | 32            | BAD (32-way) |
-
-**CORRECTION**: Pitch-136 has 2-way conflicts, not zero. This is still acceptable.
-
-The conflicts occur because `136 = 2*64 + 8`. For MFMA reads:
-- Lane L reads row (L % 32), k_offset = 8 * (L >= 32)
-- Example conflict: Lane 0 (row 0, off 0) and Lane 47 (row 15, off 8)
-  - Both map to bank 0: (0*136+0)/4%64 = 0, (15*136+8)/4%64 = 0
-
-**Bank Conflict Impact (measured with rocprof):**
-- SQ_LDS_BANK_CONFLICT: 2048 cycles per kernel
-- At small scale (seq=64): ~42.7% of kernel time
-- At target scale (seq=32128): ~22.3% of kernel time
-
-**Zero-Conflict Solutions Analyzed (2025-01-15):**
-
-1. **Diagonal Padding** `row * 136 + k_off + (row % 2) * 4`:
-   - Theoretically zero conflicts
-   - BUT: Write row != Read row (different thread mappings)
-   - Result: 6x slower, still shows bank conflicts
-   - NOT RECOMMENDED
-
-2. **XOR Swizzle** `(row * 144 + k_off) XOR (row * 4)`:
-   - Achieves 64/64 unique banks
-   - More complex but row-agnostic
-   - Requires XOR in both write AND read paths
-   - RECOMMENDED if pursuing zero conflicts
-
-**Conclusion**: 2-way conflicts with pitch-136 cause ~22% overhead at scale.
-Zero-conflict requires complex layout changes. May not be worth it vs optimizing
-other parts of the kernel (softmax, PV multiplication).
-
-### Address Formulas
-
-**Global Load (row-major):**
-```
-global_offset = row * 128 + col_chunk * 16
+sum over k in [0,127]: Q[m,k] × K[n,k]  (for each m in wave's 32 rows, n in 32 K rows)
 ```
 
-**LDS Write (pitch-136):**
-```
-lds_offset = BASE + row * 136 + col_chunk * 16
-```
+The K-loop semantics appear correct, but LDS addressing is wrong.
 
-**LDS Read for QK MFMA:**
-```
-mfma_row = (lane & 3) + ((lane >> 3) & 3) * 4 + ((lane >> 2) & 1) * 16
-k_half = 8 if lane >= 32 else 0
+---
 
-Q_addr = Q_LDS + mfma_row * 136 + k_half + k_iter * 16
-K_addr = K_LDS + mfma_row * 136 + k_half + k_iter * 16
-```
+## RECOMMENDED FIX FOR CODE MODEL
 
-### Load Pattern (MUST use buffer_load...lds)
+### Step 1: Fix LDS Stride
+Replace stride-128 with stride-132 or stride-136 to avoid bank conflicts:
 ```asm
-// Set up buffer descriptor
-s_mov_b32 s8, Q_ptr_lo
-s_mov_b32 s9, Q_ptr_hi  
-s_mov_b32 s10, -1              // size = max
-s_mov_b32 s11, 0x20000         // format
-
-// Set m0 for LDS destination
-s_mov_b32 m0, lds_base
-
-// Load 16 bytes per thread, m0 controls LDS dest
-buffer_load_dwordx4 v0, s[8:11], v_offset offen lds
-s_add_u32 m0, m0, stride       // advance LDS pointer
+; Write Q to LDS with stride-136:
+; addr = row * 136 + col
+v_mov_b32_e32 v250, 136
+v_mul_lo_u32 v251, row, v250
+v_add_u32_e32 addr, col, v251
 ```
 
-### Key Differences from BF16
-| Aspect | BF16 | FP8 Pitch-136 |
-|--------|------|---------------|
-| Element size | 2 bytes | 1 byte |
-| Pitch | Complex swizzle (0x408 wave stride) | Simple 136-byte pitch |
-| LDS base | 0x8200 | 0 (can use any base) |
-| Read type | ds_read_b64 (4 BF16) | ds_read_b64 (8 FP8) |
-| MFMA | 32x32x16 BF16 | 32x32x16 FP8 |
+### Step 2: Use Correct Thread-to-Data Mapping for ds_read
+For K=64 MFMA, each thread needs specific k-range data based on ISA layout:
+- Thread groups 0-15/32-47: Load columns for rows M=[0-15]
+- Thread groups 16-31/48-63: Load columns for rows M=[16-31]
 
-### LDS Layout Diagram (4-Q-tile architecture)
-```
-Offset    Region        Data
-0         Q_LDS_0       Q rows 0-31 (pitch-136, 4352 bytes)
-4352      Q_LDS_1       Q rows 32-63
-8704      Q_LDS_2       Q rows 64-95
-13056     Q_LDS_3       Q rows 96-127
-17408     K_LDS_A       K tile buffer A (double-buffered)
-21760     K_LDS_B       K tile buffer B
-          Total:        28672 bytes (~28KB)
-```
+### Step 3: Or Follow Triton's XOR Swizzle Pattern
+Replicate the bitop3:0x36 and XOR offset pattern from Triton assembly.
 
-### VGPR Allocation (per wave)
-```
-v[0:15]   - Output accumulator (16 VGPRs, 32×32 result)
-v[16:31]  - Pre-loaded Q data (16 VGPRs, 8×ds_read_b64)
-v[32:47]  - K data from LDS (16 VGPRs, 8×ds_read_b64)
-v[180+]   - Addresses, temps, wave offsets
-```
+---
 
-## PERFORMANCE RESULTS
+## PERFORMANCE BASELINE (verified)
 
-### Benchmark (H=40, d=128)
-| SEQ | Time (µs) | TF/s |
-|-----|-----------|------|
-| 2048 | 43.5 | 988 |
-| 4096 | 131.7 | 1304 |
-| 8192 | 499.1 | 1377 |
-| 16384 | 1702.8 | 1614 |
-| **32768** | **6799.3** | **1617** |
-
-### Comparison
 | Kernel | TF/s | Notes |
 |--------|------|-------|
-| **fwd_fp8_qk_4qtile_v2** | **1617** | BEST - 4 waves, 4 Q-tiles |
-| BF16 full attention | 987 | Reference target |
-| fwd_fp8_qk_multiblock | 388 | Single Q-tile per block |
-| fwd_fp8_qk_4qtile (buggy) | 405 | Wave redundancy bug |
+| BF16 ASM | 1016 | Reference |
+| Triton FP8 | 1294 | Target to beat |
+| FP8 ASM (untested) | ??? | fwd_fp8_k64_256t.s |
 
-## NEXT STEPS
+Target: >1300 TF/s (30% above BF16)
 
-### Priority 1: Add softmax + PV for full attention
-- QK stage is now fast enough (1617 TF/s)
-- Need online softmax (exp, max, sum)
-- Need P×V MFMA stage
-- Then can fairly compare with BF16 full attention
+---
 
-### Priority 2: buffer_load...lds optimization
-- BF16 uses direct global→LDS loads
-- Would reduce instruction count
-- Complex m0 setup required
+## PROVEN FACT: BF16 Reference Kernel LDS Pattern
 
-### Priority 3: Consider 8-Q-tile variant
-- 8 Q-tiles = 256 rows per block
-- Would need on-demand Q loading (not pre-loaded)
-- Tested: slower than 4-Q-tile due to LDS latency
+**CLAIM**: BF16 kernel uses m0-based swizzle with stride 0x2040 per load.
 
-## FP8 MFMA REGISTER LAYOUT (from AMD Matrix Calculator)
+**EVIDENCE**: fwd_hd128_bf16.s lines 180-270
 
-**For `v_mfma_f32_32x32x16_fp8_fp8`:**
-```
-A[row][k] mapping:
-  row (0-31) → lane % 32
-  k (0-3)    → v0 bytes [7:0], [15:8], [23:16], [31:24]
-  k (4-7)    → v1 bytes [7:0], [15:8], [23:16], [31:24]
-  k (8-15)   → same pattern but in lanes 32-63
+**PATTERN**:
+```asm
+; Base LDS offset per wave:
+s_mul_i32 s63, 0x408, s5           ; 0x408 = 1032 per wave
+s_add_u32 s63, 0x8200, s63         ; base = 33280 + wave_id * 1032
+s_mov_b32 m0, s63                  ; set m0 for buffer_load...lds
 
-For lane L, the A matrix values in registers are:
-  A[L % 32][0] = v0{L}.[7:0]
-  A[L % 32][1] = v0{L}.[15:8]
-  A[L % 32][2] = v0{L}.[23:16]
-  A[L % 32][3] = v0{L}.[31:24]
-  A[L % 32][4] = v1{L}.[7:0]
-  A[L % 32][5] = v1{L}.[15:8]
-  A[L % 32][6] = v1{L}.[23:16]
-  A[L % 32][7] = v1{L}.[31:24]
-  (k=8-15 uses same layout but on lanes 32-63)
+; Each load increments m0:
+buffer_load_dwordx4 v4, s[8:11], 0 offen lds
+s_add_u32 m0, 0x2040, m0           ; m0 += 8256
+
+; ds_read offsets (8-byte stride for BF16):
+ds_read_b64 v[160:161], v2
+ds_read_b64 v[162:163], v2 offset:8
+ds_read_b64 v[164:165], v2 offset:32
+ds_read_b64 v[166:167], v2 offset:40
+; Pattern: 0, 8, 32, 40, 64, 72, 96, 104
 ```
 
-**Formula (from calculator):**
-```
-A[i][k].block GPR: (floor(k / 4) % 2).[8*(k % 4)+7 : 8*(k % 4)]
-A[i][k].block Lane: 32 * floor(k / 8) + i
-```
+**KEY CONSTANTS**:
+- 0x8200 = 33280 (base LDS offset for Q storage)
+- 0x408 = 1032 (per-wave stride ≈ 32 rows × 32 stride + padding)
+- 0x2040 = 8256 (load stride ≈ 64 rows × 129 effective stride)
 
-**TR8 UNDERSTANDING:**
-- TR8 is a cooperative instruction that gathers data across LDS
-- It expects data stored in MFMA-compatible layout
-- The "8 identical values" behavior is correct - it's cross-lane gathering
+---
 
-## TR8 EXPERIMENTAL FINDINGS (2025-01-14) - SUPERSEDED
+## NEXT STEP FOR CODE MODEL
 
-**Status:** TR8 approach abandoned in favor of pitch-136 + ds_read_b64.
+1. **Test current kernel** - Run `test_multiblock.py` to see if it produces any output
+2. **If wrong results**: Focus on LDS addressing fix (stride-136 or XOR swizzle)
+3. **If crashes**: Check VGPR allocation, waitcnt placement
 
-**Reason:** TR8 requires matching diagonal write pattern in LDS. Our pitch-136 
-approach is simpler and achieves same bank-conflict-free result with 1617 TF/s.
+The kernel structure (multi-block, K-loop, 256T/4 waves) is correct. The main issue is likely LDS addressing pattern.
 
-**Historical Notes:**
-- TR8 kernels had numerical issues with arbitrary LDS layouts
-- BF16-style TR16 offsets didn't translate correctly to TR8
-- Pitch-136 proved more reliable and performant
+---
 
-## NUMERICAL VERIFICATION RESULTS (2025-01-15)
+## QUICK FIX: Simplest Path to Correct LDS Addressing
 
-**Rigorous testing with assigned GPU (HIP_VISIBLE_DEVICES=0)**
-
-### Test Results
-| Test | Expected | Kernel | Status |
-|------|----------|--------|--------|
-| All ones (seq=64) | 256.0 | 256.0 | ✓ PASS |
-| Random inputs | varies | matches | ✓ PASS |
-| Diagonal pattern | identity | identity | ✓ PASS |
-| Single row active | 128.0 | 128.0 | ✓ PASS |
-
-### Correlation Analysis (Random Inputs)
-```
-Direct correlation: 0.0623 (different output order)
-Sorted correlation: 1.0000 (same values!)
-Mean abs diff (sorted): 0.000032 (FP8 precision)
-Ref unique values: 1024
-Out unique values: 1024
-```
-
-**Conclusion**: Kernel is numerically correct. Output values match reference exactly,
-just in different order due to MFMA accumulator layout.
-
-## KEY LESSON: Wave Utilization is Critical
-
-**The 4x Speedup Bug:**
-When using 4 waves (256 threads), ensure each wave does DIFFERENT work:
+Instead of implementing full XOR swizzle, try **stride-136** for FP8:
 
 ```asm
-// BAD: All waves do same work
-v_and_b32 v200, 63, v0      // v200 = tid % 64 (same for all waves!)
+; Q LDS layout: 128 rows × 128 cols at stride-136
+; Total: 128 × 136 = 17408 bytes (fits in 20KB LDS)
 
-// GOOD: Each wave handles different Q-tile
-v_lshrrev_b32 v201, 6, v0   // v201 = wave_id (0-3)
-// Use v201 to offset Q addresses per wave
+; Write: row * 136 + col
+v_mov_b32_e32 v250, 136
+v_mul_lo_u32 v251, row_idx, v250
+v_add_u32_e32 lds_addr, col_idx, v251
+
+; Read for MFMA: need to gather correct k-range per thread
+; Thread t needs k-range based on ISA layout
 ```
 
-This bug caused 3 out of 4 waves to be wasted, reducing performance by 4x.
+**WHY 136?**: 
+- 136 = 128 + 8 (padding of 8 bytes)
+- 136 / 4 = 34 (not divisible by 32 banks)
+- Bank(addr) = (addr / 4) % 32
+- Row 0 col 0: bank 0
+- Row 1 col 0: bank 34 % 32 = 2
+- Row 2 col 0: bank 68 % 32 = 4
+- No conflicts!
 
-## TRITON AMD BACKEND ANALYSIS (2025-01-15)
+**ALTERNATIVE 132**:
+- 132 = 128 + 4
+- 132 / 4 = 33
+- Bank pattern: 0, 1, 2, 3, ... (perfect distribution)
 
-### Triton's FP8 Swizzle Approach for gfx950 (CDNA4)
+---
 
-**Key Instruction:** `ds_read_tr8_b64` (not TR64)
+## PROVEN FACT: Triton Diagonal Padding Strategy (from triton_padding_analysis.py)
 
-```cpp
-// From triton TargetInfo.cpp - For FP8 (8-bit):
-instBitWidth = 64;            // 64 bits = 8 FP8 elements per instruction
-tileSize = 8;                 // 8 elements must be contiguous in LDS
-numLanesInShuffleGroup = 16;  // 16 lanes cooperate (warpSize/4 = 64/4)
+**CLAIM**: Triton uses diagonal padding to achieve zero bank conflicts, not simple stride padding.
+
+**EVIDENCE**: `hsa/gfx950/fmha_v3_fwd_fp8/low_priority/triton_padding_analysis.py`
+
+**KEY PARAMETERS**:
+```
+warp_size = 64
+vec_size = 8 bytes (FP8 vector load)
+padding_interval = warp_size × vec_size = 512 bytes
+row_size = 128 bytes (head_dim=128, FP8=1 byte)
+padding = kWidth = 8 bytes (for FP8 k-contiguous)
+wrap = min(row_size, 128) / padding = 128 / 8 = 16
 ```
 
-### Triton's Diagonal Padding Strategy
+**DIAGONAL ROW LAYOUT IN LDS**:
+```
+Rows are NOT stored linearly. They're arranged diagonally:
+r0,  r4,  r8,  r12, r16, r20, r24, r28
+pad, r1,  r5,  r9,  r13, r17, r21, r25
+r29, pad, r2,  r6,  r10, r14, r18, r22
+r26, r30, pad, r3,  ...
 
-Instead of simple pitch-based layout, triton uses **diagonal padding** for bank conflict avoidance:
-
-```cpp
-// From triton Utility.cpp - Row arrangement in LDS:
-//  r0,  r4, r8, r12, r16, r20, r24, r28
-// pad,  r1, r5,  r9, r13, r17, r21, r25
-// r29, pad, r2,  r6, r10, r14, r18, r22
-// r26, r30, pad, r3 ....
+This creates different bank offsets for each row group.
 ```
 
-**Padding Parameters:**
-- Padding interval: `warpSize * vecSize = 64 * 8 = 512 bytes`
-- Each row group wraps diagonally to avoid bank conflicts
-- Works with `ds_read_b128` (16 bytes) or `ds_read_b64` (8 bytes)
+**ADDRESS FORMULA**:
+```
+group = row % wrap                    ; which diagonal group (0-15)
+pos_in_group = row / wrap             ; position within group
+diagonal_shift = group * padding      ; shift for this group
+addr = pos_in_group * (row_size + padding) + diagonal_shift + col
 
-### Linear Layout for ds_read_tr8_b64
-
-For `mfma_f32_32x32x16_fp8_fp8` (kWidth=16, mDim=32):
-
-```cpp
-// Register ownership - what elements thread 0 holds:
-registerBase = {
-    {1, 0},   // bit 0 of register → row +1
-    {2, 0},   // bit 1 of register → row +2
-    {4, 0},   // bit 2 of register → row +4
-    {0, 16},  // bit 3 of register → col +16
-    {0, 64},  // bit 4 of register → col +64 (for k > 64)
-    {0, 128}  // bit 5 of register → col +128 (for k > 128)
-}
-
-// Lane dimension - what elements are in register 0 of each lane:
-laneBase = {
-    {0, 1},   // lane bit 0 → col +1
-    {0, 2},   // lane bit 1 → col +2
-    {0, 4},   // lane bit 2 → col +4
-    {0, 8},   // lane bit 3 → col +8
-    {8, 0},   // lane bit 4 → row +8
-    {0, 32}   // lane bit 5 → col +32
-}
+Simplified: addr = row * pitch + col + (row % period) * shift
 ```
 
-### TR8 Transpose Operation
-
-`ds_read_tr8_b64` performs a cooperative transposed load:
-1. **Input:** 8×16 tile in LDS (8 rows × 16 columns of FP8)
-2. **Operation:** 16 consecutive lanes load 64 bits each
-3. **Output:** Transposed - lane i receives column i from input
-
+**ZERO-CONFLICT COMBINATIONS** (from analysis):
 ```
-Loaded tile (input):      After transpose (output):
-    K0  K1  ... K15           R0  R1  R2  R3
-M0[ ............... ]   =>  T0 [ .   .   .   . ]
-M1[ ............... ]       T1 [ .   .   .   . ]
-M2[ ............... ]       ...
-M7[ ............... ]       T15[ .   .   .   . ]
+pitch=136, period=8, shift=64  → 0 bank conflicts
+pitch=144, period=4, shift=32  → 0 bank conflicts
 ```
 
-### Triton vs Our Approach
-
-| Aspect | Triton (gfx950 actual) | Our Pitch-136 |
-|--------|------------------------|---------------|
-| **Write pattern** | XOR swizzle (`v_bitop3_b32`) | Row + 8-byte pad |
-| **Read instruction** | `ds_read_u8` (byte-by-byte!) | `ds_read_b64` |
-| **Packing** | Manual with `v_or_b32` | Direct 64-bit read |
-| **Bank conflicts** | Zero (XOR swizzle) | 2-way (pitch) |
-| **Instruction count** | Higher (byte ops) | Lower (64-bit ops) |
-
-### ACTUAL Triton FP8 Strategy (from dumped assembly)
-
-**Surprising finding:** Triton does NOT use `ds_read_tr8_b64` for FP8 on gfx950!
-
-Instead:
+**ASM IMPLEMENTATION**:
 ```asm
-; Triton reads FP8 bytes individually:
-ds_read_u8 v16, v10 offset:1024
-ds_read_u8 v17, v10 offset:1026
-ds_read_u8 v23, v10 offset:1028
-...
+; For pitch=136, period=8, shift=64:
+; addr = row * 136 + col + (row % 8) * 64
 
-; Then packs them manually:
-v_lshlrev_b16_e32 v31, 8, v31
-v_or_b32_e32 v23, v23, v31
-v_or_b32_sdwa v24, v24, v32 dst_sel:WORD_1 ...
-v_or_b32_sdwa v17, v23, v24 ...  ; Final packed FP8x8
-
-; Then feeds to MFMA:
-v_mfma_f32_32x32x16_fp8_fp8 a[0:15], v[16:17], v[12:13], 0
+v_mul_lo_u32 v_addr, v_row, 136       ; row * pitch
+v_add_u32 v_addr, v_addr, v_col       ; + col
+v_and_b32 v_tmp, v_row, 7             ; row % 8 (period-1)
+v_lshlrev_b32 v_tmp, 6, v_tmp         ; * 64 (shift)
+v_add_u32 v_addr, v_addr, v_tmp       ; + diagonal shift
 ```
 
-**Address calculation uses XOR swizzle:**
+**LDS USAGE**:
+- With pitch=136: 128 rows × 136 bytes = 17,408 bytes
+- Plus diagonal shifts: max additional ~512 bytes
+- Total: ~18KB (fits in 64KB LDS)
+
+---
+
+## RECOMMENDED IMPLEMENTATION FOR CODE MODEL
+
+**Option A: Simple Stride-132 (easiest)**
 ```asm
-v_bitop3_b32 v6, v10, v8, s8 bitop3:0x6c  ; 3-input XOR pattern
+; addr = row * 132 + col
+v_mov_b32 v250, 132
+v_mul_lo_u32 v_addr, v_row, v250
+v_add_u32 v_addr, v_addr, v_col
 ```
+- LDS: 128 × 132 = 16,896 bytes
+- Bank pattern: 0, 1, 2, 3, ... (perfect)
 
-This approach:
-- Trades instruction count for simpler layout
-- Avoids TR8's complex diagonal requirements
-- Uses XOR-based swizzle for bank conflict avoidance
-
-### TRITON FP8 PERFORMANCE BENCHMARK (MI350 gfx950)
-
-Tested 2025-01-15:
-```
-Config                         FP8 TF/s     FP16 TF/s    BF16 TF/s    FP8/FP16  
-B=1, H=40, S=4096              1046.6       584.5        607.1        1.79x
-B=1, H=40, S=8192              1234.6       613.4        646.6        2.01x
-B=1, H=40, S=16384             1259.6       633.3        667.5        1.99x
-B=1, H=1, S=32130              765.1        480.4        481.0        1.59x
-B=1, H=40, S=32130             1293.9       649.6        668.1        1.99x
-```
-
-**CRITICAL INSIGHT:**
-- Triton FP8 achieves **1294 TF/s** at target shape (B=1, H=40, S=32130)
-- **2x speedup** over FP16/BF16 - FP8's theoretical 2x MFMA throughput is realizable!
-- Our BF16 ASM achieves 1016 TF/s for the same shape
-- **FP8 ASM TARGET: >1300 TF/s** (to match/beat Triton FP8)
-- Single-head case (H=1) is bandwidth-limited: only 765 TF/s
-
-### WHY TRITON FP8 IS 2x FASTER: Different MFMA Instruction!
-
-**From AMD CDNA4 ISA (amd-instinct-cdna4-instruction-set-architecture.txt):**
-
-Two FP8 MFMA instruction families exist on gfx950:
-
-**1. Legacy FP8: `V_MFMA_F32_{*}_FP8_FP8`** (what we use)
-| Size | K | Cycles | VGPRs |
-|------|---|--------|-------|
-| 32x32x16 | 16 | 32 | 1+1 |
-
-**2. Unified F8F6F4: `V_MFMA_F32_32x32x64_F8F6F4`** (what Triton uses)
-| Size | K | Cycles | VGPRs |
-|------|---|--------|-------|
-| 32x32x64 | 64 | 64 | 8+8 |
-
-**Format selection (CBSZ/BLGP bits):**
-- `3'b000` = E4M3 (FP8) ← what we need
-- `3'b001` = E5M2 (BF8)
-- `3'b010` = E2M3 (FP6)
-- `3'b100` = E2M1 (FP4)
-
-**Efficiency comparison:**
-| Instruction | FLOPs | Cycles | FLOPs/cycle |
-|-------------|-------|--------|-------------|
-| `32x32x16_fp8_fp8` | 32K | 32 | **1K** |
-| `32x32x64_f8f6f4` | 128K | 64 | **2K** |
-
-**The F8F6F4 instruction is 2x more efficient per cycle!**
-
-**OUTPUT PRECISION: IDENTICAL (F32)**
-Both instructions accumulate into F32 (32-bit float):
-| Instruction | Input (A, B) | Output (C, D) |
-|-------------|--------------|---------------|
-| `V_MFMA_F32_32x32x16_FP8_FP8` | FP8 | **F32** (16 VGPRs) |
-| `V_MFMA_F32_32x32x64_F8F6F4` | FP8 | **F32** (16 VGPRs) |
-
-The `F32` in instruction name = accumulator/output type. No precision loss when
-switching instructions - both do FP8×FP8→F32 multiply-accumulate.
-
-**ROOT CAUSE OF OUR SLOW PERFORMANCE:**
-We're using `v_mfma_f32_32x32x16_fp8_fp8` (K=16, 32 cycles, 1K FLOPs/cycle)
-Triton uses `v_mfma_f32_32x32x64_f8f6f4` (K=64, 64 cycles, 2K FLOPs/cycle)
-
-### Triton FP8 Pattern (from /tmp/triton_fmha_fp8_gfx950.s)
+**Option B: Diagonal Padding (matches Triton)**
 ```asm
-; QK MFMA with ds_read_b128 for K operand:
-ds_read_b128 v[68:71], v145
-ds_read_b128 v[64:67], v72
-v_mfma_f32_32x32x64_f8f6f4 v[80:95], v[64:71], v[120:127], v[96:111]
+; addr = row * 136 + col + (row & 7) << 6
+v_mul_lo_u32 v_addr, v_row, 136
+v_add_u32 v_addr, v_addr, v_col
+v_and_b32 v_tmp, v_row, 7
+v_lshlrev_b32 v_tmp, 6, v_tmp
+v_add_u32 v_addr, v_addr, v_tmp
+```
+- LDS: ~18KB
+- Matches Triton's strategy exactly
 
-; P×V MFMA with ds_read_b64_tr_b8 for V operand (transposed!):
-ds_read_b64_tr_b8 v[72:73], v144
-ds_read_b64_tr_b8 v[74:75], v144 offset:1088
-ds_read_b64_tr_b8 v[76:77], v144 offset:4096
-ds_read_b64_tr_b8 v[78:79], v144 offset:5184
-v_mfma_f32_32x32x64_f8f6f4 v[48:63], v[72:79], v[64:71], v[48:63]
+**RECOMMENDATION**: Start with Option A (stride-132) for simplicity. If performance is insufficient, switch to Option B.
+
+---
+
+## VERIFIED: Bank Conflict Analysis (test_bank_conflicts.py)
+
+**TEST RESULTS** (run on 2025-01-18):
+```
+| Pattern              | Max Bank Conflict |
+|----------------------|-------------------|
+| Current (stride-128) | 32x (TERRIBLE!)   |
+| Stride-132           | 0x (PERFECT!)     |
+| Stride-136           | 2x                |
+| Diagonal patterns    | 2-4x              |
 ```
 
-**ACTION REQUIRED:**
-1. Switch from `v_mfma_f32_32x32x16_fp8_fp8` to `v_mfma_f32_32x32x64_f8f6f4`
-2. Use `ds_read_b64_tr_b8` for transposed operands (like V in P×V)
-3. Use `ds_read_b128` for non-transposed operands (like K in QK)
+**STRIDE-132 IS THE CLEAR WINNER** - zero bank conflicts with simple implementation.
 
-### Key Triton Files for Reference
+**CURRENT PERFORMANCE**:
+- Kernel runs at 474 TF/s (with 32x bank conflicts)
+- Target: 1294 TF/s (Triton)
+- Expected improvement: ~2-3x from eliminating bank conflicts
 
-```
-triton/third_party/amd/lib/TritonAMDGPUToLLVM/MemoryOpToLLVM.cpp
-  - lowerDsReadTr() - generates ds_read_tr8_b64 calls
-  - TransLocalLoadOpConversion - pattern matching
+---
 
-triton/third_party/amd/lib/TritonAMDGPUTransforms/Utility.cpp
-  - composePaddedLayoutForAsyncCopyCDNA4() - diagonal padding logic
+## EXACT CODE CHANGES FOR CODE MODEL
 
-triton/lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp
-  - chooseDotDsReadTrLayout() - compute layout for ds_read_tr
-```
+**File**: `fwd_fp8_k64_256t.s`
 
-### Triton's FP8 MFMA Support
-
-```cpp
-// From MfmaGroup.cpp - FP8 MFMA variants:
-mfma_f32_32x32x16_fp8_fp8  // 32×32 output, k=16, uses 8 lanes
-mfma_f32_16x16x32_fp8_fp8  // 16×16 output, k=32, uses 8 lanes
-```
-
-### KEY LEARNING: Write Row != Read Row Problem (2025-01-15)
-
-**Critical Discovery from Diagonal Padding Experiment:**
-
-When we tried Triton's diagonal padding formula `addr = row * 136 + k_off + (row % 2) * 4`:
-
-```
-Write path: row = tid / 8          (32 rows, 8 threads per row for 128-byte row)
-Read path:  row = mfma_lane_mapping (complex formula based on MFMA operand layout)
-```
-
-**These are DIFFERENT row indices!** This causes:
-- Data written at diagonal offset based on `tid / 8`
-- Data read using diagonal offset based on MFMA lane mapping
-- Result: Cache misses, wrong data, 6x slowdown (66.7 TF/s vs 394 TF/s)
-
-**Why Triton Works:**
-- Triton's LinearLayout system ensures write and read use **identical** thread-to-element mappings
-- The `chooseDotDsReadTrLayout()` computes layout that matches MFMA expectations
-- Both write (from global) and read (for MFMA) use same linear layout formula
-
-**Why Our Diagonal Padding Failed:**
-- We applied row-based shift but row definition differs between write/read
-- Write uses simple `tid / 8` for 256 threads filling 32×128 tile
-- Read uses complex MFMA mapping: `(lane & 3) + ((lane >> 3) & 3) * 4 + ...`
-
-**Solutions:**
-1. **XOR swizzle** - `(row * pitch + col) XOR (row * shift)` is more robust
-   - Applied to final address, not row-dependent
-   - Same XOR applies regardless of which "row" formula is used
-2. **Match thread mappings** - Rewrite LDS write to use MFMA-compatible layout
-   - Complex, requires understanding MFMA fragment ownership
-   - What Triton does with LinearLayout
-
-### Implications for Code Model
-
-1. **Our pitch-136 is valid** - simpler approach, 2-way conflicts (~22% overhead)
-2. **TR8 requires matching write pattern** - can't use with arbitrary LDS layout  
-3. **Diagonal padding requires thread mapping consistency** - not just row math
-4. **XOR swizzle is more robust** for hand-written ASM
-5. **Current approach is acceptable** - focus on softmax/PV stages instead
-
-### If Implementing Zero-Conflict Layout
-
-**Option A: XOR Swizzle (Recommended for ASM)**
+### Change 1: Update LDS constants (line ~30-32)
 ```asm
-// Write: addr = (row * 144 + col) XOR (row * 4)
-// Read:  addr = (mfma_row * 144 + k_off) XOR (mfma_row * 4)
-// Both use same formula, just with their respective row index
+; OLD:
+.set Q_LDS, 0           // 128 rows × 128 cols = 16384 bytes
+.set K_LDS, 16384       // 32 rows × 128 cols = 4096 bytes
+.set LDS_SIZE, 20480    // 20KB total
+
+; NEW:
+.set Q_STRIDE, 132      // bytes per row (was 128)
+.set Q_LDS, 0           // 128 rows × 132 cols = 16896 bytes
+.set K_LDS, 16896       // 32 rows × 132 cols = 4224 bytes  
+.set LDS_SIZE, 21120    // ~21KB total
 ```
 
-**Option B: Triton-Style (Complex)**
-- Would need to rewrite LDS write using MFMA-compatible thread mapping
-- Essentially duplicating Triton's LinearLayout in ASM
-- Not recommended for hand-written code
+### Change 2: Q write pattern (line ~88-108)
+Current code writes 64 bytes per thread linearly. Need to write with stride-132:
+```asm
+; Thread tid writes row (tid*64/128) = tid/2, col_start = (tid*64)%128
+; With stride-132: addr = (tid/2) * 132 + (tid%2) * 64
 
-**Recommendation:** Keep pitch-136 with 2-way conflicts. The 22% overhead at target scale
-is acceptable. Focus optimization on:
-1. Adding softmax + P×V for full attention
-2. Memory bandwidth optimization (buffer_load...lds)
-3. Instruction scheduling improvements
+; Compute row and col
+v_lshrrev_b32_e32 v_row, 1, v200      ; tid / 2 = row
+v_and_b32_e32 v_col, 1, v200          ; tid % 2
+v_lshlrev_b32_e32 v_col, 6, v_col     ; (tid % 2) * 64 = col_start
 
-## NEVER USE
-- `flat_load_*` - higher latency, no LDS direct path
-- `flat_store_*` - use `buffer_store_*` instead
-- TR8/TR16 without matching diagonal write pattern
-- Row-major pitch-128 (severe bank conflicts)
+; LDS addr = row * 132 + col_start
+v_mov_b32_e32 v250, 132
+v_mul_lo_u32 v_addr, v_row, v250
+v_add_u32_e32 v_addr, v_addr, v_col
+v_add_u32_e32 v_addr, Q_LDS, v_addr
+```
 
-## FILES REFERENCE
-- **Best kernel**: `fwd_fp8_qk_4qtile_v2.s` (1617 TF/s, correct, 4 Q-tiles)
-- Multi-block: `fwd_fp8_qk_multiblock.s` (388 TF/s, proper memory partitioning)
-- Buggy version: `fwd_fp8_qk_4qtile.s` (wave redundancy bug)
-- BF16 reference: `fwd_hd128_bf16.s` (987 TF/s full attention)
+### Change 3: Q read pattern (line ~143)
+```asm
+; OLD: v_lshlrev_b32_e32 v206, 7, v205   ; row * 128
+; NEW:
+v_mov_b32_e32 v250, 132
+v_mul_lo_u32 v206, v205, v250           ; row * 132
+```
 
-## COMMIT HISTORY
-- `e3c4c7f53`: Analysis: Triton padding strategy and diagonal padding experiments
-- `0156e9b5e`: FP8 FMHA: Fix wave redundancy bug, achieve 1617 TF/s
-- `edc9c91df`: Add multi-block kernel with proper memory partitioning
-- `e130899ed`: Add triton AMD backend analysis
+### Change 4: K read pattern (line ~162)
+```asm
+; OLD: row * 128 implicit
+; NEW:
+v_mov_b32_e32 v250, 132
+v_mul_lo_u32 v_k_base, v_row, v250      ; row * 132
+v_add_u32_e32 v214, K_LDS, v_k_base
+```
+
+### Change 5: K write pattern (wherever K is written to LDS)
+Same stride-132 adjustment for K tile writes.
+
+---
+
+## ANALYSIS UPDATE: Triton XOR Swizzle (2025-01-18)
+
+**SURPRISING FINDING**: Even Triton's XOR swizzle has 8x bank conflicts per read!
+
+From `analyze_triton_swizzle.py`:
+```
+Max bank conflict for addr1: 8x
+Max bank conflict for addr2: 8x
+```
+
+**HOW TRITON HANDLES THIS**:
+1. Issues 4 separate `ds_read_b128` with different XOR offsets (0, 32, 64, 96)
+2. The 8x conflicts are spread across 4 reads, so ~2x per read
+3. Uses `ds_read_b128` (128-bit) which accesses 4 consecutive banks
+
+**TRITON'S 4KB SECTION LAYOUT**:
+```
+Section 0: offset 0     → 32 rows (Q rows 0-31)
+Section 1: offset 4096  → 32 rows (Q rows 32-63)
+Section 2: offset 8192  → 32 rows (Q rows 64-95)
+Section 3: offset 12288 → 32 rows (Q rows 96-127)
+```
+
+**KEY INSIGHT**: Triton uses power-of-2 (128-byte) rows with 4KB section boundaries.
+The XOR swizzle reduces but doesn't eliminate bank conflicts.
+
+---
+
+## QUESTION FOR USER
+
+Previous stride-132/136 attempts had issues with "full attention with 4 waves, multiple blocks, Q and K tiles."
+
+**What specific issues occurred?**
+1. Numerical errors (wrong output)?
+2. Crashes/hangs?
+3. Performance regression?
+4. LDS size overflow?
+5. Alignment issues at wave/block boundaries?
+
+Knowing the specific failure mode will help identify the root cause.
+
+---
+
+## DEBUG ANALYSIS: "Thread 16 outputs col 15" Issue (from multiblock.path)
+
+**VERIFIED CORRECT** (via debug_k_mapping.py):
+1. K write: Thread 128 writes K[16, 0:15] to K_LDS + 2048 ✓
+2. K read: Lane 16 computes row=16, reads from K_LDS + 2048 ✓
+3. Row formula: `row = (lane & 15) + ((lane >> 4) & 1) << 4` is correct ✓
+4. k_off values: lanes 0-31 use k_off=0,32; lanes 32-63 use k_off=16,48 ✓
+
+**THE BUG MUST BE ELSEWHERE**. Possibilities:
+
+1. **MFMA output layout mismatch**: The 16 VGPRs v[80:95] output mapping might differ from expected
+   - Need to verify which VGPR holds which (row, col) of the 32x32 output
+
+2. **Identity test input construction**: If the test creates Q/K with wrong layout:
+   - Check if Q/K use [B,H,S,D] or [B,S,H,D] layout
+   - Check if FP8 quantization shifts values
+
+3. **ds_read_b128 byte order**: The 16 bytes read might be reordered
+   - FP8 packing: 8 values per 32-bit VGPR
+   - Check if byte 0 maps to lane's k=0 or k=7
+
+4. **Q write pattern mismatch**: 
+   - Q uses 64 bytes/thread (rows interleaved differently than K)
+   - Row r written by threads 2r and 2r+1
+   - Verify this matches MFMA Q operand expectations
+
+**MFMA OUTPUT LAYOUT** (from .lessons):
+```
+Thread t outputs to column (t % 32).
+Thread 16 → column 16.
+
+Row determined by VGPR index (interleaved):
+- Threads 0-31 write rows: 0-3, 8-11, 16-19, 24-27
+- Threads 32-63 write rows: 4-7, 12-15, 20-23, 28-31
+```
+
+**IF THREAD 16 OUTPUTS TO COL 15**, the issue is likely:
+1. Output storage indexing is off-by-one
+2. Test verification reads wrong column
+3. Or the Q/K identity data is constructed with offset
+
+**RECOMMENDED DEBUG FOR CODE MODEL**:
+```python
+# In test_multiblock.py, add:
+# 1. Print raw Q_fp8 and K_fp8 patterns:
+print(f"Q_fp8[0,0,0:32,0:32] non-zero positions")
+print(f"K_fp8[0,0,0:32,0:32] non-zero positions")
+
+# 2. Test with S=32 (single K-tile) first
+
+# 3. Store thread metadata to output for verification:
+# Modify kernel to write: output[tid] = float(lane_id | (row << 8) | (col << 16))
+```
+
+**KEY INSIGHT**: The "col 15 vs col 16" error suggests **off-by-one in N dimension**, not M (row). Check how the test verifies output columns.
+
+---
+
+## VERIFIED BUG: Wave Offset Not Applied (test_identity_debug.py)
+
+**TEST RESULT** (S=32, single K-tile):
+```
+Wave 0: Correct identity pattern (1.0 at expected positions)
+Wave 1: SAME pattern as Wave 0 (BUG: should be zeros/different!)
+Wave 2: Wrong values (1.875)
+Wave 3: Empty
+```
+
+**ROOT CAUSE**: Waves 1-3 are reading from same Q data as Wave 0!
+
+**SUSPECTED ISSUE** in `fwd_fp8_k64_256t.s` line 152-154:
+```asm
+// Q LDS base = Q_LDS + wave_id * 4096 (32 rows × 128 bytes)
+v_lshlrev_b32_e32 v209, 12, v201     // wave_id * 4096
+v_add_u32_e32 v209, Q_LDS, v209      // Q base for this wave
+```
+
+**CHECK**: Is `v201` correctly set to wave_id?
+Look at line ~81: `v_lshrrev_b32_e32 v201, 6, v200  // wave_id = tid / 64`
+
+**POSSIBLE FIXES**:
+1. Verify v201 contains wave_id (0-3) not lane_id
+2. Check if v201 is clobbered before use at line 153
+3. Add debug: store wave_id to output to verify
+
+**VERIFIED**: v201 is NOT modified between lines 81 and 153.
+
+**ALTERNATIVE THEORY**: The test with S=32 is too small!
+- Q global memory: only 32×128 = 4096 bytes
+- Thread 64+ loads from offset 4096+ (out of bounds → garbage/zeros)
+- LDS bytes 4096-16383 contain garbage, NOT valid Q data
+- Wave 1 reading garbage should NOT produce same pattern as wave 0
+
+**IF wave 1 shows same pattern as wave 0**, the wave offset (v201×4096) is NOT being applied.
+
+**CODE MODEL TODO**: 
+1. Add test with S=128 (full Q tile) to verify multi-wave works
+2. Or add debug kernel that stores wave_id: `buffer_store_dword v201, ...`
+
+---
+
+## CRITICAL BUG FOUND: K-loop Accumulates Wrong Dimension! (test_full_qblock.py)
+
+**TEST RESULT** (S=128, 4 K-tiles):
+```
+Wave 0, Lane 0 (Q row 0): [1, 0, 0, 0]... - 1.0 at acc[0]
+Wave 1, Lane 0 (Q row 32): [1, 0, 0, 0]... - 1.0 at acc[0]!
+Wave 2, Lane 0 (Q row 64): [1, 0, 0, 0]... - 1.0 at acc[0]!
+Wave 3, Lane 0 (Q row 96): [1, 0, 0, 0]... - 1.0 at acc[0]!
+```
+
+**PROBLEM**: ALL waves show 1.0 at acc[0], but:
+- Q row 32 should output 1.0 at col 32, not col 0!
+- Q row 64 should output 1.0 at col 64!
+- Q row 96 should output 1.0 at col 96!
+
+**ROOT CAUSE**: The K-loop ACCUMULATES across K-tiles instead of outputting separately!
+
+```asm
+K_LOOP:
+    // Load K-tile (different K rows each iteration)
+    // ...
+    // MFMA accumulates into v[80:95]
+    v_mfma_f32_32x32x64_f8f6f4 v[80:95], ..., v[80:95]  // WRONG: keeps adding!
+    // ...
+    s_cbranch K_LOOP
+```
+
+**CORRECT DESIGN FOR QK^T**:
+- K-loop iterates over K-tiles (different 32-row chunks of K)
+- Each K-tile produces 32 OUTPUT COLUMNS of QK^T
+- Accumulators should be RESET per K-tile
+- Output should be STORED after each K-tile, not after all tiles
+
+**FIX OPTIONS**:
+1. **Single K-tile mode**: Only process one K-tile, output 32 cols. Grid includes K-tile dimension.
+2. **Multi-output store**: Store output after each K-tile to different locations.
+3. **Restructure**: Make K-loop iterate over head_dim chunks, not K-row chunks.
+
+**CURRENT KERNEL IS FOR GEMM ACCUMULATION, NOT ATTENTION QK^T!**
+
+---
+
+## PROVEN FACT: TR8 V-read base mapping (bank-conflict-free)
+
+**CLAIM**: For `ds_read_b64_tr_b8`, a bank-conflict-free base uses
+`base = (lane % 32) * 128 + (lane / 32) * 32`, with fixed offsets per TR8 read.
+
+**EVIDENCE**: `hsa/gfx950/fmha_v3_fwd_fp8/low_priority/fwd_fp8_k64_tr8.s`
+lines 80–90 show:
+```
+v_lshlrev_b32_e32 v205, 7, v203      // (lane % 32) * 128
+v_lshlrev_b32_e32 v206, 5, v204      // (lane / 32) * 32
+v_add_u32_e32 v207, v205, v206
+```
+
+---
+
+## PROVEN FACT: QK+PV scaffold throughput with K=16 PV
+
+**CLAIM**: The 2‑Q‑tile scaffold (512 threads, ping‑pong K/V LDS) with
+K=16 PV MFMA and TR8 base mapping runs in ~12.65 ms for the target shape.
+
+**EVIDENCE**: `test_scaffold.py` run (2026‑01‑18) output:
+```
+avg_ms: 12.649
+TF/s (equivalent full-attention): 1671.4
+TF/s (executed MFMA): 1679.5
+```

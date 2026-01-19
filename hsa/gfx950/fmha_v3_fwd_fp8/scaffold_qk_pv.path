@@ -1,0 +1,8 @@
+STATUS: testing
+APPROACH: QK + PV scaffold kernel (no softmax) to validate layout/load TF/s
+KEY_PARAMS: Q/K pitch=132, V row-major, K_TILE=32, grid=(Q, B*H, 1)
+TEST_RESULT:
+  - Build: PASS
+  - B=1 H=40 S=32130 D=128: 12.65 ms, 1671 TF/s eq, 1679 TF/s exec
+  - PV uses K=16 MFMA with TR8 base swizzle (bank-conflict-free)
+NEXT_STEP: Reduce MFMA count and pipeline to reach ≥2 PF/s.
