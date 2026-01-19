@@ -83,6 +83,8 @@ _fwd_fp8_scaffold:
     v_mov_b32_e32 v60, v0                // tid (0-511), keep for stores
     v_lshrrev_b32_e32 v9, 6, v60         // wave_id = tid / 64 (0-7)
     v_and_b32_e32 v10, 63, v60           // lane_id = tid % 64
+    v_and_b32_e32 v61, 0xFF, v60
+    v_lshlrev_b32_e32 v61, 4, v61        // (tid & 255) * 16 (prefetch vaddr)
 
     // ------------------------------------------------------------------------
     // Load Q tile to LDS (pitch=132)
@@ -157,6 +159,8 @@ _fwd_fp8_scaffold:
     v_add_u32_e32 v17, v17, v19          // Q base
 
     v_add_u32_e32 v58, v17, v14          // Q base + row
+    v_add_u32_e32 v24, v58, v11          // Q addr1 base
+    v_add_u32_e32 v25, v58, v12          // Q addr2 base
 
     // ------------------------------------------------------------------------
     // Initialize O accumulators (v[64:127])
@@ -181,8 +185,7 @@ _fwd_fp8_scaffold:
     s_mov_b32 s31, 0                     // K/V tile soffset
 
     // Preload tile 0 into buffer 0 (all threads, masked vaddr)
-    v_and_b32_e32 v13, 0xFF, v60
-    v_lshlrev_b32_e32 v13, 4, v13        // (tid & 255) * 16
+    v_mov_b32_e32 v13, v61
     s_mov_b32 m0, K_LDS0
     buffer_load_dwordx4 v13, s[12:15], s31 offen lds
     s_mov_b32 m0, V_LDS0
@@ -205,8 +208,6 @@ K_LOOP:
     v_cndmask_b32_e64 v56, v57, v56, vcc        // V base
 
     // Compute Q/K read addresses for this tile
-    v_add_u32_e32 v24, v58, v11                 // Q addr1
-    v_add_u32_e32 v25, v58, v12                 // Q addr2
     v_add_u32_e32 v26, v29, v18                 // K base + row
     v_add_u32_e32 v27, v26, v11                 // K addr1
     v_add_u32_e32 v28, v26, v12                 // K addr2
@@ -222,8 +223,7 @@ K_LOOP:
     s_cselect_b32 s37, s43, s42          // other V base
     s_add_u32 s38, s31, 4096             // next tile offset
 
-    v_and_b32_e32 v13, 0xFF, v60
-    v_lshlrev_b32_e32 v13, 4, v13        // (tid & 255) * 16
+    v_mov_b32_e32 v13, v61
     s_mov_b32 m0, s36
     buffer_load_dwordx4 v13, s[12:15], s38 offen lds
     s_mov_b32 m0, s37
@@ -235,7 +235,6 @@ PREFETCH_DONE:
     .irp i, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47
         v_mov_b32_e32 v\i, 0
     .endr
-
     ds_read_b128 v[0:3], v24
     ds_read_b128 v[4:7], v25
     ds_read_b128 v[16:19], v27
@@ -243,45 +242,12 @@ PREFETCH_DONE:
     s_waitcnt lgkmcnt(0)
     v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
 
-    v_add_u32_e32 v24, 64, v24
-    v_add_u32_e32 v25, 64, v25
-    v_add_u32_e32 v27, 64, v27
-    v_add_u32_e32 v28, 64, v28
-    ds_read_b128 v[0:3], v24
-    ds_read_b128 v[4:7], v25
-    ds_read_b128 v[16:19], v27
-    ds_read_b128 v[20:23], v28
+    ds_read_b128 v[0:3], v24 offset:64
+    ds_read_b128 v[4:7], v25 offset:64
+    ds_read_b128 v[16:19], v27 offset:64
+    ds_read_b128 v[20:23], v28 offset:64
     s_waitcnt lgkmcnt(0)
     v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
-
-    // Convert P (v[32:47]) to FP8 packed (v48-v55)
-    v_cvt_pk_fp8_f32 v48, v32, v33
-    v_and_b32_e32 v48, 0xFFFF, v48
-    v_cvt_pk_fp8_f32 v49, v34, v35
-    v_lshlrev_b32_e32 v49, 16, v49
-    v_and_b32_e32 v49, 0xFFFF0000, v49
-    v_or_b32_e32 v48, v48, v49
-
-    v_cvt_pk_fp8_f32 v49, v36, v37
-    v_and_b32_e32 v49, 0xFFFF, v49
-    v_cvt_pk_fp8_f32 v50, v38, v39
-    v_lshlrev_b32_e32 v50, 16, v50
-    v_and_b32_e32 v50, 0xFFFF0000, v50
-    v_or_b32_e32 v49, v49, v50
-
-    v_cvt_pk_fp8_f32 v50, v40, v41
-    v_and_b32_e32 v50, 0xFFFF, v50
-    v_cvt_pk_fp8_f32 v51, v42, v43
-    v_lshlrev_b32_e32 v51, 16, v51
-    v_and_b32_e32 v51, 0xFFFF0000, v51
-    v_or_b32_e32 v50, v50, v51
-
-    v_cvt_pk_fp8_f32 v51, v44, v45
-    v_and_b32_e32 v51, 0xFFFF, v51
-    v_cvt_pk_fp8_f32 v52, v46, v47
-    v_lshlrev_b32_e32 v52, 16, v52
-    v_and_b32_e32 v52, 0xFFFF0000, v52
-    v_or_b32_e32 v51, v51, v52
 
     // V tile already prefetched into LDS (ping-pong)
 
@@ -313,6 +279,21 @@ PREFETCH_DONE:
     ds_read_b64_tr_b8 v[40:41], v5 offset:32
     ds_read_b64_tr_b8 v[42:43], v5 offset:64
     ds_read_b64_tr_b8 v[44:45], v5 offset:96
+
+    // Convert P (v[32:47]) to FP8 packed (v48-v55)
+    v_cvt_pk_fp8_f32 v48, v32, v33
+    v_and_b32_e32 v48, 0xFFFF, v48
+    v_cvt_pk_fp8_f32 v49, v34, v35
+    v_lshlrev_b32_e32 v49, 16, v49
+    v_and_b32_e32 v49, 0xFFFF0000, v49
+    v_or_b32_e32 v48, v48, v49
+
+    v_cvt_pk_fp8_f32 v49, v36, v37
+    v_and_b32_e32 v49, 0xFFFF, v49
+    v_cvt_pk_fp8_f32 v50, v38, v39
+    v_lshlrev_b32_e32 v50, 16, v50
+    v_and_b32_e32 v50, 0xFFFF0000, v50
+    v_or_b32_e32 v49, v49, v50
     s_waitcnt lgkmcnt(0)
 
     v_accvgpr_write_b32 a0, v48

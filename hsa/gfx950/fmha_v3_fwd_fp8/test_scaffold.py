@@ -76,6 +76,9 @@ def main():
     grid = (num_q_blocks // 2, B * H, 1)
     block = (512, 1, 1)
     lds_bytes = 50176
+    waves_per_block = block[0] // 64
+    blocks = grid[0] * grid[1] * grid[2]
+    print(f"grid={grid}, block={block}, waves_per_block={waves_per_block}, blocks={blocks}")
 
     # Warmup
     for _ in range(3):
