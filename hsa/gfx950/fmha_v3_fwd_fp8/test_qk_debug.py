@@ -42,10 +42,11 @@ def decode_qk(raw, rows, cols):
     """Decode MFMA v32-v47 layout to row-major (rows x cols)."""
     decoded = torch.empty((rows, cols), dtype=torch.float32)
     raw_mat = raw.view(256, 16)
+    use_f = os.environ.get("DEBUG_DECODE_F", "0") == "1"
     for tid in range(256):
         lane = tid & 63
         wave = tid >> 6
-        col = lane & 31
+        col = (lane | (lane >> 1)) & 31 if use_f else (lane & 31)
         lane_hi = lane >> 5
         for i in range(16):
             row = (i % 4) + lane_hi * 4 + (i // 4) * 8
@@ -62,7 +63,26 @@ def main():
 
     dtype = torch.float8_e4m3fn
     torch.manual_seed(0)
-    if os.environ.get("DEBUG_IDENTITY", "0") == "1":
+    if os.environ.get("DEBUG_RANDOM_NONUNIFORM", "0") == "1":
+        Q_f32 = (torch.randn(B, H, Q_rows, D, device="cuda") * 0.05 + 0.02)
+        K_f32 = (torch.randn(B, H, K_rows, D, device="cuda") * 0.05 + 0.02)
+        q_row_scale = torch.linspace(0.6, 1.4, Q_rows, device="cuda").view(1, 1, Q_rows, 1)
+        q_col_scale = torch.linspace(0.7, 1.3, D, device="cuda").view(1, 1, 1, D)
+        k_row_scale = torch.linspace(1.3, 0.7, K_rows, device="cuda").view(1, 1, K_rows, 1)
+        k_col_scale = torch.linspace(0.8, 1.2, D, device="cuda").view(1, 1, 1, D)
+        Q_f32 = Q_f32 * q_row_scale * q_col_scale
+        K_f32 = K_f32 * k_row_scale * k_col_scale
+        Q = Q_f32.to(dtype)
+        K = K_f32.to(dtype)
+    elif os.environ.get("DEBUG_COLMAP", "0") == "1":
+        Q_f32 = torch.zeros(B, H, Q_rows, D, device="cuda", dtype=torch.float32)
+        K_f32 = torch.zeros(B, H, K_rows, D, device="cuda", dtype=torch.float32)
+        Q_f32[0, 0, 0, 0] = 1.0
+        for r in range(K_rows):
+            K_f32[0, 0, r, 0] = (r + 1) / 64.0
+        Q = Q_f32.to(dtype)
+        K = K_f32.to(dtype)
+    elif os.environ.get("DEBUG_IDENTITY", "0") == "1":
         Q_f32 = torch.zeros(B, H, Q_rows, D, device="cuda", dtype=torch.float32)
         K_f32 = torch.zeros(B, H, K_rows, D, device="cuda", dtype=torch.float32)
         for i in range(Q_rows):
@@ -98,7 +118,7 @@ def main():
 
     grid = (1, 1, 1)
     block = (256, 1, 1)
-    lds_bytes = 20992
+    lds_bytes = 24576
     hip.hipModuleLaunchKernel(
         func,
         grid[0], grid[1], grid[2],
@@ -128,7 +148,17 @@ def main():
     print(f"max_rel_err: {rel_err:.6f}")
     print(f"decoded finite: {torch.isfinite(decoded).all().item()}")
 
-    if os.environ.get("DEBUG_IDENTITY", "0") == "1":
+    if os.environ.get("DEBUG_COLMAP", "0") == "1":
+        row0 = decoded[0, :K_rows]
+        expected = torch.tensor([(r + 1) / 64.0 for r in range(K_rows)])
+        print("row0 decoded:")
+        print(row0)
+        print("expected:")
+        print(expected)
+        mapped = torch.round(row0 * 64 - 1).to(torch.int32)
+        print("mapped rows:")
+        print(mapped)
+    elif os.environ.get("DEBUG_IDENTITY", "0") == "1":
         diag = torch.diagonal(decoded[:K_rows, :K_rows]).cpu()
         off_diag = decoded[:K_rows, :K_rows] - torch.diag(diag)
         print(f"diag min/max: {diag.min().item():.3f}/{diag.max().item():.3f}")
@@ -147,6 +177,16 @@ def main():
             for idx in nz[:10]:
                 r, c = idx.tolist()
                 print(r, c, decoded[r, c].item())
+    elif os.environ.get("DEBUG_RANDOM_NONUNIFORM", "0") == "1":
+        flat_dec = decoded.flatten()
+        flat_ref = ref.flatten()
+        corr = torch.corrcoef(torch.stack([flat_dec, flat_ref]))[0, 1].item()
+        max_thr = float(os.environ.get("DEBUG_RANDOM_MAX_THR", "1.0"))
+        mean_thr = float(os.environ.get("DEBUG_RANDOM_MEAN_THR", "0.05"))
+        corr_thr = float(os.environ.get("DEBUG_RANDOM_CORR_THR", "0.95"))
+        passed = (max_err <= max_thr) and (mean_err <= mean_thr) and (corr >= corr_thr)
+        print(f"corr: {corr:.6f}")
+        print(f"PASS: {passed} (max<= {max_thr}, mean<= {mean_thr}, corr>= {corr_thr})")
 
 
 if __name__ == "__main__":

@@ -84,7 +84,31 @@ def main():
     if fp8_dtype is None:
         raise RuntimeError(f"Unsupported FP8 dtype: {dtype_name}")
 
-    if os.environ.get("NUMERICS_ONES", "0") == "1":
+    if os.environ.get("NUMERICS_IDENTITY_P", "0") == "1":
+        Qf32 = torch.zeros(B, H, s_q, D, device="cuda", dtype=torch.float32)
+        Kf32 = torch.zeros(B, H, s_k, D, device="cuda", dtype=torch.float32)
+        for r in range(min(s_k, D)):
+            Qf32[0, 0, r, r] = 1.0
+            Kf32[0, 0, r, r] = 1.0
+        v_pattern = os.environ.get("NUMERICS_V_PATTERN", "row")
+        Vf32 = torch.zeros(B, H, s_k, D, device="cuda", dtype=torch.float32)
+        if v_pattern == "col":
+            for c in range(D):
+                Vf32[0, 0, :, c] = c / 128.0
+        elif v_pattern == "rowid":
+            for r in range(s_k):
+                Vf32[0, 0, r, :] = float(r)
+        elif v_pattern == "rowcol":
+            cols = (torch.arange(D, device="cuda", dtype=torch.float32) / 128.0)
+            for r in range(s_k):
+                Vf32[0, 0, r, :] = float(r) + cols
+        else:
+            for r in range(s_k):
+                Vf32[0, 0, r, :] = r / 64.0
+        Q = Qf32.to(fp8_dtype)
+        K = Kf32.to(fp8_dtype)
+        V = Vf32.to(fp8_dtype)
+    elif os.environ.get("NUMERICS_ONES", "0") == "1":
         Q = torch.ones(B, H, s_q, D, device="cuda", dtype=torch.float32).to(fp8_dtype)
         K = torch.ones(B, H, s_k, D, device="cuda", dtype=torch.float32).to(fp8_dtype)
         V = torch.ones(B, H, s_k, D, device="cuda", dtype=torch.float32).to(fp8_dtype)
@@ -147,9 +171,13 @@ def main():
     Qf = Q.float()
     Kf = K.float()
     Vf = V.float()
+    Vf_ref = Vf
+    if os.environ.get("NUMERICS_ZERO_ODD_V", "0") == "1":
+        Vf_ref = Vf.clone()
+        Vf_ref[:, :, 1::2, :] = 0
     P = torch.matmul(Qf, Kf.transpose(-1, -2))
     P_fp8 = P.to(torch.float8_e4m3fn)
-    O_ref = torch.matmul(P_fp8.float(), Vf)
+    O_ref = torch.matmul(P_fp8.float(), Vf_ref)
 
     o_finite = torch.isfinite(O)
     nan_count = torch.isnan(O).sum().item()
@@ -176,6 +204,11 @@ def main():
     print(f"mean_err: {mean_err:.6f}")
     print(f"max_rel_err: {rel_err:.6f}")
     print(f"decoded finite: {torch.isfinite(decoded).all().item()}")
+    if os.environ.get("NUMERICS_IDENTITY_P", "0") == "1":
+        print("decoded[0:8,0:8]:")
+        print(decoded[:8, :8])
+        print("ref[0:8,0:8]:")
+        print(O_ref_cpu[:8, :8])
     print(f"finite rows: {finite_rows}/{decoded.shape[0]}")
     print(f"threads all-NaN: {threads_all_nan}, no-NaN: {threads_no_nan}")
     waves_per_block = 8

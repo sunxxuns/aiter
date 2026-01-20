@@ -35,7 +35,6 @@ _fwd_fp8_scaffold:
     s_load_dword s23, s[0:1], 44          // stride_vh
     s_load_dword s24, s[0:1], 48          // stride_oh (bytes)
     s_waitcnt lgkmcnt(0)
-    s_barrier
 
     // Buffer descriptors (size=-1, flags=0x20000)
     s_mov_b32 s6, -1
@@ -76,6 +75,10 @@ _fwd_fp8_scaffold:
     s_mul_i32 s29, s3, s24
     s_lshl_b32 s33, s2, 17               // * 131072
     s_add_u32 s29, s29, s33
+
+    // Bitop3 constants for V swizzle/read
+    s_movk_i32 s24, 0x70
+    s_movk_i32 s25, 0xb80
 
     // ------------------------------------------------------------------------
     // Thread indexing
@@ -185,19 +188,42 @@ _fwd_fp8_scaffold:
     s_mov_b32 s30, 0                     // tile_idx (pair)
     s_mov_b32 s31, 0                     // K/V tile soffset
 
-    // Preload tiles 0/1 into K_LDS0/1 and V_LDS0/1
-    v_mov_b32_e32 v13, v61
-    s_mov_b32 m0, K_LDS0
-    buffer_load_dwordx4 v13, s[12:15], s31 offen lds
-    s_mov_b32 m0, V_LDS0
-    buffer_load_dwordx4 v13, s[16:19], s31 offen lds
+    // Preload tiles 0/1 into K_LDS0/1 and swizzled V (pair)
+    v_mov_b32_e32 v2, 256
+    v_cmp_lt_u32_e32 vcc, v60, v2
+    s_and_saveexec_b64 s[22:23], vcc
+    v_add_u32_e32 v13, s31, v61          // K global offset (tile0)
+    buffer_load_dwordx4 v[20:23], v13, s[12:15], 0 offen
+    s_waitcnt vmcnt(0)
+    v_add_u32_e32 v14, s40, v61          // K_LDS0 + (tid&255)*16
+    ds_write_b128 v14, v[20:23]
 
     s_add_u32 s34, s31, 4096
-    v_mov_b32_e32 v13, v61
-    s_mov_b32 m0, K_LDS1
-    buffer_load_dwordx4 v13, s[12:15], s34 offen lds
-    s_mov_b32 m0, V_LDS1
-    buffer_load_dwordx4 v13, s[16:19], s34 offen lds
+    v_add_u32_e32 v13, s34, v61          // K global offset (tile1)
+    buffer_load_dwordx4 v[20:23], v13, s[12:15], 0 offen
+    s_waitcnt vmcnt(0)
+    v_add_u32_e32 v14, s41, v61          // K_LDS1 + (tid&255)*16
+    ds_write_b128 v14, v[20:23]
+    s_mov_b64 exec, s[22:23]
+
+    // Swizzled V load: 64 rows (two tiles) into V_LDS0
+    v_mov_b32_e32 v2, 256
+    v_cmp_lt_u32_e32 vcc, v60, v2
+    s_and_saveexec_b64 s[22:23], vcc
+    v_lshlrev_b32_e32 v2, 5, v60         // tid * 32 bytes
+    buffer_load_dwordx4 v[40:43], v2, s[16:19], s31 offen
+    v_add_u32_e32 v3, 16, v2
+    buffer_load_dwordx4 v[44:47], v3, s[16:19], s31 offen
+
+    // base = bitop3((tid<<4), tid, 0x70) imm 0x78
+    v_lshlrev_b32_e32 v4, 4, v60
+    v_bitop3_b32 v4, v4, v60, s24 bitop3:0x78
+    v_add_u32_e32 v4, s42, v4
+    s_waitcnt vmcnt(0)
+    ds_write_b128 v4, v[40:43]
+    ds_write_b128 v4, v[44:47] offset:4096
+    s_mov_b64 exec, s[22:23]
+    s_waitcnt lgkmcnt(0)
     s_waitcnt vmcnt(0)
 
 K_LOOP:
@@ -206,7 +232,7 @@ K_LOOP:
     s_cmp_ge_u32 s30, s20
     s_cbranch_scc1 K_LOOP_END
 
-    // Tile pair bases (V_LDS0/V_LDS1 are contiguous for K=64)
+    // Tile pair bases (V_LDS0 holds swizzled K=64 rows)
     v_mov_b32_e32 v29, s40                      // K tile0 base
     v_mov_b32_e32 v31, s41                      // K tile1 base
     v_mov_b32_e32 v56, s42                      // V base (tile0)
@@ -307,43 +333,63 @@ K_LOOP:
     v_and_b32_e32 v57, 0xFFFF, v57
     v_perm_b32 v55, v55, v57, v59
 
-    // PV MFMA using TR8 V reads (K=64, tiles 0+1)
-    // Use bank-conflict-free TR8 base: (lane%32)*128 + (lane/32)*32
-    v_and_b32_e32 v2, 31, v10
-    v_lshrrev_b32_e32 v3, 5, v10
-    v_lshlrev_b32_e32 v4, 7, v2
-    v_lshlrev_b32_e32 v5, 5, v3
-    v_add_u32_e32 v6, v4, v5
+    // (no half-wave permute)
 
-    v_add_u32_e32 v7, v56, v6
-    ds_read_b64_tr_b8 v[0:1], v7 offset:0
-    ds_read_b64_tr_b8 v[2:3], v7 offset:512
-    ds_read_b64_tr_b8 v[4:5], v7 offset:1024
-    ds_read_b64_tr_b8 v[6:7], v7 offset:1536
+    // PV MFMA using TR8 V reads (K=64, tiles 0+1)
+    // Triton-style base swizzle (bitop3:0x36 + XOR bases)
+    v_lshlrev_b32_e32 v2, 6, v60         // v14 = tid << 6
+    v_lshlrev_b32_e32 v3, 2, v60         // v141 = tid << 2
+    v_and_b32_e32 v4, 48, v3
+    v_and_or_b32 v2, v2, s25, v4         // v14 = (v14 & ~0xb80) | (v141 & 0xb80)
+    v_and_b32_e32 v5, 16, v60
+    v_lshlrev_b32_e32 v6, 3, v60
+    v_and_b32_e32 v6, 8, v6
+    v_bitop3_b32 v2, v2, v5, v6 bitop3:0x36  // base (relative)
+
+    v_xor_b32_e32 v3, 0x20, v2
+    v_xor_b32_e32 v4, 0x460, v2
+    v_xor_b32_e32 v5, 0x1020, v2
+    v_xor_b32_e32 v6, 0x1460, v2
+    v_xor_b32_e32 v7, 0x60, v2
+    v_xor_b32_e32 v8, 0x420, v2
+    v_xor_b32_e32 v9, 0x1060, v2
+    v_xor_b32_e32 v10, 0x1420, v2
+
+    v_add_u32_e32 v2, s42, v2
+    v_add_u32_e32 v3, s42, v3
+    v_add_u32_e32 v4, s42, v4
+    v_add_u32_e32 v5, s42, v5
+    v_add_u32_e32 v6, s42, v6
+    v_add_u32_e32 v7, s42, v7
+    v_add_u32_e32 v8, s42, v8
+    v_add_u32_e32 v9, s42, v9
+    v_add_u32_e32 v10, s42, v10
+
+    ds_read_b64_tr_b8 v[0:1], v2 offset:0
+    ds_read_b64_tr_b8 v[2:3], v2 offset:1088
+    ds_read_b64_tr_b8 v[4:5], v2 offset:4096
+    ds_read_b64_tr_b8 v[6:7], v2 offset:5184
     s_waitcnt lgkmcnt(0)
     v_mfma_f32_32x32x64_f8f6f4 v[64:79], v[0:7], v[48:55], v[64:79]
 
-    v_add_u32_e32 v7, 32, v7
-    ds_read_b64_tr_b8 v[0:1], v7 offset:0
-    ds_read_b64_tr_b8 v[2:3], v7 offset:512
-    ds_read_b64_tr_b8 v[4:5], v7 offset:1024
-    ds_read_b64_tr_b8 v[6:7], v7 offset:1536
+    ds_read_b64_tr_b8 v[0:1], v3
+    ds_read_b64_tr_b8 v[2:3], v4
+    ds_read_b64_tr_b8 v[4:5], v5
+    ds_read_b64_tr_b8 v[6:7], v6
     s_waitcnt lgkmcnt(0)
     v_mfma_f32_32x32x64_f8f6f4 v[80:95], v[0:7], v[48:55], v[80:95]
 
-    v_add_u32_e32 v7, 32, v7
-    ds_read_b64_tr_b8 v[0:1], v7 offset:0
-    ds_read_b64_tr_b8 v[2:3], v7 offset:512
-    ds_read_b64_tr_b8 v[4:5], v7 offset:1024
-    ds_read_b64_tr_b8 v[6:7], v7 offset:1536
+    ds_read_b64_tr_b8 v[0:1], v2 offset:64
+    ds_read_b64_tr_b8 v[2:3], v2 offset:1024
+    ds_read_b64_tr_b8 v[4:5], v2 offset:4160
+    ds_read_b64_tr_b8 v[6:7], v2 offset:5120
     s_waitcnt lgkmcnt(0)
     v_mfma_f32_32x32x64_f8f6f4 v[96:111], v[0:7], v[48:55], v[96:111]
 
-    v_add_u32_e32 v7, 32, v7
-    ds_read_b64_tr_b8 v[0:1], v7 offset:0
-    ds_read_b64_tr_b8 v[2:3], v7 offset:512
-    ds_read_b64_tr_b8 v[4:5], v7 offset:1024
-    ds_read_b64_tr_b8 v[6:7], v7 offset:1536
+    ds_read_b64_tr_b8 v[0:1], v7
+    ds_read_b64_tr_b8 v[2:3], v8
+    ds_read_b64_tr_b8 v[4:5], v9
+    ds_read_b64_tr_b8 v[6:7], v10
     s_waitcnt lgkmcnt(0)
     v_mfma_f32_32x32x64_f8f6f4 v[112:127], v[0:7], v[48:55], v[112:127]
 
@@ -355,17 +401,40 @@ K_LOOP:
     s_add_u32 s38, s31, 8192
     s_add_u32 s39, s31, 12288
 
-    v_mov_b32_e32 v13, v61
-    s_mov_b32 m0, K_LDS0
-    buffer_load_dwordx4 v13, s[12:15], s38 offen lds
-    s_mov_b32 m0, V_LDS0
-    buffer_load_dwordx4 v13, s[16:19], s38 offen lds
+    v_mov_b32_e32 v2, 256
+    v_cmp_lt_u32_e32 vcc, v60, v2
+    s_and_saveexec_b64 s[22:23], vcc
+    v_add_u32_e32 v13, s38, v61          // K global offset (next tile0)
+    buffer_load_dwordx4 v[20:23], v13, s[12:15], 0 offen
+    s_waitcnt vmcnt(0)
+    v_add_u32_e32 v14, s40, v61          // K_LDS0 + (tid&255)*16
+    ds_write_b128 v14, v[20:23]
 
-    v_mov_b32_e32 v13, v61
-    s_mov_b32 m0, K_LDS1
-    buffer_load_dwordx4 v13, s[12:15], s39 offen lds
-    s_mov_b32 m0, V_LDS1
-    buffer_load_dwordx4 v13, s[16:19], s39 offen lds
+    v_add_u32_e32 v13, s39, v61          // K global offset (next tile1)
+    buffer_load_dwordx4 v[20:23], v13, s[12:15], 0 offen
+    s_waitcnt vmcnt(0)
+    v_add_u32_e32 v14, s41, v61          // K_LDS1 + (tid&255)*16
+    ds_write_b128 v14, v[20:23]
+    s_mov_b64 exec, s[22:23]
+
+    // Swizzled V load for next pair into V_LDS0
+    v_mov_b32_e32 v2, 256
+    v_cmp_lt_u32_e32 vcc, v60, v2
+    s_and_saveexec_b64 s[22:23], vcc
+    v_lshlrev_b32_e32 v2, 5, v60         // tid * 32 bytes
+    buffer_load_dwordx4 v[40:43], v2, s[16:19], s38 offen
+    v_add_u32_e32 v3, 16, v2
+    buffer_load_dwordx4 v[44:47], v3, s[16:19], s38 offen
+
+    // base = bitop3((tid<<4), tid, 0x70) imm 0x78
+    v_lshlrev_b32_e32 v4, 4, v60
+    v_bitop3_b32 v4, v4, v60, s24 bitop3:0x78
+    v_add_u32_e32 v4, s42, v4
+    s_waitcnt vmcnt(0)
+    ds_write_b128 v4, v[40:43]
+    ds_write_b128 v4, v[44:47] offset:4096
+    s_mov_b64 exec, s[22:23]
+    s_waitcnt lgkmcnt(0)
 
 PREFETCH_DONE:
     // Advance to next K/V tile pair
