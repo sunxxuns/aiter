@@ -672,3 +672,17 @@ RESULT: PASS non-uniform random test (max_err 0.183, mean_err 0.00117, corr 0.97
 INSIGHT: QK mapping is correct under pitch-132 layout; remaining issues are in PV path, not QK mapping.
 NEXT: Apply same QK correctness baseline when fixing scaffold PV, re-run identity-P numerics.
 BLOCKER: PV packing/layout still incorrect.
+
+=== TURN 2026-01-20 10:40 ===
+ACTION: Fixed Q load clobber of lane_id/wave_id by moving Q loads to v32-v47; verified scaffold QK identity; iterated PV permute/operand order.
+RESULT: QK identity PASS (max_err 0). Identity-P col-pattern matches reference; rowid pattern still permuted (rows wrong).
+INSIGHT: QK correctness restored; PV error persists from P-to-A layout/transpose (permute variants didn’t fix rowid).
+NEXT: Derive correct P packing/transpose for MFMA A operand (or validate V mapping) and re-test identity-P rowid.
+BLOCKER: Need correct P layout for A operand in K=64 PV.
+
+=== TURN 2026-01-20 18:02 ===
+ACTION: Benchmarked scaffold and checked GPU clocks; attempted to raise sclk via rocm-smi.
+RESULT: avg_ms ~33.3ms (~0.65 PF eq). GPU0 sclk stuck at ~144–152MHz (level 1); perf level changes denied/ineffective.
+INSIGHT: Performance regression is likely due to low GPU clocks, not kernel changes; long warmup didn't boost clocks.
+NEXT: Re-bench once sclk can be set to level 2 (~2200MHz) or perf determinism is enabled.
+BLOCKER: Clock control not permitted (rocm-smi cannot set manual/perf determinism).

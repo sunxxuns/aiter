@@ -25,11 +25,9 @@ _fwd_fp8_tr8_probe:
     s_mov_b32 s11, 0x20000
 
     // ------------------------------------------------------------------------
-    // Thread indexing (256 threads, use first 64)
+    // Thread indexing (256 threads)
     // ------------------------------------------------------------------------
     v_mov_b32_e32 v60, v0                // tid (0-255)
-    v_cmp_lt_u32_e64 vcc, v60, 64
-    s_and_saveexec_b64 s[20:21], vcc
 
     // ------------------------------------------------------------------------
     // Load Q[8×128] to LDS in TR8 interleaved layout
@@ -115,8 +113,11 @@ _fwd_fp8_tr8_probe:
     // ------------------------------------------------------------------------
     // Store 8 bytes per thread (first 64 threads)
     // ------------------------------------------------------------------------
+    v_cmp_lt_u32_e64 vcc, v60, 64
+    s_and_saveexec_b64 s[20:21], vcc
     v_lshlrev_b32_e32 v50, 3, v60         // tid * 8
     buffer_store_dwordx2 v[40:41], v50, s[4:7], 0 offen
+    s_mov_b64 exec, s[20:21]
 
     s_waitcnt vmcnt(0)
     s_endpgm

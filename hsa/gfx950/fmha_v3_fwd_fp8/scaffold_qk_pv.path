@@ -1,11 +1,12 @@
 STATUS: testing
 APPROACH: Pairwise K-loop with K=64 PV over two tiles
-KEY_PARAMS: Q pitch=132; K row-major via buffer_load->ds_write (tid<256, offset=(tid&255)*16); V swizzled store (bitop3:0x78); PV TR8 bases (bitop3:0x36 + XOR); K_TILE=32 (paired); P used as B operand; P packed via v_cvt_pk_fp8_f32 + mask + v_perm (no half-wave permute)
+KEY_PARAMS: Q pitch=132 (Q load uses v32-v47 to preserve lane_id); K row-major via buffer_load->ds_write (tid<256, offset=(tid&255)*16); V swizzled store (bitop3:0x78); PV TR8 bases (bitop3:0x36 + XOR); K_TILE=32 (paired); P used as B operand; P packed via v_cvt_pk_fp8_f32 + mask + v_perm; no half-wave P permute
 TEST_RESULT:
   - Build: PASS
   - B=1 H=40 S=32130 D=128: 8.03 ms, 2632 TF/s eq, 2648 TF/s exec
   - QK debug (non-uniform random): PASS (max<=1.0, mean<=0.05, corr>=0.95)
-  - Scaffold identity-P numerics: FAIL (column collapse; row-constant output)
-    * V_PATTERN=col: rows ~[0, 0.4375, 0.875, 1.3125, ...], columns constant
-    * V_PATTERN=rowid: large constant rows (~1744)
-NEXT_STEP: Fix PV mapping (P packing/permute vs V TR8 base). Compare to Triton ds_bpermute path (v141=tid<<2; v158=v141^0x80) and validate TR8 read bases.
+  - Scaffold identity-P numerics (after QK fix):
+    * V_PATTERN=col: PASS (rows/cols match in decoded output for small block)
+    * V_PATTERN=rowid: FAIL (rows permuted; even-row pattern)
+  - Bench @ current clocks: 33.3 ms (~0.65 PF eq); GPU sclk stuck at ~150MHz
+NEXT_STEP: Fix PV mapping (P transpose/packing vs V TR8 base). Re-bench when sclk can be raised.

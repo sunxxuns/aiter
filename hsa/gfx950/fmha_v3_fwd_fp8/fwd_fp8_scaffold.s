@@ -111,22 +111,22 @@ _fwd_fp8_scaffold:
     v_add_u32_e32 v22, v22, v23
     v_add_u32_e32 v20, v22, v12
 
-    buffer_load_dwordx4 v[4:7], v2, s[8:11], 0 offen
+    buffer_load_dwordx4 v[32:35], v2, s[8:11], 0 offen
     v_add_u32_e32 v3, 16, v2
-    buffer_load_dwordx4 v[8:11], v3, s[8:11], 0 offen
+    buffer_load_dwordx4 v[36:39], v3, s[8:11], 0 offen
     v_add_u32_e32 v3, 32, v2
-    buffer_load_dwordx4 v[12:15], v3, s[8:11], 0 offen
+    buffer_load_dwordx4 v[40:43], v3, s[8:11], 0 offen
     v_add_u32_e32 v3, 48, v2
-    buffer_load_dwordx4 v[16:19], v3, s[8:11], 0 offen
+    buffer_load_dwordx4 v[44:47], v3, s[8:11], 0 offen
     s_waitcnt vmcnt(0)
 
-    ds_write_b128 v20, v[4:7]
+    ds_write_b128 v20, v[32:35]
     v_add_u32_e32 v20, 16, v20
-    ds_write_b128 v20, v[8:11]
+    ds_write_b128 v20, v[36:39]
     v_add_u32_e32 v20, 16, v20
-    ds_write_b128 v20, v[12:15]
+    ds_write_b128 v20, v[40:43]
     v_add_u32_e32 v20, 16, v20
-    ds_write_b128 v20, v[16:19]
+    ds_write_b128 v20, v[44:47]
 
     s_waitcnt lgkmcnt(0)
 
@@ -332,8 +332,6 @@ K_LOOP:
     v_cvt_pk_fp8_f32 v57, v46, v47
     v_and_b32_e32 v57, 0xFFFF, v57
     v_perm_b32 v55, v55, v57, v59
-
-    // (no half-wave permute)
 
     // PV MFMA using TR8 V reads (K=64, tiles 0+1)
     // Triton-style base swizzle (bitop3:0x36 + XOR bases)

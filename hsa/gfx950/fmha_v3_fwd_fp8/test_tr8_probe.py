@@ -43,17 +43,23 @@ def main():
     co = build_kernel()
     module, func = load_kernel(co, "_fwd_fp8_tr8_probe")
 
-    # Input Q[8x128] with Q[r,k] = r*128 + k (mod 256)
-    rows, cols = 8, 128
+    # Input Q[32x128] with value = encoded (addr >> 3)
+    # Interleaved layout address: addr = (row % 8) + (row / 8) * 1024 + k * 8
+    rows, cols = 32, 128
     q_data = np.zeros((rows, cols), dtype=np.uint8)
     for r in range(rows):
         for k in range(cols):
-            q_data[r, k] = (r * cols + k) % 256
+            addr = (r % 8) + (r // 8) * 1024 + k * 8
+            val = (addr >> 3) & 0x7F
+            val |= ((addr >> 11) & 1) << 7
+            q_data[r, k] = val
 
     q_input = torch.from_numpy(q_data.flatten()).to(device="cuda")
     output = torch.zeros(512, dtype=torch.uint8, device="cuda")
 
-    for base_offset in range(0, 8):
+    base_offsets = [0, 2, 4, 6, 8, 64, 128, 512, 1024, 1088, 4096, 5184]
+    results = {}
+    for base_offset in base_offsets:
         output.zero_()
         args = [
             ctypes.c_void_p(output.data_ptr()),
@@ -68,12 +74,11 @@ def main():
         hip.hipDeviceSynchronize()
 
         out = output.cpu().numpy()
-        print(f"\nBase offset = {base_offset}")
-        for tid in range(4):
-            row = tid % 8
-            expected = [q_data[(row + base_offset) % rows, k] for k in range(8)]
-            actual = list(out[tid * 8 : tid * 8 + 8])
-            print(f"  Thread {tid} (row={row}): expected={expected}, got={actual}")
+        results[base_offset] = list(out[0:8])  # thread 0 only
+
+    print("\nThread 0 bytes for selected base offsets:")
+    for base_offset in base_offsets:
+        print(f"{base_offset:04d}: {results[base_offset]}")
 
     hip.hipModuleUnload(module)
 
