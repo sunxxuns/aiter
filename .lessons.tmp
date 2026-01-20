@@ -1,39 +1,104 @@
-=== 128Q Kernel Debug Session ===
+## CRITICAL: FP8 Should Use ds_read_b64 NOT TR8 (2026-01-15)
 
-## Findings
+### KEY FINDING: ds_read_b64 WORKS for FP8 (Same as BF16)
 
-### Bug 1: Register clobbering
-- MFMA result registers v[0:15] were being clobbered by address calculations
-- Fix: Use different registers (v50+) for temporary values after MFMA
+**Test Result** (`test_fp8_qk_simple.s`):
+- Input: Q and K are all 1.0 (FP8 0x38)
+- Expected: 32×32 matrix with all 16.0 (sum of 16 ones)
+- Actual: All outputs are 16.0 ✓ **CORRECT!**
 
-### Bug 2: wave_id clobbering O pointer  
-- s5 was used for both wave_id (via v_readfirstlane) and O pointer high bits
-- Fix: Use s28 for wave_id, keep s[4:5] for O pointer
+**Why ds_read_b64 works for FP8:**
+- `ds_read_b64` reads 8 bytes from LDS
+- 8 bytes = 8 FP8 values (exactly what MFMA A operand needs)
+- BF16: 8 bytes = 4 BF16 values (needs 4 reads for k=0..15)
+- FP8: 8 bytes = 8 FP8 values (needs 2 reads for k=0..15)
+- **FP8 is MORE efficient per read than BF16!**
 
-### Bug 3: PV MFMA incomplete (CRITICAL)
-- 64T kernel does 2 MFMAs per HD tile (K=0..15 and K=16..31)
-- 128Q kernel only did 1 MFMA per HD tile
-- Fix: Add second MFMA for each HD tile
+**Conclusion**: Use ds_read_b64 with BF16-style swizzle, NOT TR8.
 
-## Working tests:
-- test_128q_qload.py: Wave ID output works, Q loading works
-- test_128q_qk_only.py: QK MFMA works (after fixing register clobber)
+### TR8 Analysis (Why We Abandoned It)
 
-## Structure comparison (64T vs 128Q):
+**TR8 stride-16 collision problem for 32 rows:**
+- Layout `Q[r,c] = LDS[r + c*16]` has address collisions
+- `LDS[32] = Q[16, 1]` AND `LDS[32] = Q[0, 2]` (same address!)
+- Simple stride-16 only works for <16 rows
 
-### 64T (fwd_fp8_kloop.s):
-- 64 threads, 1 wave
-- Q: 32×128, O: 32×128
-- PV: 2 MFMAs × 4 HD tiles = 8 MFMAs per K-tile
+**TR8 would require complex layout**, but ds_read_b64 is simpler and proven.
 
-### 128Q target:
-- 256 threads, 4 waves  
-- Q: 128×128 (32 rows per wave), O: 128×128
-- Each wave independent, same structure as 64T
+### Key Findings
 
-## BF16 reference analysis:
-- 256 threads = 4 waves
-- 176 total MFMAs
-- Per wave: 32 Q rows
-- Uses swizzle: m0 = 0x8200 + 0x408 * wave_id
-- Per-wave Q offset: wave_id * Q_stride * 2
+#### 1. TR8 Hardware Requirement
+From verified experiments, `ds_read_b64_tr_b8` gathers data as:
+```
+output[k] = LDS[(base >> 3) + k * 16]  for k = 0..7
+```
+
+**TR8 expects stride-16 between consecutive k values.**
+
+#### 2. Our Current TR8 Layout is WRONG
+```asm
+// Current WRONG layout (pitch-128)
+v_lshrrev_b32_e32 v3, 3, v2        // group = lane >> 3
+v_lshlrev_b32_e32 v3, 7, v3        // * 128 pitch (WRONG!)
+v_and_b32_e32 v4, 7, v2
+v_add_u32_e32 v3, v3, v4
+```
+- Uses pitch 128, TR8 expects stride 16
+- This causes wrong data reads AND 16x bank conflicts
+
+#### 3. BF16 Layout is NEITHER Row-Major NOR Column-Major
+BF16 uses **complex swizzled layout** designed for bank conflict avoidance:
+
+**Q read address formula**:
+```
+address = 0x8200 + (tid>>5)*16 + (lane&1)*128 + (lane>>1)*1032
+```
+
+**TR_B16 V read offsets** (NOT sequential):
+```
+0, 512, 64, 576, 2176, 2688, 2240, 2752, 4352, 4864, ...
+```
+
+This is a carefully designed swizzle pattern, not simple row/column major.
+
+#### 4. CK Does NOT Meet TF/s Requirements
+- CK uses `ds_read_b128` (no TR at all)
+- Can only use CK as reference for correctness, not performance
+- Must develop own optimized layout
+
+### Correct TR8 Approach for FP8
+
+To use TR8 correctly:
+1. **Store data with stride-16** between consecutive k values (column-major-like)
+2. **Apply BF16-style swizzle** to base addresses for bank conflict avoidance
+3. **Adapt the swizzle formulas** for TR8's byte-level access pattern
+
+### LDS Layout for TR8 (Correct)
+For K[row, col], store at: `LDS[row + col * 16]` (column-major with stride 16)
+
+Then with `base = mfma_row * 8`:
+- Lane reads: `output[k] = LDS[mfma_row + k * 16] = K[mfma_row, k]`
+
+### Bank Conflict Status
+
+| Approach | Pitch | Banks Used | Conflict Factor |
+|----------|-------|-----------|-----------------|
+| Current TR8 | 128 | 4 | **16x** |
+| Correct TR8 | 16 + swizzle | 32-64 | **1-2x** |
+| BF16 style | swizzled | 32 | **1x** |
+
+### Bank Conflict Analysis for ds_read_b64
+
+| Layout | Conflict Factor |
+|--------|-----------------|
+| Simple row-major | 16x |
+| BF16-style swizzle | 2x |
+| XOR swizzle | 2x |
+
+The 2x factor is inherent (ds_read_b64 touches 2 consecutive 4-byte banks).
+
+### Action Items
+1. ~~Derive FP8 TR8 swizzle formula~~ → Use ds_read_b64 instead
+2. Adapt BF16 swizzle formula for FP8 element sizes
+3. Implement swizzled LDS layout for Q/K with ds_read_b64
+4. Benchmark swizzled version (expect ~8x improvement over row-major)

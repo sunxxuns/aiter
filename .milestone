@@ -1,99 +1,44 @@
-# FP8 Flash Attention - Milestones
+# FP8 Flash Attention ASM Kernel - Milestone Tracker
 
-## Goal
-FP8 kernel with >30% TF/s improvement over BF16 (~1000 → >1300 TF/s)
+## TARGET
+- >1300 TF/s at B=1, H=40, S=32130, D=128
+- 30%+ faster than BF16 ASM (1016 TF/s)
 
----
+## BASELINE (verified 2025-01-16)
+| Kernel | TF/s | Notes |
+|--------|------|-------|
+| BF16 ASM | 1016 | Reference |
+| Triton FP8 | 1294 | Target to beat |
 
-## Phase 2: Single-Tile HD=128 ✅ COMPLETE
-Working kernel: `test_full_hd128.s`
-- All 7 rigorous tests passing
+## CURRENT STATUS
 
----
+### Phase: MULTI-BLOCK IMPLEMENTATION
+- K=64 MFMA working (2x efficiency) ✓
+- K-loop working (numerically correct) ✓
+- Single-block only (perf gap) ←
+- Multi-block support (in progress)
+- LDS swizzle (pending)
+- Pipelining (pending)
 
-## Phase 3: K-tile Loop ✅ COMPLETE
+### Working Files
+- `fwd_fp8_k64_kloop_acc.s` - Single-block K-loop with K=64 MFMA
+- `fwd_fp8_kloop.s` - Full attention (K=16, non-performant reference)
 
-### Key Fixes
-1. **v1 must be recalculated before K load** - The VGPR offset was getting stale
-2. **Buffer descriptor size must be -1 (max)** - Size=4096 blocked tile 1+ access
-3. **Proper O rescaling** - correction = exp((old_max - new_max) * scale)
-4. **Use new_max for P computation** - Was using tile_max instead of global max
+### Active Path
+See `multiblock.path` for current approach details
 
-### Test Results (After Buffer Descriptor Fix)
-```
-seq_len=32  (1 tile):  max_error=0.088 ✅
-seq_len=64  (2 tiles): max_error=0.073 ✅  
-seq_len=96  (3 tiles): max_error=0.044 ✅
-seq_len=128 (4 tiles): max_error=0.035 ✅
-```
+## ROADMAP
 
-### Notes
-- Multi-tile errors now DECREASE with more tiles (proper accumulation)
-- FP8 quantization noise is the primary error source
+1. [DONE] K=64 MFMA implementation
+2. [DONE] K-loop iteration
+3. [NOW] Multi-block support (workgroup_id for Q-tile/head)
+4. [NEXT] LDS swizzle (stride-132 or BF16 pattern)
+5. [NEXT] K-tile load pipelining
+6. [NEXT] Full attention integration (softmax + PV)
 
----
+## BLOCKERS INVESTIGATED
 
-## Phase 4: Full HD=128 Output ✅ COMPLETE
-
-### Summary
-Extended kernel from 32 columns to full 128 columns (4 HD tiles).
-
-### Completed
-- [x] Expand O accumulator to v[80:143] (64 registers for 4 HD tiles)
-- [x] Update O rescaling for all 64 registers
-- [x] Add PV MFMA for HD tiles 1, 2, 3 (V col offsets 32, 64, 96)
-- [x] Update final normalization for all 64 registers
-- [x] Expand output store for 128 columns
-
-### Bug Found and Fixed
-**HD tile 0 (cols 0-31) initially produced NaN/wrong values.**
-
-**Root Cause**: AGPR writes were moved to BEFORE V read, but should be AFTER V packing (just before MFMA).
-
-**Fix**: 
-1. Use v30 (not v60) for P conversion temp - matches original code pattern
-2. Move `v_accvgpr_write` to just before each MFMA (after V packing)
-
-### Test Results
-All tests pass:
-- seq_len=32 (1 tile): max_err=0.097 ✅
-- seq_len=64 (2 tiles): max_err=0.073 ✅
-- seq_len=96 (3 tiles): max_err=0.060 ✅
-- seq_len=128 (4 tiles): max_err=0.066 ✅
-- Debug harness: 23/23 tests passed ✅ (includes HD tile identity test)
-
-## Phase 5: Benchmark 🔜 NEXT
-
-### Todo
-- [ ] Run benchmark against BF16 kernel
-- [ ] Measure TF/s for various sequence lengths
-- [ ] Profile for optimization opportunities
-
----
-
-## Files
-
-```
-hsa/gfx950/fmha_v3_fwd_fp8/
-├── fwd_fp8_kloop.s         # Main kernel: K-loop + full HD=128 ✅
-├── test_kloop_attn.py      # Numerical accuracy test
-├── debug_harness.py        # Comprehensive test suite (23 tests)
-├── asm_validator.py        # Static analysis tool
-├── test_full_hd128.s       # Single-tile reference kernel
-├── .numerics               # Numerical accuracy reference
-├── .bench                  # Benchmark reference
-├── .comp                   # BF16 comparison notes
-├── .bugs                   # Common bug patterns
-├── .tools                  # Debug tools reference
-```
-
----
-
-## LDS Layout (K-loop kernel)
-
-| Offset | Size | Content |
-|--------|------|---------|
-| 0 | 4KB | Q (stays for all tiles) |
-| 4096 | 4KB | K → P (reused per tile) |
-| 8192 | 4KB | V |
-| **Total** | **12KB** | |
+### Triton HSACO Direct Launch (BLOCKED)
+- Preload mechanism changes SGPR layout
+- HIP packed buffer has ~56 byte limit
+- Decision: Build custom kernel instead

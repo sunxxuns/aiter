@@ -31,6 +31,25 @@ For `v_mfma_f32_32x32x16_fp8_fp8`:
 - k_half = 8 if lane >= 32 else 0
 - 16 F32 outputs per lane in v[0:15]
 
+## K=64 MFMA K-Loop (fwd_fp8_k64_kloop_acc.co) - VERIFIED 2025-01-16
+
+### Uniform Input Test
+- Q = K = 1.0 (FP8)
+- 1 tile: expected 128, got 128.0 ✓
+- 2 tiles: expected 256, got 256.0 ✓
+- 4 tiles: expected 512, got 512.0 ✓
+
+### Random Input Test (4 K-tiles)
+- Max diff (sorted): 0.0014 (FP8 precision)
+- Sorted correlation: 1.0000 ✓
+- Output range matches reference range ✓
+
+### Key Implementation Details
+- Uses v_mfma_f32_32x32x64_f8f6f4 (K=64, 2x efficiency)
+- Accumulators in v[80:95] (v[0:15] causes corruption)
+- K load data in v[150:165] (separate from MFMA operands)
+- soffset for K-tile advancement: s20 += 4096 per tile
+
 ## PV MFMA Status
 
 - Not yet verified numerically

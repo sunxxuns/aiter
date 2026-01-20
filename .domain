@@ -615,3 +615,21 @@ avg_ms: 12.649
 TF/s (equivalent full-attention): 1671.4
 TF/s (executed MFMA): 1679.5
 ```
+
+---
+
+## PROVEN FACT: Scaffold PMC counters (rocprofv3)
+
+**CLAIM**: PMC counters show low LDS bank conflicts and high L2 hit rate
+for the K=16 scaffold kernel.
+
+**EVIDENCE**: `hsa/gfx950/fmha_v3_fwd_fp8/nimrodmi350/3782199_results.db`
+average over dispatch_id 12–19:
+```
+GRBM_GUI_ACTIVE=27613110.55
+SQ_LDS_BANK_CONFLICT=126362.75  (~0.46% of GUI)
+TCC_HIT=4915078.91
+TCC_MISS=469143.96  (L2 hit ~91.29%)
+SQ_INSTS_VALU_MFMA_F8=12663000
+SQ_INSTS_VALU_MFMA_MOPS_F8=1296691200
+```

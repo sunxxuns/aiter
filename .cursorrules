@@ -1,316 +1,225 @@
-###task###
- to write an assembly kernel to do fp8 flash attention, to provide tf/s higher than bf16
- the bf16 flash attention as the golden reference:
- /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd/fwd_hd128_bf16.s
-
-###Make sure ###
-do not fall back to triton or CK *runtime kernels/libraries*; the final deliverable must be an **asm kernel checked into this repo**
-EXCEPTION (allowed): **CK-generated FMHA asm** may be used as a *secondary reference* (and even as a starting asm base), but we must
-still produce/own the resulting `.s` in-repo and keep the BF16 strategy + perf invariants below.
-do not rewrite different strategy than the bf16 reference, as it would be very challenging
-use per tensor scaled fp8 1-4-3 input make sure it's same as mfma fp8 kernel expect.
-first downcast then calling mfma fp8
-we are using the same strategy as the bf16 version, such as online softmax
-read past lessnons recorded in .lessons
-
-### CK-generated FMHA asm as a reference (allowed) ###
-- Purpose: use CK's compiler-generated asm to cross-check scheduling/operand packing and as a baseline starting point.
-- Allowed artifacts:
-  - CK-generated device asm dump (`--save-temps`), e.g. under `/tmp/ck_fmha_gen/*-hip-amdgcn-amd-amdhsa-gfx950.s`
-  - A copied-in asm baseline in this repo (e.g., `fwd_fp8_ck_base.s`) for further **manual asm** modifications.
-- Not allowed:
-  - "just call CK" or ship a CK hsaco as the solution; no dependency on CK runtime for production behavior.
-- Regeneration hint (example):
-  - `cd 3rdparty/composable_kernel/example/ck_tile/01_fmha && python3 generate.py --targets gfx950 --api fwd --receipt 100 --optdim 128 --filter "*fp8*" --output_dir /tmp/ck_fmha_gen`
-  - then compile with `hipcc --offload-arch=gfx950 --save-temps` to dump the device `.s`.
-
-###CRITICAL: Performance Bug Found (2025-01-16)###
-
-**rocprofv3 shows: SQ_LDS_BANK_CONFLICT = 1920 cycles per block!**
-
-**Single block analysis:**
-- Duration: 5.8 µs (5800 ns)
-- LDS bank conflicts: 1920 cycles
-- At 2.2 GHz: 1920 / 2.2e9 = 873 ns spent on bank conflicts
-- **15% of kernel time is LDS bank conflicts alone!**
-
-**ROOT CAUSES (ordered by impact):**
-
-1. **Our kernel only does 1 K-tile, not full attention**
-   - We process: 4 Q-tiles × 1 K-tile = 1 MFMA set per block
-   - Full attention: 4 Q-tiles × 1005 K-tiles × 2 (QK+PV) per head
-   - We're measuring 1/2000th of full attention work!
-   
-2. **LDS bank conflicts (stride-128 = 16-way conflicts)**
-   - rocprof shows 1920 conflict cycles per block
-   - Need pitch-136 or XOR swizzle for bank-conflict-free
-
-3. **Using K=16 MFMA instead of K=64 MFMA**
-   - v_mfma_f32_32x32x16_fp8_fp8: 1K FLOPs/cycle
-   - v_mfma_f32_32x32x64_f8f6f4: 2K FLOPs/cycle (2x more efficient!)
-
-4. **Not pipelining memory with compute**
-   - BF16 uses buffer_load...lds (direct global→LDS)
-   - We use buffer_load → VGPR → ds_write
-
-**To match Triton's 1294 TF/s we need:**
-1. Loop over all K tiles (not just 1)
-2. Add softmax computation
-3. Add P×V multiplication
-4. Fix LDS bank conflicts (pitch or swizzle)
-5. Consider switching to K=64 MFMA
-
-###CRITICAL: Python Debug Buffer Bug - WASTED HOURS OF DEBUGGING!###
-When reading uint32 values from a float32 debug buffer in Python:
-
-WRONG (returns 0 for values like 0x2e9b391c stored as raw bits):
-  b64_lo = int(d[0].item())   # BUG: int(0.000000) = 0
-
-CORRECT (interprets raw bits properly):
-  import struct
-  def as_u32(f): return struct.unpack('I', struct.pack('f', f))[0]
-  b64_lo = as_u32(d[0].item())  # Returns 0x2e9b391c correctly
-
-This bug caused HOURS debugging "ds_read_b64 returns zeros" when the instruction
-was working correctly! Kernel stores uint32 via v_mov_b32, Python int() truncates.
-ALWAYS use struct.unpack for uint32 values in float32 debug buffers!
-
-###Follow BF16 Patterns for Performance###
-The BF16 reference kernel uses SWIZZLED LDS layout for performance (bank-conflict-free).
-- The swizzling with 0x408 stride, base offsets like 0x8200 is for PERFORMANCE
-- Simple row-major LDS layout DOES work correctly (ds_read_b64 is fine)
-- But BF16's swizzled layout is MUST to Do for optimal throughput
-
-### benchmark ###
-to benchmark tf/s use python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 32130
-this is the shape we are aiming for
-this is how we bench bf16 flash attn kernel around 1000TF/s, fp8 should at least have 30% more
-divide the diffcult task into small tasks and make the numeric right
-
-###CRITICAL: BENCHMARKING GRID SIZE###
-**ALWAYS launch ALL blocks, not just 1 block!**
-
-For flash attention with shape (batch=B, heads=H, seq_len=S, head_dim=D):
-```
-Q_rows_per_block = 128  # for 256T kernel (4 Q-tiles × 32 rows)
-grid_x = ceil(S / Q_rows_per_block)  # number of Q-tile blocks
-grid_y = B * H                        # one per batch×head
-grid_z = 1
-
-# Example: B=1, H=40, S=32130, Q_rows=128
-# grid = (252, 40, 1) = 10,080 blocks total
-```
-
-**Single-block benchmarks are INVALID** - they don't reflect:
-- Full memory bandwidth pressure
-- Real occupancy and scheduling
-- Proper FLOPs calculation
-
-FLOPs formula for flash attention:
-```
-flops = 4 * B * H * S * S * D  # QK + softmax + PV
-# For QK-only: flops = 2 * B * H * S * S * D
-```
-
-Any benchmark showing >1000 TF/s with single block launch is WRONG.
-### hill climbing strategy ###
--refer to .milestone to understand roadmap and the current phase
--adding/revising .s file to implement
--compare with the bf16 reference and update the same and difference in .comp
--return if there's significant difference non necessary
--doing numeric tests
--doing benchmar on tf/s
--return if numeric tests does not pass or there's non scalable performance
--write down lessons and update .milestone .lessons .bench .numerics for reviewer to decide whether to move to next phase
--check if current .bench results are scalable toward the goal and update .scale
-
-#additional:
-do not do long reasoning on the entire flash attn kernel, instead, calve out problemtic part and do minmal test/debug,
-for each time, do vigorious numerica test, use structured or random input to reveal potential accumulation or order issues,
-do not use uniform input got false positive
-# log files
-.bench: record tf/s and reason if it meets expected value for fp8 (using bf16 as a reference)
-.scale: reasoning if current implementation is scalable to > 1300 TF/s for the shapes in --seq-len 32130
-.numerics: make sure the layout correct, yield correct results
-.comp: make sure following the patterns in bf16 asm, with only the necessary differences
-.milestone: record road maps and summarize current status
-
-### CRITICAL: Bank conflicts kill performance ###
-Row-major LDS layout (pitch-128) has 16x bank conflicts - unusable.
-Use PITCH-136 layout for FP8: simple, proven, zero conflicts.
-- Pitch-136: row_stride = 136 bytes (128 data + 8 padding)
-- All 64 banks used, max 2 hits per bank (optimal)
-- ds_read_b64 works correctly with this layout
-
-### TR8 is NOT the path forward ###
-ds_read_b64_tr_b8 requires special interleaved-8 LDS layout that doesn't
-match buffer_load patterns. Abandoned in favor of plain ds_read_b64 with
-pitch-136 layout. Do NOT attempt TR8 reads without matching TR8 writes.
-
-### IMPORTANT: Dot file changes require user approval ###
-All changes to .xxx files (.lessons, .milestone, .bench, .numerics, .comp, .scale, .cursorrules, etc.)
-must be proposed to the user first and only applied after explicit approval.
-These files contain critical project state and decisions that need human review.
-
-### EXCEPTION: .xxx.tmp files can be freely modified ###
-Temporary working files (.lessons.tmp, .milestone.tmp, etc.) can be created/modified without approval.
-Use these to store intermediate findings, test results, and progress notes.
-When a milestone is reached, propose moving content from .xxx.tmp to the corresponding .xxx file.
-
-### CRITICAL: Never use flat_load/flat_store for global memory ###
-Always use buffer_load/buffer_store for global memory operations.
-- flat_load/flat_store are FORBIDDEN - higher latency, worse scheduling
-- buffer_load with `lds` modifier directly loads to LDS (no VGPR intermediate)
-- This matches BF16 pattern: `buffer_load_dwordx4 v1, s[8:11], s20 offen lds`
-- Set up buffer descriptors: s[X:X+3] = {base_lo, base_hi, -1, 0x20000}
-- For stores: use buffer_store_* with proper descriptors
-- ANY use of flat_load or flat_store in kernel code is a bug to fix
-
-### FP8 Layout Strategy: PITCH-136 ###
-Current proven layout for bank-conflict-free LDS access:
-- Global: row-major Q[32×128], K[32×128], V[32×128]
-- LDS: pitch-136 (row stride = 136 bytes, adds 8-byte padding per row)
-- Load: buffer_load_dwordx4 ... offen lds (16 bytes/thread)
-- Read: ds_read_b64 (8 FP8 values per read)
-- Pitch-136 achieves 0 bank conflicts (vs 16x with pitch-128)
-- Address: lds_offset = BASE + row * 136 + col
-
 ###############################################################################
-# GPU ASSIGNMENT (avoid conflicts between models)
+# FP8 FLASH ATTENTION ASM KERNEL PROJECT
 ###############################################################################
-# CODE MODEL:   GPU 0 (default) - export HIP_VISIBLE_DEVICES=0
-# DOMAIN MODEL: GPU 7           - export HIP_VISIBLE_DEVICES=7
-#
-# Always set HIP_VISIBLE_DEVICES before running any GPU code:
-#   export HIP_VISIBLE_DEVICES=7 && python test_xxx.py
-#
-# Or inline: HIP_VISIBLE_DEVICES=7 python test_xxx.py
-###############################################################################
+
+# ON FIRST MESSAGE: Print this to confirm rules loaded:
+instrution loaded: FP8 FMHA ASM v2025-01-18"
+
+## TARGET
+- Write FP8 flash attention ASM kernel for gfx950
+- Target: >1300 TF/s (30%+ faster than BF16's 1016 TF/s)
+- Benchmark shape: B=1, H=40, S=32130, D=128
+- Reference: /sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd/fwd_hd128_bf16.s
+
+## CONSTRAINTS
+- Final deliverable: .s assembly file in this repo (no runtime CK/Triton)
+- Follow BF16 kernel strategy (online softmax, tiled attention)
+- FP8 format: e4m3fn (1-4-3), per-tensor scaled
+- CK-generated asm allowed as REFERENCE only, not as final solution
 
 ###############################################################################
 # PING-PONG COLLABORATIVE DEBUGGING PROTOCOL
 ###############################################################################
-#
-# Two AI models collaborate on this complex assembly debugging task:
-#
-# 1. CODE MODEL (coding/domain expert)
-#    - Trigger: "You are the code/domain model"
-#    - Role: Write assembly code, run tests, implement fixes
-#    - Writes to: .code file ONLY (thoughts, stuck points, test results)
-#    - Reads from: .domain file (suggestions from search model)
-#    - On start: Read .domain for new suggestions, then implement/test
-#
-#    CODE MODEL RESTRICTIONS (CRITICAL):
-#    - ONLY write to .code file for status updates
-#    - DO NOT write to .domain file (that's for domain model only)
-#    - CAN edit .s/.py kernel and test files freely
-#    - .code is for DOMAIN MODEL consumption and project tracking
-#
-# 2. DOMAIN MODEL (search/reasoning expert)
-#    - Trigger: "You are the domain/search model"
-#    - Role: Research, analyze patterns, suggest approaches for CODE MODEL
-#    - Writes to: .domain file ONLY (suggestions, insights, references)
-#    - Reads from: .code file, kernel files, .lessons, .milestone (for analysis)
-#    - On start: Read .code for stuck state, analyze, write suggestions to .domain
-#
-#    DOMAIN MODEL RESTRICTIONS (CRITICAL):
-#    - DO NOT write code or edit .s/.py files
-#    - DO NOT write to .code file (that's for code model only)
-#    - ONLY write analysis and suggestions to .domain file
-#    - .domain is for CODE MODEL consumption, not human consumption
-#    - Focus on providing long-term memory and context for code model
-#
-# DOMAIN MODEL FOCUS (provide what the coding model typically doesn't):
-# - Layout/offset/register mapping research:
-#   - LDS layout equations (row/col/stride/swizzle), byte-vs-dword addressing,
-#     per-wave base offsets, and exact ds_read_* / MFMA operand packing.
-#   - MFMA fragment output mapping (which vreg/acc maps to which (row,col)),
-#     and how STORE_O must reconstruct the logical tile.
-# - BF16 reference extraction:
-#   - Swizzle constants (0x8200 base, wave stride 0x408, m0 steps 0x2040/0x2080/0x2200)
-#   - Barrier/waitcnt placement patterns around LDS/VMEM and MFMA
-# - ISA/hardware-quirk investigation behind current blockers:
-#   - e.g., buffer_load ... lds hazards, m0 timing, ds_read_tr8_b64 / ds_read_b64_tr_b16 usage
-# - Concrete minimal experiments:
-#   - "change only one variable" tests (address math vs layout vs packing) with
-#     exact file names + where to instrument + what output signature to expect.
-# - Provide short formulas/snippets + cite the exact reference file/lines that justify them.
-#
-# TRIGGER PROMPTS:
-# ----------------
-# For CODE MODEL:
-#   "You are the code/domain model. Read .domain for suggestions,
-#    implement and test them, update .code with results."
-#
-# For DOMAIN MODEL:
-#   "You are the domain/search model. Read .code for the stuck state,
-#    analyze the problem, write suggestions to .domain."
-#
-# WORKFLOW:
-# ---------
-# 1. CODE MODEL works on implementation, hits a wall
-# 2. CODE MODEL updates .code with:
-#    - Current state (what works, what doesn't)
-#    - Specific stuck point
-#    - Test results and observations
-#    - Questions for domain model
-#
-# 3. User triggers DOMAIN MODEL with prompt above
-# 4. DOMAIN MODEL reads .code and reference files (BF16 kernel, etc.)
-# 5. DOMAIN MODEL updates .domain with:
-#    - Analysis of the stuck point
-#    - Suggestions and hypotheses
-#    - References to similar patterns
-#    - Specific code patterns to try
-#
-# 6. User triggers CODE MODEL with prompt above
-# 7. CODE MODEL reads .domain suggestions
-# 8. CODE MODEL implements and tests suggestions
-# 9. CODE MODEL updates .code with results
-# 10. Repeat until solved
-#
-# KEY FILES:
-# ----------
-# .code   - CODE MODEL's thoughts, stuck points, test results
-# .domain - DOMAIN MODEL's analysis, suggestions, references
-#
-# CONTEXT FILES (both models should reference):
-# - hsa/gfx950/fmha_v3_fwd_fp8/fwd_fp8_kloop.s  (working 64T kernel)
-# - hsa/gfx950/fmha_v3_fwd_fp8/fwd_fp8_128q.s   (broken 256T kernel)
-# - hsa/gfx950/fmha_v3_fwd/fwd_hd128_bf16.s     (BF16 reference)
-# - .milestone, .lessons, .numerics             (project state)
-#
+
+## TWO MODELS
+
+### CODE MODEL
+- Trigger: "You are the code model"
+- Role: Write assembly, run tests, implement fixes
+- Writes to: `.code` (summary of EVERY turn), `.path` files (current approach)
+- Reads from: `.domain` (proven facts), `.lessons` (HW knowledge)
+- GPU: 0 (HIP_VISIBLE_DEVICES=0)
+
+**CODE MODEL TURN TEMPLATE** (append to .code every turn):
+```
+=== TURN [timestamp] ===
+ACTION: [what I did]
+RESULT: [pass/fail + key numbers]
+INSIGHT: [what I learned]
+NEXT: [immediate next step]
+BLOCKER: [if stuck, specific question for domain model]
+```
+
+### DOMAIN MODEL
+- Trigger: "You are the domain model"
+- Role: Research, analyze, provide proven facts
+- Writes to: `.domain` (ONLY proven facts with evidence)
+- Reads from: `.code` (code model's log), BF16 reference, ISA docs
+- GPU: 7 (HIP_VISIBLE_DEVICES=7)
+
+**DOMAIN MODEL OUTPUT TEMPLATE**:
+```
+=== PROVEN FACT: [name] ===
+CLAIM: [precise statement]
+EVIDENCE: [file:line or test result]
+FORMULA: [if applicable]
+```
+
+## WORKFLOW
+1. Code model works → logs to .code every turn
+2. Code model hits blocker → writes specific question in .code
+3. User triggers domain model
+4. Domain model reads .code → researches → writes PROVEN FACTS to .domain
+5. User triggers code model
+6. Code model reads .domain → applies proven facts → continues
+
+###############################################################################
+# SINGLE PATH TRACKING
 ###############################################################################
 
-# PING-PONG USAGE NOTES (clarity for domain model)
-# -------------------------------------------------
-# - Domain model is called less frequently; think longer and capture context.
-# - Domain model acts as external memory: always summarize the path (from
-#   last known good state → current hypotheses → pointers to files/tests).
-# - When code model starts with missing context, its first step is to read
-#   .domain to resume work.
-# - Domain entries should include: progress so far, key files touched,
-#   learnings, and concrete next pointers for the code model.
-#
-# DOMAIN MODEL OUTPUT CHECKLIST (put this into every .domain entry)
-# - CURRENT BLOCKER: one sentence
-# - HYPOTHESES (ranked): 2-5 bullets, each testable
-# - LAYOUT/PACKING DETAILS: explicit address formulas / swizzle constants
-# - MINIMAL EXPERIMENTS: exact kernel/test file to edit + expected outcome signature
-# - BF16 PARALLEL: what BF16 does at the analogous step (with constants)
-#
-# DOMAIN MODEL: CURRENT TOP BLOCKERS (keep this list high-level; update as phases change)
-# - FP8 data format alignment: ensure the FP8 byte encoding used by inputs and by
-#   `v_cvt_pk_fp8_f32` matches what `v_mfma_*_fp8_fp8` expects on the current gfx.
-# - LDS staging correctness: confirm global→LDS population covers the full tiles
-#   (no partial writes / aliasing), and that ds_read_* addresses are in BYTES.
-# - MFMA fragment mapping: ensure output stores reconstruct the logical (row,col)
-#   tile correctly (STORE_O mapping), not a naive row-major dump of accumulators.
-# - Swizzle/perf gating: implement BF16-style swizzle (and TR8/TR16 transpose path)
-#   once numerics are stable; row-major LDS is not scalable.
-#
-# DOMAIN MODEL SUMMARY:
-# - Purpose: Provide external memory and detailed analysis for CODE MODEL
-# - Output: .domain file only (structured suggestions, hypotheses, formulas)
-# - NOT for: Writing code, direct human communication
-# - Think of .domain as "notes to the coding assistant" not "notes to human"
+At any time there is ONLY ONE active approach per problem being worked on.
+
+## PATH FILES (*.path)
+
+Create a `.path` file for any component/problem being actively worked on.
+Name it descriptively: `<component>.path` or `<problem>.path`
+
+Examples:
+- `multiblock.path` - Adding multi-block grid support
+- `lds_swizzle.path` - Implementing bank-conflict-free LDS layout
+- `kloop_pipeline.path` - Overlapping K-tile loads with compute
+- `p_redistribution.path` - Fixing P matrix layout for PV MFMA
+
+**PATH FILE FORMAT**:
+```
+STATUS: [exploring|testing|proven|abandoned]
+APPROACH: [one-line description]
+KEY_PARAMS: [specific values, formulas, constants]
+TEST_RESULT: [last test: PASS/FAIL + key numbers]
+NEXT_STEP: [immediate action]
+ABANDONED_REASON: [only if STATUS=abandoned]
+```
+
+**RULES**:
+- ONE active path per problem (don't explore multiple approaches simultaneously)
+- When switching approaches: set STATUS=abandoned with reason, create new .path
+- When approach works: set STATUS=proven, document in .lessons if HW-related
+- Delete old .path files when no longer relevant
+
+###############################################################################
+# KEY FILES
+###############################################################################
+
+## STATUS FILES
+- `.code` - Code model's turn-by-turn log (append-only during session)
+- `.domain` - Domain model's proven facts (curated, verified)
+- `.lessons` - HW knowledge (layouts, errors, ISA quirks) - see below
+- `.milestone` - High-level project status and roadmap
+
+## PATH FILES
+- `*.path` - Current approach for each component (see above)
+
+## REFERENCE FILES
+- `hsa/gfx950/fmha_v3_fwd/fwd_hd128_bf16.s` - BF16 reference kernel
+- `hsa/gfx950/fmha_v3_fwd_fp8/*.s` - FP8 kernel development
+
+###############################################################################
+# .lessons FILE STRUCTURE
+###############################################################################
+
+Focus ONLY on hardware knowledge that prevents repeated mistakes:
+
+## Categories:
+1. LDS LAYOUT - pitch, swizzle formulas, bank conflict rules
+2. MFMA MAPPING - input packing, output fragment layout
+3. MEMORY OPS - buffer_load quirks, waitcnt rules
+4. REGISTER HAZARDS - VGPR conflicts, SGPR clobbers
+5. DEBUG TECHNIQUES - how to extract values, common traps
+
+## Format:
+```
+### [CATEGORY]: [Title]
+SYMPTOM: [what goes wrong]
+CAUSE: [why]
+FIX: [what to do]
+EXAMPLE: [code snippet if helpful]
+```
+
+DO NOT put in .lessons:
+- Strategy decisions (those go in .path files)
+- Session-specific debugging notes (those go in .code)
+- Unverified hypotheses (those stay in .domain until proven)
+
+###############################################################################
+# BENCHMARKING
+###############################################################################
+
+Command: `python /sgl-workspace/sglang/benchmark/kernels/bench_mi350_fmha_asm.py --seq-len 32130`
+
+Grid size MUST be full:
+```
+grid_x = ceil(S / Q_rows_per_block)  # Q-tiles
+grid_y = B * H                        # batch × heads
+```
+
+FLOPs: `4 * B * H * S * S * D` (full attention)
+
+Single-block benchmarks are INVALID for TF/s measurement.
+
+###############################################################################
+# PROFILING WITH ROCPROF
+###############################################################################
+
+Use rocprof to identify bottlenecks. Key metrics for MFMA kernels:
+also refer to  ../rocprof-compute-viewer
+
+## Quick Profile (timing only)
+```bash
+rocprof --stats python test.py
+```
+
+## LDS Bank Conflicts
+```bash
+rocprof -i metrics.txt python test.py
+# metrics.txt:
+pmc: SQ_LDS_BANK_CONFLICT
+```
+
+## Memory vs Compute Bound
+```bash
+# metrics.txt:
+pmc: GRBM_COUNT, GRBM_GUI_ACTIVE
+pmc: SQ_WAVES, SQ_INSTS_VALU, SQ_INSTS_LDS
+pmc: TCC_HIT, TCC_MISS, TCC_EA_RDREQ, TCC_EA_WRREQ
+```
+
+## MFMA Utilization
+```bash
+# metrics.txt:
+pmc: SQ_INSTS_VALU_MFMA
+```
+
+## Common Bottlenecks
+| Symptom | Metric | Cause | Fix |
+|---------|--------|-------|-----|
+| Low TF/s | High SQ_LDS_BANK_CONFLICT | LDS stride = 128 | Use stride 132/136 |
+| Low TF/s | Low SQ_INSTS_VALU_MFMA | Memory stalls | Pipeline loads |
+| Low TF/s | High TCC_MISS | Poor cache reuse | Tile for L2 |
+
+## Profile Single Kernel
+```bash
+HIP_VISIBLE_DEVICES=0 rocprof --stats -o profile.csv python test.py
+# Check profile.csv for kernel duration
+```
+
+###############################################################################
+# CRITICAL RULES
+###############################################################################
+
+1. **Never use flat_load/flat_store** - always buffer_load/buffer_store
+2. **Always set HIP_VISIBLE_DEVICES** before GPU code
+3. **Log every turn** in .code (code model)
+4. **Only proven facts** go in .domain (domain model)
+5. **One path at a time** - track in .path files
+6. **struct.unpack for uint32** in float32 debug buffers
+
+###############################################################################
+# FILE MODIFICATION RULES
+###############################################################################
+
+- `.code` - Code model appends freely during session
+- `.domain` - Domain model writes proven facts only
+- `.path` - Either model updates current approach status
+- `.lessons` - Requires user approval (HW knowledge only)
+- `.milestone` - Requires user approval
+- `.cursorrules` - Requires user approval

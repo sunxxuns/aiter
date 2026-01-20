@@ -1,1077 +1,226 @@
-# FP8 Flash Attention Assembly Kernel - Lessons Learned
+# FP8 Flash Attention - Hardware Knowledge
 
-## Table of Contents
-1. [CRITICAL BUGS](#1-critical-bugs---read-first)
-2. [Data Formats](#2-data-formats)
-3. [MFMA Instructions](#3-mfma-instructions)
-4. [LDS & Memory](#4-lds--memory)
-5. [Layout & Redistribution](#5-layout--redistribution)
-6. [Multi-Wave Architecture](#6-multi-wave-architecture)
-7. [Numerical Stability](#7-numerical-stability)
-8. [Testing & Debugging](#8-testing--debugging)
+Focus: Verified HW facts that prevent repeated mistakes.
+NOT for: Strategy decisions, session notes, unverified hypotheses.
 
 ---
 
-# 1. CRITICAL BUGS - READ FIRST!
+## 1. LDS LAYOUT
 
-## 1.1 Python Debug Buffer Bug (HOURS WASTED!)
+### 1.1 Bank Conflict Rules
+SYMPTOM: Kernel is slow, rocprof shows high SQ_LDS_BANK_CONFLICT
+CAUSE: Multiple threads accessing same bank (32 banks, 4 bytes each)
+FIX: Use stride that spreads accesses across banks
 
-**Problem**: `ds_read_b64` appeared to return zeros while `ds_read_u8` worked.
+| Stride | Conflict Factor | Notes |
+|--------|-----------------|-------|
+| 128    | 16x             | All rows hit same bank (128 = 32×4) |
+| 132    | 0x              | Optimal - each row different bank |
+| 136    | 0x              | Also optimal |
 
-**Root Cause**: Python `int(tensor.item())` truncates small float values to 0!
-
-```python
-# WRONG - int() truncates small floats to 0!
-debug = torch.zeros(64, 8, dtype=torch.float32, device='cuda')
-# ... kernel stores uint32 0x2e9b391c as raw bits ...
-b64_lo = int(d[0].item())  # Returns 0! (float value is ~0.000000)
-
-# CORRECT - interpret raw bits!
-import struct
-def as_u32(f): return struct.unpack('I', struct.pack('f', f))[0]
-b64_lo = as_u32(d[0].item())  # Returns 0x2e9b391c correctly!
+### 1.2 Stride-132 Formula
+```asm
+// Write: LDS[row * 132 + col]
+// Read:  same formula
+v_mov_b32_e32 v2, 132
+v_mul_lo_u32 v5, row, v2
+v_add_u32_e32 v5, col, v5
 ```
 
-**Rule**: ALWAYS use `struct.unpack('I', struct.pack('f', val))` for uint32 in float32 buffers!
+### 1.3 XOR Swizzle Alternative
+```asm
+// swizzle = ((offset & 0x1ff) >> 7) << 3
+// addr = offset ^ swizzle
+v_and_b32_e32 tmp, 0x1ff, offset
+v_lshrrev_b32_e32 tmp, 7, tmp
+v_lshlrev_b32_e32 tmp, 3, tmp
+v_xor_b32_e32 addr, tmp, offset
+```
 
 ---
 
-## 1.2 MFMA Metadata Corruption
+## 2. MFMA MAPPING
 
-**Problem**: Isolated MFMA kernel produces garbage/NaN while working kernel is correct.
+### 2.1 FP8 MFMA 32x32x16 Operand Layout
+**A operand (32M × 16K)**: 2 AGPRs = 8 FP8 values
+- Thread t: `A[M=t%32, K=(t/32)*8:(t/32)*8+8]`
+- Threads 0-31: K=0..7, threads 32-63: K=8..15
 
-**Root Cause**: `.amdhsa_accum_offset` and VGPR count too low.
+**B operand (16K × 32N)**: 2 VGPRs = 8 FP8 values
+- Thread t: `B[K=(t/32)*8:(t/32)*8+8, N=t%32]`
 
+### 2.2 MFMA Output Layout (INTERLEAVED!)
+Output 32M × 32N stored in 16 VGPRs (v32-v47):
+```
+row  | threads 0-31  | threads 32-63 | vreg
+-----|---------------|---------------|------
+0-3  | v32-v35       | -             |
+4-7  | -             | v32-v35       |
+8-11 | v36-v39       | -             |
+...
+```
+Formula: `row = ((v-32)%4) + ((tid/32)*4) + ((v-32)/4)*8`
+
+### 2.3 K=64 MFMA (2x Efficiency)
 ```asm
-// WRONG (causes MFMA output corruption):
-.amdhsa_next_free_vgpr 48
-.amdhsa_accum_offset 48
+// v_mfma_f32_32x32x64_f8f6f4: 2K FLOPs/cycle (vs 1K for K=16)
+v_mfma_f32_32x32x64_f8f6f4 v[acc], v[A], v[B], v[acc]
+// A: 8 VGPRs, B: 8 VGPRs, acc: 16 VGPRs
+```
 
-// CORRECT:
+---
+
+## 3. MEMORY OPS
+
+### 3.1 buffer_load→LDS Pattern
+```asm
+// Direct global→LDS, bypasses VGPRs
+s_mov_b32 s11, 0x20000              // buffer flags
+v_lshlrev_b32_e32 v1, 4, v0         // voffset = tid * 16
+s_mov_b32 m0, LDS_BASE
+buffer_load_dwordx4 v1, s[8:11], 0 offen lds
+// 64 threads × 16 bytes = 1024 bytes
+```
+
+### 3.2 soffset Must Be SGPR
+```asm
+// BAD: immediate doesn't work for soffset
+buffer_load_dwordx4 v1, s[8:11], 1024 offen lds  // ERROR
+
+// GOOD: use SGPR
+s_mov_b32 s20, 1024
+buffer_load_dwordx4 v1, s[8:11], s20 offen lds   // OK
+```
+
+### 3.3 NEVER Use flat_load/flat_store
+SYMPTOM: Kernel works but slow
+CAUSE: flat_* has higher latency, worse scheduling
+FIX: Always use buffer_load/buffer_store with descriptors
+
+---
+
+## 4. REGISTER HAZARDS
+
+### 4.1 VGPR Corruption in K-Loop
+SYMPTOM: v[0:15] accumulators corrupt after 2+ K-tiles
+CAUSE: Pipeline interaction between buffer_load and MFMA
+FIX: Use high VGPRs for accumulators
+```asm
+// BAD
+v_mfma_f32_32x32x64_f8f6f4 v[0:15], ...
+
+// GOOD
+v_mfma_f32_32x32x64_f8f6f4 v[80:95], ...
+```
+
+### 4.2 v_cvt_pk_fp8_f32 Garbage in High Bits
+SYMPTOM: NaN from MFMA after FP8 conversion
+CAUSE: v_cvt_pk_fp8_f32 only writes low 16 bits
+FIX: Mask after conversion
+```asm
+v_cvt_pk_fp8_f32 v72, v64, v65
+v_and_b32_e32 v72, 0xFFFF, v72     // REQUIRED: clear garbage
+```
+
+### 4.3 amdhsa_accum_offset Must Match VGPRs
+SYMPTOM: MFMA output is garbage/NaN
+CAUSE: Metadata doesn't reserve enough AGPRs
+FIX: Match known-working kernel (usually 148+)
+```asm
 .amdhsa_next_free_vgpr 148
 .amdhsa_accum_offset 148
 ```
 
-**Rule**: When in doubt, match metadata from a known-working kernel!
+### 4.4 v_readfirstlane_b32 Same for All Waves
+SYMPTOM: All waves compute same result
+CAUSE: v_readfirstlane returns lane 0 value to SGPR (same for all waves)
+FIX: Keep wave-varying values in VGPRs
 
 ---
 
-## 1.3 v_cvt_pk_fp8_f32 Leaves Garbage in High Bits
-
-**Problem**: NaN outputs from MFMA when using converted FP8 values.
-
-**Root Cause**: `v_cvt_pk_fp8_f32` only writes low 16 bits; high 16 bits are garbage!
-
-```asm
-v_cvt_pk_fp8_f32 v72, v64, v65        // Low 16 bits = valid FP8
-v_and_b32_e32 v72, 0xFFFF, v72        // REQUIRED: Clear garbage!
-v_cvt_pk_fp8_f32 v73, v66, v67
-v_lshlrev_b32_e32 v73, 16, v73        // Shift to high 16 bits
-v_or_b32_e32 v20, v72, v73            // Safe to combine now
-```
-
----
-
-# 2. DATA FORMATS
-
-## 2.1 FP8 Format: MFMA Uses e4m3fn (OCP), NOT e4m3fnuz!
-
-**THE MOST CRITICAL FINDING**: Wrong FP8 format causes 2× output values!
-
-| Value    | e4m3fnuz byte | e4m3fn (OCP) byte |
-|----------|---------------|-------------------|
-| 0.015625 | 16            | 8                 |
-| 0.03125  | 24            | 16                |
-| 0.0625   | 32            | 24                |
-| 0.125    | 40            | 32                |
-
-**Rules**:
-- `v_cvt_pk_fp8_f32` produces OCP (e4m3fn) format
-- In PyTorch: use `torch.float8_e4m3fn`, NOT `torch.float8_e4m3fnuz`
-
----
-
-## 2.2 FP8 Precision Limitations
-
-FP8 e4m3 has limited precision for larger values:
-- Values 0-16: Exact representation
-- Values 17,19,21,23,25,27,29,31: Round to nearest even
-- Max representable: ~448
-
-**Rule**: Use values in exact FP8 range for algorithm testing.
-
----
-
-# 3. MFMA INSTRUCTIONS
-
-## 3.1 FP8/BF16 MFMA Minimum Size: 32×32 ONLY!
-
-**CRITICAL HARDWARE CONSTRAINT on gfx950 (MI300X/MI350)**:
-
-For FP8 and BF16, only ONE MFMA size exists:
-- FP8: `v_mfma_f32_32x32x16_fp8_fp8` (32×32 output, K=16)
-- BF16: `v_mfma_f32_32x32x8_bf16` (32×32 output, K=8)
-
-**There are NO 8×8 or 16×16 variants for FP8/BF16!**
-
-```bash
-echo "v_mfma_f32_16x16x32_fp8_fp8 ..." | llvm-mc -mcpu=gfx950  # ERROR
-echo "v_mfma_f32_32x32x16_fp8_fp8 ..." | llvm-mc -mcpu=gfx950  # OK
-```
-
----
-
-## 3.2 MFMA 32x32x16 Operand Layout
-
-**A operand (32M × 16K)**:
-- Thread t provides `A[M=t%32, K=(t/32)*8:(t/32)*8+8]`
-- Threads 0-31: K=0..7 for M rows 0-31
-- Threads 32-63: K=8..15 for M rows 0-31
-
-**B operand (16K × 32N)**:
-- Thread t provides `B[K=(t/32)*8:(t/32)*8+8, N=t%32]`
-- Threads 0-31: K=0..7 for N cols 0-31
-- Threads 32-63: K=8..15 for N cols 0-31
-
----
-
-## 3.3 MFMA Output Layout (INTERLEAVED!)
-
-**Output (32M × 32N)** - Thread t owns `C[M_rows_interleaved, N=t%32]`:
-
-```
-row  | col 0-31 threads           | vreg
------|----------------------------|------
-0-3  | threads 0-31 (tid//32=0)   | v32-v35
-4-7  | threads 32-63 (tid//32=1)  | v32-v35  
-8-11 | threads 0-31 (tid//32=0)   | v36-v39
-12-15| threads 32-63 (tid//32=1)  | v36-v39
-16-19| threads 0-31               | v40-v43
-20-23| threads 32-63              | v40-v43
-24-27| threads 0-31               | v44-v47
-28-31| threads 32-63              | v44-v47
-```
-
-**Formula**: `col = tid % 32, row = ((v-32)%4) + ((tid//32)*4) + ((v-32)//4)*8`
-
----
-
-# 4. LDS & MEMORY
-
-## 4.1 buffer_load→LDS Pattern
-
-`buffer_load_dwordx4 ... lds` writes directly to LDS, bypassing VGPRs:
-
-```asm
-// Setup buffer descriptor s[8:11]
-s_mov_b32 s11, 0x20000              // flags
-
-// Each thread loads 16 bytes: buffer[voffset] → LDS[m0 + tid*16]
-v_lshlrev_b32_e32 v1, 4, v0         // voffset = tid * 16
-s_mov_b32 m0, LDS_BASE
-buffer_load_dwordx4 v1, s[8:11], 0 offen lds
-
-// 64 threads × 16 bytes = 1024 bytes in ONE instruction
-s_waitcnt vmcnt(0)
-s_barrier
-```
-
----
-
-## 4.2 HD=128 Loading: Multiple buffer_load with soffset
-
-For Q[32×128] = 4KB, need 4 wavefront loads:
-
-```asm
-v_lshlrev_b32_e32 v1, 4, v0    // voffset = tid * 16 (fixed)
-
-// Load 0: global[0:1024] → LDS[0:1024]
-s_mov_b32 m0, 0
-s_mov_b32 s20, 0
-buffer_load_dwordx4 v1, s[8:11], s20 offen lds
-
-// Load 1: global[1024:2048] → LDS[1024:2048]
-s_mov_b32 m0, 1024
-s_mov_b32 s20, 1024
-buffer_load_dwordx4 v1, s[8:11], s20 offen lds
-// ... repeat for loads 2, 3
-```
-
-**Key**: soffset must be an SGPR, not immediate!
-
----
-
-## 4.3 ds_read_b64_tr_b8 Transpose Read
-
-**Base address scaling**: `base = position * 8`
-
-```asm
-v_and_b32_e32 v6, 15, v0           // D = lane % 16
-v_lshlrev_b32_e32 v6, 3, v6        // base = D * 8 (REQUIRED!)
-ds_read_b64_tr_b8 v[30:31], v6     // Reads with stride 16
-```
-
-**Limitation**: Reliable only for positions 0-127.
-
----
-
-# 5. LAYOUT & REDISTRIBUTION
-
-## 5.1 P Redistribution is REQUIRED for PV MFMA
-
-After QK MFMA, thread t has: `P[Q_rows_interleaved, K=t%32]` - 16 Q values at ONE K column
-
-For PV MFMA, thread t needs: `P[Q=t%32, K_range]` - ONE Q value at 8 K columns
-
-**The layouts are TRANSPOSED** - must redistribute via LDS:
-
-```asm
-// Write P to LDS: P[Q, K] at offset Q*32 + K
-v_and_b32_e32 v4, 31, v0              // K = tid % 32
-v_add_u32_e32 v5, LDS_P_OFFSET, v4
-ds_write_b8 v5, v3                    // Write for Q=0
-ds_write_b8 v5, v3 offset:32          // Write for Q=1
-
-s_barrier
-
-// Read P for PV MFMA: P[Q=tid%32, K_start..K_start+8]
-v_and_b32_e32 v6, 31, v0              // Q = tid % 32
-v_lshrrev_b32_e32 v7, 5, v0           // K_group = tid / 32
-v_lshlrev_b32_e32 v7, 3, v7           // K_start = K_group * 8
-v_lshlrev_b32_e32 v6, 5, v6           // Q * 32
-v_add_u32_e32 v6, v6, v7              // + K_start
-ds_read_b64 v[32:33], v6              // Read 8 FP8 P values
-```
-
-**Why uniform P works without redistribution**: Same values regardless of layout.
-
----
-
-## 5.2 Scatter Store Pattern for Interleaved Output
-
-```asm
-v_and_b32_e32 v3, 31, v0              // N = tid % 32
-v_lshrrev_b32_e32 v4, 5, v0           // M_base = (tid/32)*4
-
-.macro STORE_VREG vreg, row_mod4, row_8_group
-    v_mov_b32_e32 v7, \row_mod4
-    v_add_u32_e32 v7, v7, v_row_half_x4   // + (tid//32)*4
-    v_add_u32_e32 v7, \row_8_group * 8, v7
-    v_lshlrev_b32_e32 v7, 5, v7           // row * 32
-    v_add_u32_e32 v7, v7, v_col           // + col
-    v_lshlrev_b32_e32 v7, 2, v7           // × 4 bytes
-    flat_store_dword [ptr + v7], vreg
-.endm
-```
-
----
-
-# 6. MULTI-WAVE ARCHITECTURE
-
-## 6.1 BF16 Reference: 128 Q Rows, 32 Per Wave
-
-**Analysis of fwd_hd128_bf16.s**:
-
-| Wave | Q Row Range | Output Rows | LDS Region |
-|------|-------------|-------------|------------|
-| 0 | 0-31 | 0-31 | 0x8200 + 0×0x408 |
-| 1 | 32-63 | 32-63 | 0x8200 + 1×0x408 |
-| 2 | 64-95 | 64-95 | 0x8200 + 2×0x408 |
-| 3 | 96-127 | 96-127 | 0x8200 + 3×0x408 |
-
-```asm
-// Output offset per wave (line 2469)
-s_mul_i32 s40, s5, 32              // wave_id × 32 rows
-
-// LDS offset per wave (line 180-181)
-s_mul_i32 s63, 0x408, s5           // wave_id × 1032 bytes
-s_add_u32 s63, 0x8200, s63         // + 33280 base
-```
-
----
-
-## 6.2 Wrong Assumption That Blocked 256T Progress
-
-**WRONG**: "Each wave handles 8 Q rows, compute 32×32, use only 8 rows"
-
-**CORRECT**: "Each wave handles 32 Q rows (complete MFMA tile)"
-
-**Why this matters**:
-- With 8 rows/wave: 4× redundant compute
-- With 32 rows/wave: no redundancy, waves independent
-- BF16's ~1000 TF/s comes from 4× more work, not 4× parallelism on same work
-
----
-
-# 7. NUMERICAL STABILITY
-
-## 7.1 Online Softmax Numerical Limits
-
-**Problem**: Kernel fails with extreme attention patterns.
-
-**Failure Conditions**:
-1. Large input values (σ > 1.0) → Large S values
-2. Structured inputs (Q and K both row-varying) → Extreme patterns
-3. S values > 50 before scaling → P underflow/overflow
-
-**Working Conditions**:
-- Random inputs with σ ≤ 0.5: Max error ~0.1
-- Uniform attention patterns: Max error ~0
-- Properly normalized inputs: Reliable
-
-**Production Guidelines**:
-- Normalize Q, K, V to mean=0, std≈0.5
-- Keep values in FP8 range (-3.5 to 3.5)
-- LLM inference typically satisfies these constraints
-
----
-
-# 8. TESTING & DEBUGGING
-
-## 8.1 Test Methodology
-
-| Rule | Reason |
-|------|--------|
-| NEVER use uniform inputs | Hides bugs due to symmetry |
-| Use random data with controlled σ | Reveals layout/ordering bugs |
-| Test edge cases | Large, small, structured patterns |
-| Compare vs PyTorch reference | Use same FP8-quantized inputs |
-| Check for NaN | Indicates fundamental errors |
-| Error threshold ~0.5 for FP8 | Limited precision |
-
----
-
-## 8.2 Verified Test Patterns
-
-| Test | Pattern | Expected | Purpose |
-|------|---------|----------|---------|
-| test_mfma_k_sum.s | A=1, B=K | 120 | K reduction |
-| test_mfma_m_index.s | A=M, B=1 | M*16 | M-row distribution |
-| test_attention_pv.s | P=1/16, V=d | d | D propagation |
-| test_p_redistrib.s | P=(k+1)/16 | 8.5 | P redistribution |
-
----
-
-## 8.3 QK MFMA for HD=128: 8 Passes
-
-```asm
-// Thread mapping
-v_and_b32_e32 v2, 31, v0              // row = tid % 32
-v_lshrrev_b32_e32 v3, 5, v0           // half = tid / 32
-
-// Q base: row * 128 + half * 8
-v_lshlrev_b32_e32 v5, 7, v2           // row * 128
-v_lshlrev_b32_e32 v4, 3, v3           // half * 8
-v_add_u32_e32 v5, v5, v4
-
-// K base at LDS offset 4096
-v_add_u32_e32 v6, 4096, v5
-
-// 8 MFMA passes, advancing by 16 bytes each
-.irp k_off, 0, 16, 32, 48, 64, 80, 96, 112
-    v_add_u32_e32 v7, \k_off, v6
-    v_add_u32_e32 v8, \k_off, v5
-    ds_read_b64 v[20:21], v7          // K
-    ds_read_b64 v[22:23], v8          // Q
-    s_waitcnt lgkmcnt(0)
-    v_accvgpr_write_b32 a0, v20
-    v_accvgpr_write_b32 a1, v21
-    s_nop 1
-    v_mfma_f32_32x32x16_fp8_fp8 v[32:47], a[0:1], v[22:23], v[32:47]
-    s_nop 15
-.endr
-```
-
----
-
-## Quick Reference
-
-### Critical Rules
-1. Use `struct.unpack` for uint32 in float32 debug buffers
-2. Match `.amdhsa_accum_offset` to working kernel (148)
-3. Mask `v_cvt_pk_fp8_f32` output with 0xFFFF
-4. Use `torch.float8_e4m3fn` (not e4m3fnuz)
-5. MFMA 32×32 is minimum for FP8/BF16
-6. Each wave needs 32 Q rows (full MFMA tile)
-7. P redistribution via LDS is REQUIRED
-8. Test with random data, NEVER uniform
-
----
-
-## 8.4 Bug Found: P Storage/Read Layout Mismatch in fwd_fp8_kloop.s
-
-**Symptom**: Kernel works with uniform attention, fails with non-uniform attention.
-
-**Root Cause**: MFMA output is interleaved, but P read assumes contiguous rows!
-
-**MFMA Output Layout** (per column):
-- Thread 0 writes: rows 0,1,2,3, 8,9,10,11, 16,17,18,19, 24,25,26,27
-- Thread 32 writes: rows 4,5,6,7, 12,13,14,15, 20,21,22,23, 28,29,30,31
-
-**P Read Pattern** (current buggy code):
-- Thread 0 reads: rows 0,1,2,3,4,5,6,7 (WRONG - rows 4-7 belong to thread 32!)
-- Thread 32 reads: rows 8,9,10,11,12,13,14,15
-
-**Why uniform P works**: All P values identical, so reading wrong rows gives same values.
-
-**Why non-uniform P fails**: Thread reads P values from different Q rows than it computed.
-
-**Fix**: P read must account for interleaved MFMA layout. Either:
-1. Change P storage to be contiguous (deinterleave during store)
-2. Change P read to match interleaved layout
-
----
-
-## 8.5 Key Insight: Treat 2 FP8 as 1 BF16 for Layout (NOT Math!)
-
-**Problem**: FP8 lacks `ds_read_b64_tr_fp8` transpose instruction, causing P redistribution bugs.
-
-### You Don't Need a "tr_fp8" Instruction!
-
-On gfx950, the transpose-load family exists for multiple element widths — including 8-bit:
-- **TR8**: `ds_read_tr8_b64` for 8×i8 per lane (byte granularity)
-- **TR16**: `ds_read_b64_tr_b16` for 4×i16 per lane (16-bit granularity)
-
-For FP8:
-1. Use **TR8** to transpose bytes directly, then pack into MFMA format
-2. Or use **TR16** with "2 FP8 as 1 BF16" packing for potentially better perf
-
-### When "Two FP8 as One BF16" Makes Sense
-
-Think of it as `(fp8_a, fp8_b)` packed into a 16-bit word:
-```
-u16 = fp8_a | (fp8_b << 8)   // low byte first
-```
-
-- TR16 moves that u16 around efficiently as a unit
-- After transpose, reinterpret/unpack back into bytes (or directly into MFMA packing)
-
-**⚠️ CRITICAL: Do NOT feed those bits into BF16 math/conversion ops!**
-- `v_cvt_*bf16*` would interpret packed FP8 bits as a BF16 number → NONSENSE
-- This is purely for LAYOUT/SHUFFLE, not math!
-
-### Why TR16 Often Has Best Performance
-
-Raw LDS transpose is "load + cross-lane permute" in hardware, but overall perf depends on:
-1. How many extra permutes needed after the load
-2. Whether load result already matches MFMA operand packing
-
-If MFMA path wants pairs of FP8 grouped together, TR16 reduces post-shuffle instruction count.
-
-### Practical Recommendation for FP8 Flash-Attn
-
-**Option A: Start with TR8 (byte granularity)**
-1. Store V (or P) into LDS as i8 in same logical matrix shape
-2. Use `ds_read_tr8_b64` to read 8×i8 per lane in transposed pattern
-3. Use `v_perm_b32` / pack ops to form exact 32-bit chunks for MFMA
-4. Only then do FP8→F16/F32 expansion if needed
-
-**Option B: Use TR16 with "2 FP8 as BF16 container" (PREFERRED)**
-1. Pack adjacent FP8 pairs into 16-bit slots: `slot[i] = [fp8[2i], fp8[2i+1]]`
-2. Use `ds_read_b64_tr_b16` to transpose these 16-bit containers
-3. Unpack bytes after transpose if needed for MFMA
-4. Maximizes reuse of BF16 swizzle patterns
-
-**We want to maximize use of "2 FP8 as 1 BF16" idea, then unpack if needed.**
-Be careful about transpose semantics - the pairs stay together during transpose!
-
-### Implementation Notes
-- Pack FP8 pairs: `slot[i] = [fp8[2i], fp8[2i+1]]`
-- LDS layout: same byte offsets as BF16 kernel
-- Transpose: `ds_read_b64_tr_b16` works on 16-bit granularity
-- After transpose: bytes may need repacking for MFMA operand format
-
----
-
-## 8.6 Transpose Semantics: TR8 vs TR16 for FP8
-
-### Two Levels to Keep Straight
-
-**1) Logical matrix view**:
-- Original FP8 matrix A[m][k], with a=A[m0][k0], b=A[m0][k0+1] adjacent in K
-- After scalar transpose Aᵀ[k][m]:
-  - a → (row=k0, col=m0)
-  - b → (row=k0+1, col=m0)
-- **Yes: a and b end up in DIFFERENT ROWS in Aᵀ**
-
-**2) Packed view (what TR16 actually moves)**:
-- Pack two FP8 into one 16-bit lane: P[m][k2] = pack16(A[m][2k2], A[m][2k2+1])
-- Transpose P → Pᵀ[k2][m]
-- When you unpack Pᵀ[k2][m]:
-  - low byte = Aᵀ[2k2][m]
-  - high byte = Aᵀ[2k2+1][m]
-- **a and b are in different rows, but remain packed as a "row-pair" for same column**
-
-### TR8 is the Cleaner Option for FP8!
-
-CDNA4 ISA has `DS_READ_B64_TR_B8` (or `ds_read_tr8_b64`) for 8-bit element transpose:
-- Transpose at byte granularity = one FP8 per element
-- No pair-packing confusion
-- After transpose, each byte is already the correct transposed element
-- Just pack bytes into MFMA format
-
-**Constraints**:
-- EXEC must be all 1's before executing
-- LDS address must be aligned to data size
-- DS ops reading ≥64b have VGPR alignment requirements
-
-### If Using TR16 (Pipeline B1: "Pair-grid transpose")
-
-1. Pack adjacent FP8s into u16 pairs along chosen dimension
-2. Treat data as matrix of u16 pairs
-3. Transpose using TR16
-4. Unpack each u16 into two FP8s
-5. **Low byte → row 2k, High byte → row 2k+1** (for same output column)
-
-### Byte Order Footgun
-
-After TR16, you may need lane-local byte swap:
-- `(a | (b<<8)) → (b | (a<<8))`
-- Depends on: original packing, TR16 return format, MFMA operand format
-
-### Minimal Correctness Test
-
-```
-1. Fill LDS with known pattern: val = (row << 4) | col
-2. Run transpose path (pack → transpose → unpack)
-3. Store final FP8 bytes to global
-4. Check they match expected transpose
-```
-
-This tells you:
-- Whether you transposed pairs instead of scalars (2×2 blocks wrong)
-- Whether byte order inside pairs is flipped
-- Whether address math is correct
-
-### For Our FP8 Flash-Attn: MFMA v_mfma_f32_32x32x16_fp8_fp8 (wave32)
-
-- A operand: 2 VGPRs (a[0:1]) = 16 FP8 values
-- B operand: 2 VGPRs (v[30:31]) = 16 FP8 values
-
-**Recommendation**:
-- **Prefer TR_B8** for simplest correctness (scalar byte transpose)
-- Or use TR_B16 with explicit pair-grid interpretation if MFMA operand packing benefits
-
----
-
-## 8.7 P Redistribution Bug Analysis and Fix Options (2024-01-12)
-
-### Bug Summary
-The `fwd_fp8_kloop.s` kernel has incorrect P storage/read layout:
-- **Storage**: Thread 0 writes P[rows 0,1,2,3,8,9,10,11,...] for column 0
-- **Read**: Thread 0 reads P[rows 0,1,2,3,4,5,6,7] contiguously  
-- **Mismatch**: Rows 4-7 were written by thread 32, not thread 0!
-
-### Why Uniform Attention Works
-When all P values are identical, reading wrong rows gives same values.
-
-### How BF16 Handles This
-BF16 kernel keeps P in registers and uses it as **B operand** of MFMA:
-```asm
-// BF16 PV MFMA
-v_mfma_f32_32x32x16_bf16 v[96:111], v[192:195], v[32:35], v[96:111]
-//                       output      V (A operand) P (B operand)
-```
-- V is loaded with `ds_read_b64_tr_b16` (transpose read) into VGPRs
-- P stays in VGPRs from QK MFMA output, converted to BF16
-- No LDS round-trip for P!
-
-### Fix Options for FP8
-
-**Option A: Keep P in registers (like BF16)**
-- Convert P to FP8 directly from softmax output (v32-v47)
-- Load V into AGPRs (A operand)
-- Use P in VGPRs (B operand)
-- Swap operand positions: `v_mfma_f32_32x32x16_fp8_fp8 v[out], a[V], v[P], v[out]`
-- **Status**: Approach tested but implementation incomplete
-
-**Option B: Fix P read addresses**
-- Keep current storage layout
-- Change P read to match interleaved MFMA output pattern
-- Read rows 0,1,2,3 from current half-wave's storage
-- Read rows 4,5,6,7 from other half-wave's storage
-- **Complexity**: Medium
-
-**Option C: Use ds_read_b64_tr_b16 for P**
-- Store P with BF16-compatible swizzled layout
-- Use transpose read to get correct row-major P for PV MFMA
-- Requires implementing BF16's complex swizzle pattern
-- **Complexity**: High (need to match BF16 offset tables)
-
-### TR Instructions Available on gfx950
-- `ds_read_b64_tr_b8`: 8-bit element transpose (best for FP8)
-- `ds_read_b64_tr_b16`: 16-bit element transpose (BF16 compatible)
-
-Both require EXEC=all-ones and specific LDS alignment.
-
-### Recommendation
-**Option A** (keep P in registers) is closest to BF16's proven approach and avoids LDS complexity. However, requires careful operand swapping and understanding of MFMA A/B operand layouts.
-
----
-
-## 8.8 Correct Approach: Use ds_read_b64_tr_b16 (NOT ds_read_b64_tr_b8)
-
-### Why NOT ds_read_b64_tr_b8
-- Would be a **different strategy** than BF16 reference
-- .cursorrules: "do not rewrite different strategy than the bf16 reference"
-- Would require deriving new swizzle patterns for 8-bit elements
-
-### Why ds_read_b64_tr_b16 with "2 FP8 = 1 BF16" packing
-- **EXACT same** LDS byte layout as BF16
-- **EXACT same** instruction sequence
-- **EXACT same** swizzle pattern (proven bank-conflict-free)
-- Only data interpretation changes (2 FP8 per slot instead of 1 BF16)
-
-### Key Insight: Perfect Fit for FP8 MFMA!
-
-| Item | BF16 MFMA | FP8 MFMA |
-|------|-----------|----------|
-| Instruction | v_mfma_f32_32x32x16_bf16 | v_mfma_f32_32x32x16_fp8_fp8 |
-| A operand VGPRs | 4 (8 BF16) | 2 (8 FP8) |
-| B operand VGPRs | 4 (8 BF16) | 2 (8 FP8) |
-| ds_read_b64_tr_b16 result | 8 bytes = 4 BF16 | 8 bytes = 8 FP8 |
-| Reads per operand | 2 | 1 |
-
-FP8 needs **FEWER** LDS reads than BF16 for same MFMA!
-- BF16: 2 reads per operand (8 bytes × 2 = 16 bytes = 8 BF16)
-- FP8: 1 read per operand (8 bytes = 8 FP8)
-
-### Implementation Plan
-1. Use BF16's LDS layout exactly (same m0 offsets, same swizzle)
-2. Store FP8 data packed: slot[i] = [fp8[2i], fp8[2i+1]]
-3. Use ds_read_b64_tr_b16 with same offset table as BF16
-4. Result goes directly to MFMA operand (2 VGPRs)
-5. May need byte reorder if MFMA expects different packing (test empirically)
-
----
-
-## 8.9 Step 1 Verification: ds_read_b64_tr_b16 with BF16 Swizzle Works for FP8
-
-### Test Setup
-- 256 threads (4 waves × 64 threads) with wave64
-- Each thread writes [tid, tid+128] as FP8 pair to swizzled LDS address
-- Used BF16's swizzle formula: `(lane&1)*0x80 + (lane>>1)*0x408 + (lane>>5)*16 + wave_offset`
-
-### Key Finding: Wave Offset Must Use VGPR, Not SGPR!
-
-**BUG FOUND**: `v_readfirstlane_b32` returns same value for ALL waves!
-
-```asm
-// BAD: All waves get wave_id=0
-v_readfirstlane_b32 s6, v1    // s6 same for all waves!
-
-// GOOD: Keep wave_id in VGPR
-v_lshrrev_b32_e32 v1, 6, v0   // v1 = wave_id (VGPR)
-// Use v1 directly for wave offset calculation
-```
-
-### Transpose Read Results
-
-For threads at "correct" addresses (lane 0 of each wave):
-```
-Thread 0 got: [0,128], [4,132], [8,136], [12,140]
-             ↑ from tid=0  ↑ tid=4  ↑ tid=8  ↑ tid=12
-```
-
-The transpose read gathers data from stride-4 threads!
-
-### Interpretation for "2 FP8 = 1 BF16"
-
-| Before Transpose | After Transpose |
-|------------------|-----------------|
-| Thread 0 stores row 0 data | Thread 0 gets column 0 data |
-| Thread 4 stores row 4 data | (from rows 0,4,8,12) |
-
-This is EXACTLY the matrix transpose needed for MFMA!
-
-### Next Steps
-1. Fill LDS completely using `buffer_load ... offen lds` (like BF16)
-2. Verify all 256 threads get correct transposed data
-3. Feed into FP8 MFMA and verify output
-
----
-
-## 8.10 Step 2 Success: Swizzled Write + Transpose Read Works!
-
-### Key Finding
-**Must write data to LDS in swizzled pattern for transpose read to work!**
-
-### Working Pattern
-
-1. **Swizzled LDS Write Address**:
-```asm
-// Same formula as BF16's m0 calculation
-write_addr = 0x8200 + (lane&1)*0x80 + (lane>>1)*0x408 + (lane>>5)*16 + wave_offset
-```
-
-2. **Transpose Read Address** (same formula):
-```asm
-ds_read_b64_tr_b16 v[dst], v[addr]
-// addr uses same swizzle formula
-```
-
-### Results Verified
-
-Thread 0 transpose read: `[0, 1, 64, 65, 128, 129, 192, 193]`
-- Bytes 0-1: from thread 0 (input[0:2])
-- Bytes 2-3: from thread 4 (input[64:66])
-- Bytes 4-5: from thread 8 (input[128:130])
-- Bytes 6-7: from thread 12 (input[192:194])
-
-**Pattern**: Gathers from threads 0, 4, 8, 12 (stride 4)
-
-### For "2 FP8 = 1 BF16"
-- Each 16-bit slot contains 2 FP8 from same original row
-- 4 slots = data from 4 different rows
-- After transpose: 8 FP8 values ready for MFMA operand!
-
-### Implementation Notes
-- `buffer_load ... offen lds` didn't work (buffer descriptor issue)
-- Used `flat_load` + `ds_write` instead
-- Swizzle formula must match for write and read
-
----
-
-## 8.11 Step 3 Success: FP8 MFMA QK Verified
-
-### Key Findings
-
-1. **Simple row-major LDS works for QK MFMA**
-   - No swizzling needed for correctness (swizzle is for performance)
-   - Each thread loads 64 bytes from global → writes to LDS → reads 8 bytes for MFMA
-
-2. **FP8 MFMA Operand Layout**
-   - A operand: 2 AGPRs (a[0:1]) = 8 FP8
-   - B operand: 2 VGPRs (v[x:x+1]) = 8 FP8
-   - Output: 16 VGPRs = 16 F32
-
-3. **Compute S^T instead of S**
-   - Use K as A operand, Q as B operand
-   - S^T = K @ Q^T (avoids K transpose)
-   - Same as working kernel (fwd_fp8_kloop.s)
-
-4. **MFMA Output Layout**
-   - Output is NOT row-major
-   - But all 1024 values are correct (verified via sorted comparison)
-   - For flash attention: OK because softmax and PV MFMA use same layout
-
-### Verified Results
-- Uniform input (all 1s): All outputs = 128.0 ✓
-- Random input: Sorted values match reference (max_diff=0.0002) ✓
-
-### Code Pattern
-```asm
-// 8 MFMA iterations for HD=128
-.irp hd_off, 0, 16, 32, 48, 64, 80, 96, 112
-    ds_read_b64 v[30:31], v_K_addr offset:\hd_off
-    ds_read_b64 v[34:35], v_Q_addr offset:\hd_off
-    s_waitcnt lgkmcnt(0)
-    v_accvgpr_write_b32 a0, v30
-    v_accvgpr_write_b32 a1, v31
-    s_nop 1
-    v_mfma_f32_32x32x16_fp8_fp8 v[acc], a[0:1], v[34:35], v[acc]
-    s_nop 15
-.endr
-```
-
----
-
-## 8.12 Working 64T Kernel Verified
-
-### Test Results
-- Input: Q=K=V=1.0 (uniform), seq_len=32
-- Expected O: 1.0 (softmax distributes uniformly)
-- Actual O: 1.0 (exact match!)
-- max_diff: 0.000000
-
-### Key P/V Read Patterns (from fwd_fp8_kloop.s)
-
-**P (Attention weights)**:
-- Stored as F32 in LDS (not FP8!)
-- Read: 4 × ds_read_b64 = 32 bytes = 8 F32 values
-- Converted to FP8 with v_cvt_pk_fp8_f32 just before MFMA
-- Different P columns for K-pass 0 vs K-pass 1
-
-**V (Value matrix)**:
-- Read byte-by-byte with row-stride: ds_read_u8 at offsets 0, 128, 256, ...
-- 8 reads to get 8 values from 8 different rows
-- Pack into 2 VGPRs for MFMA B operand
-- This gives transposed access pattern needed for MFMA
-
-### Why step4_full.s Failed
-1. P stored directly as FP8 (should be F32, converted on read)
-2. V read sequentially (should be row-strided)
-3. Same P used for all HD tiles (wrong for K-pass separation)
-
-### Next Step: Scale to 256T
-- Working 64T kernel is correct
-- Scale by adding 3 more waves (4 total)
-- Follow BF16's wave coordination pattern
-
----
-
-## 8.13 VERIFIED: ds_read_b64 + Row-Major LDS + XOR Swizzle (2026-01-12)
-
-### Working Solution for FP8 QK MFMA
-
-**Approach**: Use `ds_read_b64` (non-transpose) with XOR swizzle for bank conflict avoidance.
-
-**XOR Swizzle Formula**:
-```asm
-.macro XOR_SWIZZLE dst, src, tmp
-    v_and_b32_e32 \tmp, 0x1ff, \src     // offset & 0x1ff
-    v_lshrrev_b32_e32 \tmp, 7, \tmp     // >> 7
-    v_lshlrev_b32_e32 \tmp, 3, \tmp     // << 3
-    v_xor_b32_e32 \dst, \tmp, \src      // offset ^ swizzle
-.endm
-```
-
-**MFMA A Operand Mapping (32 rows)**:
-```
-row16 = (lane & 3) + ((lane >> 3) & 3) * 4     // 0-15
-row_hi = (lane >> 2) & 1                        // 0 or 1
-full_row = row16 + row_hi * 16                  // 0-31
-k_base = 8 if lane >= 32 else 0
-```
-
-**LDS Layout**: Row-major with swizzle
-- K[row, k] at `swizzle(row * 16 + k)`
-- Apply same swizzle on both write and read paths
-
-### Benchmark Results
-
-| Comparison | Result |
-|------------|--------|
-| XOR swizzle vs no swizzle | **13% faster** with swizzle |
-| ds_read_b64 vs TR_B8 | ds_read_b64 is **12% faster** |
-
-### Numerical Verification - ALL PASS
-
-| Test | Result |
-|------|--------|
-| Uniform K=Q=1 | output = 16.0 ✓ |
-| Single K row | correct sum ✓ |
-| Single Q row | correct sum ✓ |
-| Random (3 seeds) | mean_diff=0.000 ✓ |
-| Identity pattern | exact match ✓ |
-
-### TR_B8 Gather Formula (Verified 2026-01-12)
-
-With per-lane address `base`:
-```
-output[k] = LDS[(base >> 3) + k * 16]  for k = 0..7
-```
-
-Example with `base = lane * 8`:
-- Lane 0 (base=0): reads LDS[0, 16, 32, 48, 64, 80, 96, 112]
-- Lane 1 (base=8): reads LDS[1, 17, 33, 49, 65, 81, 97, 113]
-- Lane 8 (base=64): reads LDS[8, 24, 40, 56, 72, 88, 104, 120]
-
-**This is column-major with stride 16!**
-
-To use TR_B8 for MFMA:
-1. Store K matrix in LDS column-major with 16-byte row stride
-2. Each lane reads 8 elements from one column (K dimension)
-3. Cross-lane distribution handles the M dimension
-
-**LDS Layout for TR_B8**:
-For K[row, col], store at: `LDS[row + col * 16]`
-
-Then with `base = mfma_row * 8`:
-- Lane reads: `output[k] = LDS[mfma_row + k * 16] = K[mfma_row, k]` ✓
-
-**Status**: TR_B8 formula verified, MFMA integration WIP (some NaN issues)
-
-### Recommendation
-
-Use **ds_read_b64 + row-major LDS + XOR swizzle** for FP8 flash attention:
-- ✅ Numerically correct
-- ✅ 13% faster than non-swizzled (bank conflict avoidance)
-- ✅ Simpler than TR_B8 approach
-
-**Files**: `stepA_full_qk.s`, `stepA_full_qk.py`, `stepD5_verify_stepA.py`
-
----
-
-## 8.14 BETTER SOLUTION: Stride-132 LDS Layout (Zero Bank Conflicts)
-
-### Root Cause of Bank Conflicts
-
-With HD=128 row stride (128 bytes), ALL rows hit **bank 0** because:
-- 128 bytes = 32 banks × 4 bytes
-- Every multiple of 128 hits the same bank!
-
-### Solution: Use Non-Aligned Stride
-
-**Stride 132** achieves **ZERO bank conflicts**:
-- 132 = 128 + 4 (adds 1 bank offset per row)
-- Each row hits a different bank
-- All 4 phases of `ds_read_b64` have 16 unique banks
-
-### Comparison
-
-| Approach | Conflicts/Phase | Speedup vs Naive |
-|----------|-----------------|------------------|
-| Stride 128 (naive) | 15 | Baseline |
-| XOR swizzle | 12 | +13% |
-| **Stride 132** | **0** | **+17%** |
-
-### Implementation
-
-```asm
-.set LDS_STRIDE, 132    // NOT 128!
-
-// Write: row * 132 + col
-v_mov_b32_e32 v2, LDS_STRIDE
-v_mul_lo_u32 v5, row, v2
-v_add_u32_e32 v5, col, v5
-
-// Read: same formula
-v_mul_lo_u32 v70, row, v2
-v_add_u32_e32 v70, k_base, v70
-ds_read_b64 v[30:31], v70
-```
-
-### LDS Size
-
-- Q: 32 rows × 132 stride = 4224 bytes
-- K: 32 rows × 132 stride = 4224 bytes
-- Total: ~8.5 KB (well under 64 KB limit)
-
-### Why This Works
-
-The MFMA row mapping produces rows [0,1,2,3,16,17,18,19,4,5,6,7,...] for phase 0.
-With stride 132:
-- Row 0: offset 0, bank 0
-- Row 1: offset 132, bank 1
-- Row 2: offset 264, bank 2
-- etc.
-
-Each row hits a different bank → zero conflicts.
-
-**Files**: `qk_fp8_stride132.s`, `qk_fp8_stride132_opt.s`, `test_qk_fp8_stride132.py`
-
----
-
-## 8.15 CRITICAL: fwd_fp8_qk_8wave_swizzle.s Has 16x Bank Conflicts!
-
-### Analysis Date: 2025-01-14
-
-The `fwd_fp8_qk_8wave_swizzle.s` kernel uses a simple pitch-128 layout for TR8 reads:
-
-```asm
-// Lines 72-76
-v_lshrrev_b32_e32 v3, 3, v57        // group = lane >> 3
-v_lshlrev_b32_e32 v3, 7, v3         // * 128 pitch
-v_and_b32_e32 v4, 7, v57            // col = lane & 7
-v_add_u32_e32 v3, v3, v4            // address = group*128 + col
-```
-
-### Bank Conflict Analysis
-
-| Approach | Banks Used | Max/Bank | Conflict Factor |
-|----------|-----------|----------|-----------------|
-| **8-wave TR8 (pitch-128)** | 3 | 64 | **16.0x** |
-| BF16-derived v8 (Q) | 32 | 4 | **1.0x** (optimal) |
-| BF16-derived v2 (K) | 32 | 4 | **1.0x** (optimal) |
-
-### Why Pitch-128 is Disastrous
-
-With pitch-128 for `ds_read_b64`:
-- Threads 0-7 all hit banks 0-1 (group 0, cols 0-7)
-- Threads 8-15 also hit banks 0-1 (group 1, same pattern)
-- All groups map to same 3 banks!
-- 64 threads × 2 banks = 128 accesses, but only 3 banks used
-
-### BF16-Derived Swizzle Achieves Optimal
-
-The complex BF16 swizzle formulas spread accesses across all 32 banks:
-
+## 5. DEBUG TECHNIQUES
+
+### 5.1 Reading uint32 from float32 Buffer
+SYMPTOM: Debug values show 0 when kernel wrote valid data
+CAUSE: Python int() truncates small floats to 0
+FIX: Use struct.unpack
 ```python
-# FP8 v8 (Q reads) - scaled from BF16
-v8 = ((tid >> 5) * 8)
-   + ((lane >> 2) & 1) * 128
-   + ((lane >> 3) & 3) * 1040
-   + (lane & 1) * 64
-   + ((lane >> 1) & 1) * 520
+# BAD
+val = int(tensor.item())  # Returns 0 for 0x2e9b391c!
 
-# FP8 v2 (K reads) - scaled from BF16
-v2 = ((tid >> 5) * 8)
-   + (lane & 1) * 64
-   + (lane >> 1) * 516
-   + 0x4100
+# GOOD
+import struct
+def as_u32(f): return struct.unpack('I', struct.pack('f', f))[0]
+val = as_u32(tensor.item())  # Returns 0x2e9b391c
 ```
 
-### Conclusion
+### 5.2 Test Patterns (NEVER Use Uniform Input)
+| Pattern | Purpose |
+|---------|---------|
+| Random σ≤0.5 | Reveals layout/ordering bugs |
+| Q=K=1.0 | Verify basic MFMA (expect output = K×16) |
+| Single row varies | Check row distribution |
+| Identity pattern | Exact output verification |
 
-**The simple pitch-128 layout is fundamentally flawed for performance.**
+### 5.3 HIP_VISIBLE_DEVICES
+```bash
+# Code model uses GPU 0
+HIP_VISIBLE_DEVICES=0 python test.py
 
-- Simple TR8 layout: 16x bank conflict overhead
-- BF16-style swizzle: 1.0x (optimal)
-
-**Recommendation**: Use BF16-derived swizzle formulas, not simple pitch-N layouts.
-
-**Files**: `.domain` (detailed formulas), `bf16_to_fp8_swizzle.py` (analysis)
+# Domain model uses GPU 7
+HIP_VISIBLE_DEVICES=7 python test.py
+```
 
 ---
 
-## 8.16 CONFIRMED: ds_read_b64 Works for FP8 QK MFMA (NOT TR8)
+## 6. FP8 FORMAT
 
-### Verification Date: 2026-01-15
+### 6.1 Use e4m3fn (OCP), NOT e4m3fnuz
+SYMPTOM: 2× output values
+CAUSE: Wrong FP8 format interpretation
+FIX: Use torch.float8_e4m3fn
 
-### Test Results (`test_fp8_qk_simple.s/py`)
+| Value    | e4m3fn | e4m3fnuz |
+|----------|--------|----------|
+| 1.0      | 0x38   | 0x40     |
+| 0.125    | 0x20   | 0x28     |
 
-| Test | Input | Expected | Actual | Status |
-|------|-------|----------|--------|--------|
-| Uniform | Q=K=1.0 | 16.0 | 16.0 | ✓ PASS |
-| Random seed 42 | uniform(0.5,2.0) | Q@K^T | exact match | ✓ PASS |
-| Random seed 123 | uniform(0.5,2.0) | Q@K^T | exact match | ✓ PASS |
-| Random seed 7 | uniform(0.5,2.0) | Q@K^T | exact match | ✓ PASS |
+### 6.2 FP8 Precision Limits
+- Values 0-16: Exact
+- Values >16: Round to nearest even
+- Max: ~448
 
-**max_diff = 0.0000** for all random tests (sorted comparison to handle MFMA layout).
+---
 
-### Why ds_read_b64 Works for FP8
+## 7. MFMA INSTRUCTION CONSTRAINTS
 
-| Instruction | Bytes | BF16 elements | FP8 elements |
-|-------------|-------|---------------|--------------|
-| ds_read_b64 | 8 | 4 BF16 | **8 FP8** |
-
-FP8 MFMA 32×32×16 needs 8 FP8 per operand → **1 ds_read_b64 (vs 2 for BF16)**
-
-### Why NOT TR8 for Q/K
-
-1. **TR8 stride-16 collides for >15 rows** (verified: rows 16-31 get wrong data)
-2. **BF16 reference uses ds_read_b64 for Q/K** (TR_B16 only for V)
-3. **CK FP8 uses ds_read_b128** (no TR at all)
-4. **ds_read_b64 is simpler and proven correct**
-
-### Bank Conflict Summary
-
-| Layout | Conflict Factor |
-|--------|-----------------|
-| Simple row-major (stride 128) | 16x |
-| XOR swizzle | 2x |
-| Stride-132 | 0x (optimal) |
-
-### Implementation Pattern
-
-```asm
-// Simple row-major LDS layout (no swizzle, works but has conflicts)
-// Q[row,k] at LDS[row * 16 + k]
-// K[row,k] at LDS[0x200 + row * 16 + k]
-
-// Thread tid reads:
-v_and_b32_e32 v20, 31, v1              // mfma_row = tid % 32
-v_lshrrev_b32_e32 v21, 5, v1           // k_half = tid / 32
-v_lshlrev_b32_e32 v22, 4, v20          // row * 16
-v_lshlrev_b32_e32 v23, 3, v21          // k_base = k_half * 8
-v_add_u32_e32 v22, v22, v23
-ds_read_b64 v[40:41], v22              // 8 FP8 values for MFMA
+### 7.1 Minimum Size for FP8/BF16: 32×32 Only
+```bash
+# NO 16x16 or 8x8 for FP8!
+v_mfma_f32_16x16x32_fp8_fp8  # ERROR - doesn't exist
+v_mfma_f32_32x32x16_fp8_fp8  # OK
 ```
 
-### Files
+### 7.2 s_nop Requirements
+```asm
+v_accvgpr_write_b32 a0, v30
+s_nop 1                          // Required before MFMA
+v_mfma_f32_32x32x16_fp8_fp8 ...
+s_nop 15                         // Required after MFMA
+```
 
-- `test_fp8_qk_simple.s` - working kernel (row-major, no swizzle)
-- `test_fp8_qk_simple.py` - test with uniform and random input
-- `test_dsread_fp8.s/py` - ds_read_b64 verification
-- `analyze_bank_conflicts.py` - bank conflict analysis
+---
+
+## 8. BF16 REFERENCE PATTERNS
+
+### 8.1 Multi-Wave Layout (256T = 4 waves)
+| Wave | Q Rows | LDS Offset |
+|------|--------|------------|
+| 0    | 0-31   | 0x8200 + 0×0x408 |
+| 1    | 32-63  | 0x8200 + 1×0x408 |
+| 2    | 64-95  | 0x8200 + 2×0x408 |
+| 3    | 96-127 | 0x8200 + 3×0x408 |
+
+### 8.2 Each Wave Handles 32 Q Rows (Full MFMA Tile)
+WRONG: "Each wave handles 8 Q rows"
+CORRECT: "Each wave handles 32 Q rows"
