@@ -206,18 +206,23 @@ _fwd_fp8_scaffold:
     ds_write_b128 v14, v[20:23]
     s_mov_b64 exec, s[22:23]
 
-    // Swizzled V load: 64 rows (two tiles) into V_LDS0
+    // Swizzled V load: 16B for row r and row r+32
     v_mov_b32_e32 v2, 256
     v_cmp_lt_u32_e32 vcc, v60, v2
     s_and_saveexec_b64 s[22:23], vcc
-    v_lshlrev_b32_e32 v2, 5, v60         // tid * 32 bytes
+    v_lshrrev_b32_e32 v4, 3, v60          // row = tid >> 3 (0..31)
+    v_and_b32_e32 v5, 7, v60              // col_block = tid & 7 (0..7)
+    v_lshlrev_b32_e32 v4, 7, v4           // row * 128
+    v_lshlrev_b32_e32 v5, 4, v5           // col_block * 16
+    v_add_u32_e32 v2, v4, v5              // byte offset within V
     buffer_load_dwordx4 v[40:43], v2, s[16:19], s31 offen
-    v_add_u32_e32 v3, 16, v2
+    v_add_u32_e32 v3, 4096, v2            // row + 32
     buffer_load_dwordx4 v[44:47], v3, s[16:19], s31 offen
 
-    // base = bitop3((tid<<4), tid, 0x70) imm 0x78
-    v_lshlrev_b32_e32 v4, 4, v60
-    v_bitop3_b32 v4, v4, v60, s24 bitop3:0x78
+    // Triton-style LDS write swizzle (bitop3:0x78)
+    s_movk_i32 s26, 0x70
+    v_lshlrev_b32_e32 v4, 4, v60          // tid * 16 bytes
+    v_bitop3_b32 v4, v4, v60, s26 bitop3:0x78
     v_add_u32_e32 v4, s42, v4
     s_waitcnt vmcnt(0)
     ds_write_b128 v4, v[40:43]
@@ -260,30 +265,19 @@ K_LOOP:
     s_waitcnt lgkmcnt(0)
     v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
 
-    // Pack P0 (tile 0) to FP8 (v48-v51)
-    v_cvt_pk_fp8_f32 v48, v32, v33
-    v_and_b32_e32 v48, 0xFFFF, v48
-    v_cvt_pk_fp8_f32 v49, v34, v35
-    v_and_b32_e32 v49, 0xFFFF, v49
-    v_perm_b32 v48, v48, v49, v59
-
-    v_cvt_pk_fp8_f32 v49, v36, v37
-    v_and_b32_e32 v49, 0xFFFF, v49
-    v_cvt_pk_fp8_f32 v50, v38, v39
-    v_and_b32_e32 v50, 0xFFFF, v50
-    v_perm_b32 v49, v49, v50, v59
-
-    v_cvt_pk_fp8_f32 v50, v40, v41
-    v_and_b32_e32 v50, 0xFFFF, v50
-    v_cvt_pk_fp8_f32 v51, v42, v43
-    v_and_b32_e32 v51, 0xFFFF, v51
-    v_perm_b32 v50, v50, v51, v59
-
-    v_cvt_pk_fp8_f32 v51, v44, v45
-    v_and_b32_e32 v51, 0xFFFF, v51
-    v_cvt_pk_fp8_f32 v52, v46, v47
-    v_and_b32_e32 v52, 0xFFFF, v52
-    v_perm_b32 v51, v51, v52, v59
+    // Pack P0 (tile 0) to FP8 (v48-v51) - Triton-style
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+    v_cvt_scalef32_pk_fp8_f32 v48, v32, v33, 1.0
+    v_cvt_scalef32_pk_fp8_f32 v48, v34, v35, 1.0 op_sel:[0,0,0,1]
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+    v_cvt_scalef32_pk_fp8_f32 v49, v36, v37, 1.0
+    v_cvt_scalef32_pk_fp8_f32 v49, v38, v39, 1.0 op_sel:[0,0,0,1]
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+    v_cvt_scalef32_pk_fp8_f32 v50, v40, v41, 1.0
+    v_cvt_scalef32_pk_fp8_f32 v50, v42, v43, 1.0 op_sel:[0,0,0,1]
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+    v_cvt_scalef32_pk_fp8_f32 v51, v44, v45, 1.0
+    v_cvt_scalef32_pk_fp8_f32 v51, v46, v47, 1.0 op_sel:[0,0,0,1]
 
     // Compute Q/K read addresses for tile 1
     v_add_u32_e32 v26, v31, v18                 // K base + row
@@ -308,30 +302,280 @@ K_LOOP:
     s_waitcnt lgkmcnt(0)
     v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
 
-    // Pack P1 (tile 1) to FP8 (v52-v55)
-    v_cvt_pk_fp8_f32 v52, v32, v33
-    v_and_b32_e32 v52, 0xFFFF, v52
-    v_cvt_pk_fp8_f32 v53, v34, v35
-    v_and_b32_e32 v53, 0xFFFF, v53
-    v_perm_b32 v52, v52, v53, v59
+    // Pack P1 (tile 1) to FP8 (v52-v55) - Triton-style
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+    v_cvt_scalef32_pk_fp8_f32 v52, v32, v33, 1.0
+    v_cvt_scalef32_pk_fp8_f32 v52, v34, v35, 1.0 op_sel:[0,0,0,1]
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+    v_cvt_scalef32_pk_fp8_f32 v53, v36, v37, 1.0
+    v_cvt_scalef32_pk_fp8_f32 v53, v38, v39, 1.0 op_sel:[0,0,0,1]
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+    v_cvt_scalef32_pk_fp8_f32 v54, v40, v41, 1.0
+    v_cvt_scalef32_pk_fp8_f32 v54, v42, v43, 1.0 op_sel:[0,0,0,1]
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+    v_cvt_scalef32_pk_fp8_f32 v55, v44, v45, 1.0
+    v_cvt_scalef32_pk_fp8_f32 v55, v46, v47, 1.0 op_sel:[0,0,0,1]
 
-    v_cvt_pk_fp8_f32 v53, v36, v37
-    v_and_b32_e32 v53, 0xFFFF, v53
-    v_cvt_pk_fp8_f32 v54, v38, v39
-    v_and_b32_e32 v54, 0xFFFF, v54
-    v_perm_b32 v53, v53, v54, v59
+    // Build A operand from packed P (byte-level transpose)
+    // row = (lane & 15) + 16 * ((lane >> 4) & 1)
+    v_and_b32_e32 v57, 15, v10
+    v_and_b32_e32 v58, 16, v10
+    v_add_u32_e32 v57, v57, v58            // row
 
-    v_cvt_pk_fp8_f32 v54, v40, v41
-    v_and_b32_e32 v54, 0xFFFF, v54
-    v_cvt_pk_fp8_f32 v55, v42, v43
-    v_and_b32_e32 v55, 0xFFFF, v55
-    v_perm_b32 v54, v54, v55, v59
+    // src_half = (row & 4) * 8  (0 or 32)
+    v_and_b32_e32 v59, 4, v57
+    v_lshlrev_b32_e32 v56, 3, v59
 
-    v_cvt_pk_fp8_f32 v55, v44, v45
-    v_and_b32_e32 v55, 0xFFFF, v55
-    v_cvt_pk_fp8_f32 v57, v46, v47
-    v_and_b32_e32 v57, 0xFFFF, v57
-    v_perm_b32 v55, v55, v57, v59
+    // byte_shift = (row & 3) * 8
+    v_and_b32_e32 v59, 3, v57
+    v_lshlrev_b32_e32 v63, 3, v59
+
+    // group = (row & ~4) >> 3
+    v_and_b32_e32 v62, 0xFFFFFFFB, v57
+    v_lshrrev_b32_e32 v62, 3, v62
+
+    // Select packed source word for tile0 (v32) and tile1 (v33)
+    v_mov_b32_e32 v32, v48
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v32, v32, v49, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v32, v32, v50, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v32, v32, v51, vcc
+
+    v_mov_b32_e32 v33, v52
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v33, v33, v53, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v33, v33, v54, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v33, v33, v55, vcc
+
+    // col_base = (lane & 32) >> 1  (0 or 16)
+    v_and_b32_e32 v58, 32, v10
+    v_lshrrev_b32_e32 v58, 1, v58
+
+    // Group 0 -> v48 (cols 0..3)
+    v_add_u32_e32 v4, v58, v56
+    v_lshlrev_b32_e32 v4, 2, v4
+    ds_bpermute_b32 v0, v4, v33
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v1, v4, v33
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v2, v4, v33
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v3, v4, v33
+    s_waitcnt lgkmcnt(0)
+    v_lshrrev_b32_e32 v0, v63, v0
+    v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v1, v63, v1
+    v_and_b32_e32 v1, 0xFF, v1
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v2, v63, v2
+    v_and_b32_e32 v2, 0xFF, v2
+    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v3, v63, v3
+    v_and_b32_e32 v3, 0xFF, v3
+    v_lshlrev_b32_e32 v3, 24, v3
+    v_or_b32_e32 v0, v0, v1
+    v_or_b32_e32 v0, v0, v2
+    v_or_b32_e32 v0, v0, v3
+    v_mov_b32_e32 v48, v0
+
+    // Group 1 -> v49 (cols 4..7)
+    v_add_u32_e32 v4, v58, v56
+    v_add_u32_e32 v4, 4, v4
+    v_lshlrev_b32_e32 v4, 2, v4
+    ds_bpermute_b32 v0, v4, v33
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v1, v4, v33
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v2, v4, v33
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v3, v4, v33
+    s_waitcnt lgkmcnt(0)
+    v_lshrrev_b32_e32 v0, v63, v0
+    v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v1, v63, v1
+    v_and_b32_e32 v1, 0xFF, v1
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v2, v63, v2
+    v_and_b32_e32 v2, 0xFF, v2
+    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v3, v63, v3
+    v_and_b32_e32 v3, 0xFF, v3
+    v_lshlrev_b32_e32 v3, 24, v3
+    v_or_b32_e32 v0, v0, v1
+    v_or_b32_e32 v0, v0, v2
+    v_or_b32_e32 v0, v0, v3
+    v_mov_b32_e32 v49, v0
+
+    // Group 2 -> v50 (cols 8..11)
+    v_add_u32_e32 v4, v58, v56
+    v_add_u32_e32 v4, 8, v4
+    v_lshlrev_b32_e32 v4, 2, v4
+    ds_bpermute_b32 v0, v4, v33
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v1, v4, v33
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v2, v4, v33
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v3, v4, v33
+    s_waitcnt lgkmcnt(0)
+    v_lshrrev_b32_e32 v0, v63, v0
+    v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v1, v63, v1
+    v_and_b32_e32 v1, 0xFF, v1
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v2, v63, v2
+    v_and_b32_e32 v2, 0xFF, v2
+    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v3, v63, v3
+    v_and_b32_e32 v3, 0xFF, v3
+    v_lshlrev_b32_e32 v3, 24, v3
+    v_or_b32_e32 v0, v0, v1
+    v_or_b32_e32 v0, v0, v2
+    v_or_b32_e32 v0, v0, v3
+    v_mov_b32_e32 v50, v0
+
+    // Group 3 -> v51 (cols 12..15)
+    v_add_u32_e32 v4, v58, v56
+    v_add_u32_e32 v4, 12, v4
+    v_lshlrev_b32_e32 v4, 2, v4
+    ds_bpermute_b32 v0, v4, v33
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v1, v4, v33
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v2, v4, v33
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v3, v4, v33
+    s_waitcnt lgkmcnt(0)
+    v_lshrrev_b32_e32 v0, v63, v0
+    v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v1, v63, v1
+    v_and_b32_e32 v1, 0xFF, v1
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v2, v63, v2
+    v_and_b32_e32 v2, 0xFF, v2
+    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v3, v63, v3
+    v_and_b32_e32 v3, 0xFF, v3
+    v_lshlrev_b32_e32 v3, 24, v3
+    v_or_b32_e32 v0, v0, v1
+    v_or_b32_e32 v0, v0, v2
+    v_or_b32_e32 v0, v0, v3
+    v_mov_b32_e32 v51, v0
+
+    // Group 4 -> v52 (cols 16..19)
+    v_add_u32_e32 v4, v58, v56
+    v_lshlrev_b32_e32 v4, 2, v4
+    ds_bpermute_b32 v0, v4, v32
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v1, v4, v32
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v2, v4, v32
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v3, v4, v32
+    s_waitcnt lgkmcnt(0)
+    v_lshrrev_b32_e32 v0, v63, v0
+    v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v1, v63, v1
+    v_and_b32_e32 v1, 0xFF, v1
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v2, v63, v2
+    v_and_b32_e32 v2, 0xFF, v2
+    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v3, v63, v3
+    v_and_b32_e32 v3, 0xFF, v3
+    v_lshlrev_b32_e32 v3, 24, v3
+    v_or_b32_e32 v0, v0, v1
+    v_or_b32_e32 v0, v0, v2
+    v_or_b32_e32 v0, v0, v3
+    v_mov_b32_e32 v52, v0
+
+    // Group 5 -> v53 (cols 20..23)
+    v_add_u32_e32 v4, v58, v56
+    v_add_u32_e32 v4, 4, v4
+    v_lshlrev_b32_e32 v4, 2, v4
+    ds_bpermute_b32 v0, v4, v32
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v1, v4, v32
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v2, v4, v32
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v3, v4, v32
+    s_waitcnt lgkmcnt(0)
+    v_lshrrev_b32_e32 v0, v63, v0
+    v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v1, v63, v1
+    v_and_b32_e32 v1, 0xFF, v1
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v2, v63, v2
+    v_and_b32_e32 v2, 0xFF, v2
+    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v3, v63, v3
+    v_and_b32_e32 v3, 0xFF, v3
+    v_lshlrev_b32_e32 v3, 24, v3
+    v_or_b32_e32 v0, v0, v1
+    v_or_b32_e32 v0, v0, v2
+    v_or_b32_e32 v0, v0, v3
+    v_mov_b32_e32 v53, v0
+
+    // Group 6 -> v54 (cols 24..27)
+    v_add_u32_e32 v4, v58, v56
+    v_add_u32_e32 v4, 8, v4
+    v_lshlrev_b32_e32 v4, 2, v4
+    ds_bpermute_b32 v0, v4, v32
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v1, v4, v32
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v2, v4, v32
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v3, v4, v32
+    s_waitcnt lgkmcnt(0)
+    v_lshrrev_b32_e32 v0, v63, v0
+    v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v1, v63, v1
+    v_and_b32_e32 v1, 0xFF, v1
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v2, v63, v2
+    v_and_b32_e32 v2, 0xFF, v2
+    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v3, v63, v3
+    v_and_b32_e32 v3, 0xFF, v3
+    v_lshlrev_b32_e32 v3, 24, v3
+    v_or_b32_e32 v0, v0, v1
+    v_or_b32_e32 v0, v0, v2
+    v_or_b32_e32 v0, v0, v3
+    v_mov_b32_e32 v54, v0
+
+    // Group 7 -> v55 (cols 28..31)
+    v_add_u32_e32 v4, v58, v56
+    v_add_u32_e32 v4, 12, v4
+    v_lshlrev_b32_e32 v4, 2, v4
+    ds_bpermute_b32 v0, v4, v32
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v1, v4, v32
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v2, v4, v32
+    v_add_u32_e32 v4, 4, v4
+    ds_bpermute_b32 v3, v4, v32
+    s_waitcnt lgkmcnt(0)
+    v_lshrrev_b32_e32 v0, v63, v0
+    v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v1, v63, v1
+    v_and_b32_e32 v1, 0xFF, v1
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v2, v63, v2
+    v_and_b32_e32 v2, 0xFF, v2
+    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v3, v63, v3
+    v_and_b32_e32 v3, 0xFF, v3
+    v_lshlrev_b32_e32 v3, 24, v3
+    v_or_b32_e32 v0, v0, v1
+    v_or_b32_e32 v0, v0, v2
+    v_or_b32_e32 v0, v0, v3
+    v_mov_b32_e32 v55, v0
 
     // PV MFMA using TR8 V reads (K=64, tiles 0+1)
     // Triton-style base swizzle (bitop3:0x36 + XOR bases)
@@ -363,33 +607,45 @@ K_LOOP:
     v_add_u32_e32 v9, s42, v9
     v_add_u32_e32 v10, s42, v10
 
-    ds_read_b64_tr_b8 v[0:1], v2 offset:0
-    ds_read_b64_tr_b8 v[2:3], v2 offset:1088
-    ds_read_b64_tr_b8 v[4:5], v2 offset:4096
-    ds_read_b64_tr_b8 v[6:7], v2 offset:5184
-    s_waitcnt lgkmcnt(0)
-    v_mfma_f32_32x32x64_f8f6f4 v[64:79], v[0:7], v[48:55], v[64:79]
+    // Preserve TR8 base addresses (avoid clobber by reads)
+    v_mov_b32_e32 v20, v2
+    v_mov_b32_e32 v21, v3
+    v_mov_b32_e32 v22, v4
+    v_mov_b32_e32 v23, v5
+    v_mov_b32_e32 v24, v6
+    v_mov_b32_e32 v25, v7
+    v_mov_b32_e32 v26, v8
+    v_mov_b32_e32 v27, v9
+    v_mov_b32_e32 v28, v10
 
-    ds_read_b64_tr_b8 v[0:1], v3
-    ds_read_b64_tr_b8 v[2:3], v4
-    ds_read_b64_tr_b8 v[4:5], v5
-    ds_read_b64_tr_b8 v[6:7], v6
-    s_waitcnt lgkmcnt(0)
-    v_mfma_f32_32x32x64_f8f6f4 v[80:95], v[0:7], v[48:55], v[80:95]
 
-    ds_read_b64_tr_b8 v[0:1], v2 offset:64
-    ds_read_b64_tr_b8 v[2:3], v2 offset:1024
-    ds_read_b64_tr_b8 v[4:5], v2 offset:4160
-    ds_read_b64_tr_b8 v[6:7], v2 offset:5120
+    ds_read_b64_tr_b8 v[0:1], v20 offset:0
+    ds_read_b64_tr_b8 v[2:3], v20 offset:1088
+    ds_read_b64_tr_b8 v[4:5], v20 offset:4096
+    ds_read_b64_tr_b8 v[6:7], v20 offset:5184
     s_waitcnt lgkmcnt(0)
-    v_mfma_f32_32x32x64_f8f6f4 v[96:111], v[0:7], v[48:55], v[96:111]
+    v_mfma_f32_32x32x64_f8f6f4 v[64:79], v[48:55], v[0:7], v[64:79]
 
-    ds_read_b64_tr_b8 v[0:1], v7
-    ds_read_b64_tr_b8 v[2:3], v8
-    ds_read_b64_tr_b8 v[4:5], v9
-    ds_read_b64_tr_b8 v[6:7], v10
+    ds_read_b64_tr_b8 v[0:1], v21
+    ds_read_b64_tr_b8 v[2:3], v22
+    ds_read_b64_tr_b8 v[4:5], v23
+    ds_read_b64_tr_b8 v[6:7], v24
     s_waitcnt lgkmcnt(0)
-    v_mfma_f32_32x32x64_f8f6f4 v[112:127], v[0:7], v[48:55], v[112:127]
+    v_mfma_f32_32x32x64_f8f6f4 v[80:95], v[48:55], v[0:7], v[80:95]
+
+    ds_read_b64_tr_b8 v[0:1], v20 offset:64
+    ds_read_b64_tr_b8 v[2:3], v20 offset:1024
+    ds_read_b64_tr_b8 v[4:5], v20 offset:4160
+    ds_read_b64_tr_b8 v[6:7], v20 offset:5120
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[96:111], v[48:55], v[0:7], v[96:111]
+
+    ds_read_b64_tr_b8 v[0:1], v25
+    ds_read_b64_tr_b8 v[2:3], v26
+    ds_read_b64_tr_b8 v[4:5], v27
+    ds_read_b64_tr_b8 v[6:7], v28
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[112:127], v[48:55], v[0:7], v[112:127]
 
     // Prefetch next tile pair (if any)
     s_add_u32 s34, s30, 2
@@ -419,14 +675,19 @@ K_LOOP:
     v_mov_b32_e32 v2, 256
     v_cmp_lt_u32_e32 vcc, v60, v2
     s_and_saveexec_b64 s[22:23], vcc
-    v_lshlrev_b32_e32 v2, 5, v60         // tid * 32 bytes
+    v_lshrrev_b32_e32 v4, 3, v60          // row = tid >> 3 (0..31)
+    v_and_b32_e32 v5, 7, v60              // col_block = tid & 7 (0..7)
+    v_lshlrev_b32_e32 v4, 7, v4           // row * 128
+    v_lshlrev_b32_e32 v5, 4, v5           // col_block * 16
+    v_add_u32_e32 v2, v4, v5              // byte offset within V
     buffer_load_dwordx4 v[40:43], v2, s[16:19], s38 offen
-    v_add_u32_e32 v3, 16, v2
+    v_add_u32_e32 v3, 4096, v2            // row + 32
     buffer_load_dwordx4 v[44:47], v3, s[16:19], s38 offen
 
-    // base = bitop3((tid<<4), tid, 0x70) imm 0x78
-    v_lshlrev_b32_e32 v4, 4, v60
-    v_bitop3_b32 v4, v4, v60, s24 bitop3:0x78
+    // Triton-style LDS write swizzle (bitop3:0x78)
+    s_movk_i32 s26, 0x70
+    v_lshlrev_b32_e32 v4, 4, v60          // tid * 16 bytes
+    v_bitop3_b32 v4, v4, v60, s26 bitop3:0x78
     v_add_u32_e32 v4, s42, v4
     s_waitcnt vmcnt(0)
     ds_write_b128 v4, v[40:43]
