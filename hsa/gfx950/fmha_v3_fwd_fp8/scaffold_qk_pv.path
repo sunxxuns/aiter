@@ -1,10 +1,9 @@
-STATUS: testing
-APPROACH: Byte-level ds_bpermute pack of P to MFMA A operand for PV
-KEY_PARAMS: Q pitch=132 (Q load uses v32-v47 to preserve lane_id); K row-major via buffer_load->ds_write (tid<256, offset=(tid&255)*16); V swizzled store (bitop3:0x78); PV TR8 bases (bitop3:0x36 + XOR); K_TILE=32 (paired); P packed via v_cvt_scalef32_pk_fp8_f32 into v48-v55; row = (lane & 15) + 16 * ((lane >> 4) & 1); src_half = (row & 4) * 8; group = (row & ~4) >> 3; col_base = (lane & 32) >> 1; groups 0..3 use tile0 (v32), groups 4..7 use tile1 (v33)
+STATUS: exploring
+APPROACH: Derive PV B-operand mapping after Triton lane-mix (no extra post-mix), then apply a precise lane/byte permutation to restore identity-P (row/col).
+KEY_PARAMS: P packed via `v_cvt_scalef32_pk_fp8_f32` into v48-v55; B operand mix uses Triton lane-mix (v237 = (lane<<2)^0x80, vcc = lane<32); V uses `ds_read_b64` (no TR8) as A operand; MFMA uses v[0:7] (V) x v[48:55] (P).
 TEST_RESULT:
   - Build: PASS
-  - Scaffold layout probes (test_scaffold_layout.py):
-    * identity P + V col-pattern: FAIL (col-map shows stride-4 pattern; max_err ~7.0)
-    * identity P + V rowid: FAIL (rows map to ~176/192/208 pattern)
-  - P->O single-column probe (K row hot) shows k0..15 do not map 1:1 (e.g., k0->32, k3->36, k6->40)
-NEXT_STEP: Add P-pack dump kernel to write v48-v55 to global and derive exact A-operand byte mapping; fix pack accordingly, then re-run layout probes.
+  - Scaffold numerics (test_scaffold_numerics.py):
+    * NUMERICS_IDENTITY_P=1 NUMERICS_V_PATTERN=col: FAIL (columns repeat in 8-wide groups)
+    * NUMERICS_IDENTITY_P=1 NUMERICS_V_PATTERN=rowid: FAIL (row>>1; rows duplicated)
+NEXT_STEP: Analyze `p_pack_mapping.csv` + layout probes to derive exact B-operand permutation (lane/byte) that restores identity-P.

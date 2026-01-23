@@ -686,3 +686,128 @@ RESULT: avg_ms ~33.3ms (~0.65 PF eq). GPU0 sclk stuck at ~144–152MHz (level 1)
 INSIGHT: Performance regression is likely due to low GPU clocks, not kernel changes; long warmup didn't boost clocks.
 NEXT: Re-bench once sclk can be set to level 2 (~2200MHz) or perf determinism is enabled.
 BLOCKER: Clock control not permitted (rocm-smi cannot set manual/perf determinism).
+
+=== TURN 2026-01-20 12:45 ===
+ACTION: Added TR8 decode script (row/col mapping per ds_read), added P-pack dump kernel; ran TR8 mapping and tested a V-row swizzle attempt (reverted).
+RESULT: TR8 decode shows per-lane columns fixed at lane+32*group; row groups are [0-7,8-15,32-39,40-47] for lanes 0-7 and [16-23,24-31,48-55,56-63] for lanes 8-15. P-pack dump shows lane0 k0..15 in order; lane32 k16..31 with FP8 rounding. Row-swizzle in V write did not improve layout probes (col-pattern stride-4 persists; rowid still wrong).
+INSIGHT: P packing for k0..31 is likely correct; PV mismatch remains in V/TR8 layout vs MFMA B-operand expectations. Need to derive a byte/row permutation for V rather than row swizzle.
+NEXT: Use TR8 decode + ISA B layout to derive required byte permutation or lane mixing for B operand; prototype reorder and re-run layout probes.
+BLOCKER: Unclear B-operand byte ordering for 32x32x64 f8f6f4 beyond TR8 read order.
+
+=== TURN 2026-01-20 13:30 ===
+ACTION: Added `test_p_pack_map.py` to correlate packed P bytes to k/row; ran rowdiag mapping; tried src_half tweak, lane-swap bpermute, and bit3 mask in P-pack dump (all reverted).
+RESULT: Rowdiag shows lane r picks rows {r, r+8} at k indices {r, r+8} (e.g., tid1 rows [1,9]), indicating P pack mixes row+8. src_half tweak and lane-swap/mask tests did not fix mapping. k_map confirms k0..15 ordering within bytes but row mapping is wrong.
+INSIGHT: P pack (A-operand) is still incorrect; need to reproduce Triton’s v_cndmask+ds_bpermute mixing rather than heuristic tweaks.
+NEXT: Port Triton P-pack mixing block into scaffold/P-pack dump and re-run rowdiag to verify row-to-k mapping.
+BLOCKER: Need correct register mapping for Triton mixing block.
+
+=== TURN 2026-01-20 14:05 ===
+ACTION: Prototyped Triton-style lane-mix block in P-pack dump with approximate register mapping; re-ran rowdiag map.
+RESULT: Mapping shifted (rows mixed with +16/+24) and remained incorrect; prototype reverted.
+INSIGHT: Triton block likely correct but needs exact register mapping from its pack outputs.
+NEXT: Derive exact register correspondence between Triton packed regs and our v48-v55, then port the full mixing block.
+BLOCKER: Need accurate mapping from Triton pack outputs to A operand regs.
+
+=== TURN 2026-01-20 15:15 ===
+ACTION: Reworked scaffold P-pack ds_bpermute sources to use fixed v48-v55 per group; added row16 xor and re-ran layout probes. Used P-pack dump to probe raw pack (bypass bpermute) and rowdiag mapping.
+RESULT: identity-P col-pattern now matches reference for first 16 columns; rowid still permuted (rows 4-7 map to 28/30/32; rows 16-31 map to 16/18/20/12/13/14/15). Raw pack shows rows distributed across lanes 0-7/32-39 and bytes 0-3/4-7, so remaining issue is a deterministic lane/byte permutation.
+INSIGHT: PV mismatch is now isolated to a specific permutation in P-pack A-operand layout; V/TR8 path is producing correct column signal.
+NEXT: Use raw-pack mapping (test_p_pack_map) to generate a lane/byte permutation table and implement it with ds_bpermute/v_perm; then re-run rowid.
+BLOCKER: Need to translate the mapping into an efficient ds_bpermute schedule.
+
+=== TURN 2026-01-18 19:30 ===
+ACTION: Bypassed P-pack bpermute in scaffold and re-ran layout probes; derived row permutation from identity-P rowid. Tried row-bit permutation in P-pack dump and a store-row permutation (reverted).
+RESULT: Raw pack yields perfect col-pattern but rowid is permuted; observed row mapping matches bit permutation (b4,b3,b2)->(b2,b4,b3). Store-row permutation broke outputs (all zeros) and was reverted. P-pack dump still shows row mixing under attempted row_reg/row_off tweaks.
+INSIGHT: Raw pack layout is close; remaining issue is a deterministic row-bit permutation in A-operand interpretation. Need to implement inverse permutation at P-pack stage (not store) and verify via P-pack dump + scaffold rowid.
+NEXT: Use raw-pack mapping + row-bit permutation to rewrite A-operand selection; validate with test_p_pack_map and scaffold rowid after restoring bpermute path.
+BLOCKER: Find correct place to apply row-bit permutation (row_reg vs row_off vs byte) without collapsing k mapping.
+
+=== TURN 2026-01-18 20:10 ===
+ACTION: Rewrote scaffold P-pack with per-row ds_bpermute selection (saved packed regs, row_reg cndmask per byte). Verified P-pack dump now maps row/k cleanly for tile0. Ported changes into scaffold, then iterated lane-offset options.
+RESULT: Using lane_offset = (row & 4)*8 keeps rowid wrong and col-pattern doubled. Switching lane_offset to lane^32 fixes col-pattern scaling (matches ref) but rowid still off: row->value = (row & ~3) + 16. Trying other row_reg/byte_shift tweaks worsened mapping.
+INSIGHT: Lane swap (tid^32) matches Triton-style ds_bpermute base and fixes column mapping; remaining error is row mapping (low 2 row bits lost). Likely need Triton’s lane-mix cndmask/bpermute block or an explicit row permutation to restore low bits.
+NEXT: Align P-pack with Triton mixing (v158=tid<<2^0x80) or derive a row permutation to restore low-bit row mapping; re-run rowid and full layout probes.
+BLOCKER: Correct lane-mix order for A operand still unclear.
+
+=== TURN 2026-01-23T01:58:24+00:00 ===
+ACTION: Swapped PV MFMA operand order (A/B) to test V-as-A; rebuilt and ran layout probes. Reverted swap and re-ran probes.
+RESULT: Swap severely regressed col-pattern/rowid (collapsed columns, wrong rows). Revert restores prior state (tile0-only bpermute with k collapse for rows 32..63).
+INSIGHT: PV MFMA expects P packed as A and V as B; operand swap is incorrect.
+NEXT: Fix missing k coverage by reconstructing correct A-operand mapping for tile1 or integrating Triton lane-mix with exact reg mapping.
+BLOCKER: Need precise A-operand packing spec/mapping for k bits 0..31/32..63.
+
+=== TURN 2026-01-23T02:24:56+00:00 ===
+ACTION: Tried V row permutations with mix enabled; re-enabled Triton-style mix and added post-mix cndmask stage. Added mix+post-mix to p_pack_dump and bumped VGPR metadata; reran layout probes and k->row mapping.
+RESULT: With mix+no row perm, col-pattern/swizzle16x8 pass but rowid is wrong; k->row mapping collapses to row0. With row perm (b3,b2,b4), rowid improves but still wrong; k->row still collapses. p_pack_dump shows k_idx bytes all zero after mix (mix destroys k mapping).
+INSIGHT: Current mix register mapping is incorrect; post-mix alone doesn’t restore k. Need to remap inputs to mix block or derive correct mix ordering from Triton so k bytes survive.
+NEXT: Use p_pack_dump (raw vs mixed) to search for correct reg permutation into mix block that preserves k_idx; then re-enable mix in scaffold with that mapping.
+BLOCKER: Need correct reg mapping for Triton mix to preserve k bytes.
+
+=== TURN 2026-01-23T02:40:00+00:00 ===
+ACTION: Inspected Triton PV pack/mix block and compared with current scaffold PV MFMA operand order.
+RESULT: Confirmed scaffold PV uses `v_mfma ... A=v[48:55] (packed P), B=v[0:7] (TR8 V reads)`, and the embedded Triton-style lane-mix block is currently bypassed by an unconditional branch.
+INSIGHT: Triton’s ds_bpermute “mix” block is for packing P as the MFMA **B** operand (Triton uses V as A, P as B). Our scaffold is currently using P as **A** and V as **B**, so Triton’s mix block does not directly apply unless we switch operand order (and redo V mapping).
+NEXT: Decide whether to keep current operand order (fix P→A packing) or switch to Triton operand order (V→A, P→B with mix) and update V/TR8 path accordingly.
+BLOCKER: Choosing operand order determines which packing/mapping work is required (P-pack vs V-pack).
+
+=== TURN 2026-01-23T03:30:00+00:00 ===
+ACTION: Implemented and enabled P→A packing path in scaffold using byte-level `ds_bpermute` (jump to `P_A_TRANSPOSE`), tuned pack parameters, and re-ran identity-P numerics.
+RESULT:
+  - identity-P + V col-pattern: PASS (decoded matches ref in 8x8; no NaN/Inf)
+  - identity-P + V rowid: FAIL (decoded rows collapse to constants; rows 0-3 map to ~16, rows 4-7 map to ~20)
+INSIGHT: PV column mapping is now correct, but PV row mapping still loses low row bits (row groups collapse). This points to an A-operand row permutation/byte-selection issue in P-pack (not a V column/stride issue).
+NEXT: Use `test_scaffold_layout.py` + `test_p_pack_map.py` to derive full row→(lane,byte) mapping for A operand and update the `P_A_TRANSPOSE` selection logic to preserve low 2 row bits.
+BLOCKER: Need a deterministic mapping table for MFMA A-operand row layout under `v_mfma_f32_32x32x64_f8f6f4` with our packed-P sources.
+
+=== TURN 2026-01-23T04:20:00+00:00 ===
+ACTION: Enabled Triton-style P lane-mix and swapped PV operands to V-as-A, P-as-B; tested TR8 vs non-TR8 V reads.
+RESULT:
+  - With TR8 V reads: rowid pattern appears along columns (row/col swap); col-pattern fails.
+  - With non-TR8 `ds_read_b64`: col-pattern partially correct (alternating rows), rowid collapses to row>>1 (rows duplicated).
+INSIGHT: Triton-style mix is closer but still loses row bit 0; V read orientation influences row/col mapping. The remaining error looks like a missing row LSB in the B-operand layout.
+NEXT: Instrument P-pack mix output in `fwd_fp8_p_pack_dump.s` to map B-operand bytes and recover row-bit handling; reconcile with Triton’s post-mix cndmask stage.
+BLOCKER: Need exact P-as-B row-bit mapping after mix (Triton’s second-stage cndmask likely required).
+
+=== TURN 2026-01-23T05:18:45+00:00 ===
+ACTION: Removed extra post-mix cndmask stage (to match Triton), regenerated P-pack mapping, ran rowid/col layout probes; tested TR8 V reads for PV and reverted.
+RESULT:
+  - P-pack mapping shows full row range (0..31), but identity-P rowid still collapses (row>>1) and col-pattern repeats.
+  - Switching V reads to `ds_read_b64_tr_b8` transposes PV (rowid becomes columns), so reverted to `ds_read_b64`.
+INSIGHT: Row/col transpose is controlled by V read mode; with `ds_read_b64` the PV errors persist, indicating B-operand layout is still mismatched despite full row coverage in packed P.
+NEXT: Use P-pack mapping + layout probes to derive the exact B-operand permutation; compare against Triton mix ordering and apply a lane/byte perm to restore identity-P (rowid + col).
+BLOCKER: Need a deterministic mapping from packed P bytes to MFMA B-operand rows/cols (derive via mapping analysis and/or B operand probe).
+
+=== TURN 2026-01-23T05:36:10+00:00 ===
+ACTION: Tried modifying Triton bpermute base to use lane^1 (v237 from tid^1) to recover row LSB; rebuilt and re-tested rowid, then reverted.
+RESULT: No change in rowid output (still row>>1 duplication); reverted v237 to lane<<2.
+INSIGHT: Simple lane-pair swap of bpermute base does not restore row LSB; missing bit likely tied to byte-level mapping, not lane base.
+NEXT: Derive explicit B-operand byte permutation from mapping tables; apply targeted byte/word perm rather than lane-base tweak.
+BLOCKER: Need to compute expected B layout to generate the correct byte permutation.
+
+=== TURN 2026-01-23T05:53:18+00:00 ===
+ACTION: Tested swapping t71/t73 source mapping (v54/v55) before Triton mix; rebuilt and re-tested rowid, then reverted.
+RESULT: No change in rowid output; reverted mapping to original.
+INSIGHT: The missing row LSB is not caused by a simple t71/t73 swap; likely requires a broader byte permutation across the 8 packed regs.
+NEXT: Build a deterministic B-operand byte permutation using mapping tables (p_pack_mapping + MFMA layout) and apply it post-mix.
+BLOCKER: Need explicit expected B-layout mapping to compute the permutation.
+
+=== TURN 2026-01-23T06:07:02+00:00 ===
+ACTION: Tested a byte-parity flip permutation (swap 0<->1 and 2<->3) across v48..v55 post-mix; rebuilt and re-tested rowid, then reverted.
+RESULT: No change in rowid output (still row>>1); permutation removed.
+INSIGHT: Row LSB is correlated with byte parity in packed P, but MFMA output still collapses; a simple parity flip within each dword is insufficient.
+NEXT: Derive a cross-reg byte permutation using mapping tables and MFMA B layout; may require moving bytes across v48..v55, not just within.
+BLOCKER: Need explicit expected B-layout mapping to compute the permutation.
+
+=== TURN 2026-01-23T06:32:50+00:00 ===
+ACTION: Added `derive_pv_b_mapping.py` to analyze `p_pack_mapping.csv`, generated `pv_b_mapping_report.md`, and updated `DEBUG_STATUS.md` with PV-B mapping findings.
+RESULT: Report confirms row LSB is preserved in byte parity and diagonal mapping is lane-shifted (row0 at lane63/pos31; rows16..31 at lanes48..63/pos0..15).
+INSIGHT: The current Triton mix preserves row parity in bytes but places bytes in lanes/positions that MFMA B does not interpret as distinct rows; a cross-lane/byte permutation is required.
+NEXT: Use the report to compute a concrete byte/lane permutation for v48..v55 post-mix; apply and re-test rowid/col.
+BLOCKER: Need explicit expected B-layout mapping (byte position -> K index) to build the permutation.
+
+=== TURN 2026-01-23T06:45:14+00:00 ===
+ACTION: Ran `test_scaffold_numerics.py` with random Q/K/V inputs (default path, NUMERICS_IDENTITY_P=0).
+RESULT: PASS (finite outputs) with max_err=0.543720, mean_err=0.086345, max_rel_err=21667.939453; no NaNs/Infs.
+INSIGHT: Random-input numerics are finite but error levels remain high; this is consistent with the known PV B-operand mapping issue.
+NEXT: Derive and apply a cross-register byte permutation for v48..v55 based on mapping report; re-test identity-P rowid/col.
+BLOCKER: Need explicit expected B-layout mapping to generate the permutation.
