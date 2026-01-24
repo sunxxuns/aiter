@@ -211,8 +211,19 @@ _fwd_fp8_scaffold:
     v_cmp_lt_u32_e32 vcc, v60, v2
     s_and_saveexec_b64 s[22:23], vcc
     v_lshrrev_b32_e32 v4, 3, v60          // row = tid >> 3 (0..31)
+    // permute row bits: (b4,b3,b2)->(b3,b2,b4)
+    v_and_b32_e32 v208, 8, v4
+    v_lshlrev_b32_e32 v208, 1, v208
+    v_and_b32_e32 v209, 4, v4
+    v_lshlrev_b32_e32 v209, 1, v209
+    v_and_b32_e32 v210, 16, v4
+    v_lshrrev_b32_e32 v210, 2, v210
+    v_and_b32_e32 v211, 3, v4
+    v_or_b32_e32 v208, v208, v209
+    v_or_b32_e32 v208, v208, v210
+    v_or_b32_e32 v4, v208, v211
     v_and_b32_e32 v5, 7, v60              // col_block = tid & 7 (0..7)
-    v_lshlrev_b32_e32 v4, 7, v4           // row * 128
+    v_lshlrev_b32_e32 v4, 7, v4           // row_perm * 128
     v_lshlrev_b32_e32 v5, 4, v5           // col_block * 16
     v_add_u32_e32 v2, v4, v5              // byte offset within V
     buffer_load_dwordx4 v[40:43], v2, s[16:19], s31 offen
@@ -316,277 +327,797 @@ K_LOOP:
     v_cvt_scalef32_pk_fp8_f32 v55, v44, v45, 1.0
     v_cvt_scalef32_pk_fp8_f32 v55, v46, v47, 1.0 op_sel:[0,0,0,1]
 
-    // Build A operand from packed P (byte-level transpose)
-    // row = (lane & 15) + 16 * ((lane >> 4) & 1)
-    v_and_b32_e32 v57, 15, v10
-    v_and_b32_e32 v58, 16, v10
-    v_add_u32_e32 v57, v57, v58            // row
+    // Triton-style lane mix for P -> B operand layout (verbatim mapping with temps)
+    v_lshlrev_b32_e32 v237, 2, v10
+    v_xor_b32_e32 v237, 0x80, v237
+    v_and_b32_e32 v238, 32, v10
+    v_cmp_eq_u32_e32 vcc, 0, v238
 
-    // src_half = (row & 4) * 8  (0 or 32)
-    v_and_b32_e32 v59, 4, v57
-    v_lshlrev_b32_e32 v56, 3, v59
+    // Map packed P into temp regs (t66..t73, t82..t86)
+    v_mov_b32_e32 v200, v48   // t66
+    v_mov_b32_e32 v208, v49   // t82
+    v_mov_b32_e32 v209, v50   // t83
+    v_mov_b32_e32 v210, v51   // t84
+    v_mov_b32_e32 v211, v52   // t85
+    v_mov_b32_e32 v212, v53   // t86
+    v_mov_b32_e32 v205, v54   // t71
+    v_mov_b32_e32 v207, v55   // t73
+
+    // Mix stage 1 (Triton)
+    v_cndmask_b32_e32 v201, v200, v209, vcc      // t67
+    ds_bpermute_b32 v201, v237, v201
+    v_cndmask_b32_e32 v202, v208, v210, vcc      // t68
+    ds_bpermute_b32 v203, v237, v202             // t69
+    v_cndmask_b32_e32 v202, v211, v205, vcc
+    ds_bpermute_b32 v206, v237, v202             // t72
+    v_cndmask_b32_e32 v202, v212, v207, vcc
+    s_waitcnt lgkmcnt(2)
+    v_cndmask_b32_e32 v200, v201, v200, vcc
+    v_cndmask_b32_e32 v201, v209, v201, vcc
+    ds_bpermute_b32 v209, v237, v202             // t83
+
+    // Mix stage 2 (Triton)
+    v_cndmask_b32_e32 v202, v203, v208, vcc
+    v_cndmask_b32_e32 v203, v210, v203, vcc
+    v_cndmask_b32_e32 v204, v206, v211, vcc      // t70
+    v_cndmask_b32_e32 v205, v205, v206, vcc      // t71
+    v_cndmask_b32_e32 v206, v209, v212, vcc      // t72
+    v_cndmask_b32_e32 v207, v207, v209, vcc      // t73
+
+    // Copy mixed P back to v48..v55 (B operand)
+    v_mov_b32_e32 v48, v200
+    v_mov_b32_e32 v49, v201
+    v_mov_b32_e32 v50, v202
+    v_mov_b32_e32 v51, v203
+    v_mov_b32_e32 v52, v204
+    v_mov_b32_e32 v53, v205
+    v_mov_b32_e32 v54, v206
+    v_mov_b32_e32 v55, v207
+
+    s_nop 0
+    // Mixed P is ready for use as MFMA B operand.
+    s_branch PV_MFMA_START
+
+P_A_TRANSPOSE:
+    // Build A operand from packed P (byte-level transpose) [disabled]
+    // Preserve packed P sources for bpermute (tile0/1)
+    v_mov_b32_e32 v200, v48
+    v_mov_b32_e32 v201, v49
+    v_mov_b32_e32 v202, v50
+    v_mov_b32_e32 v203, v51
+    v_mov_b32_e32 v204, v52
+    v_mov_b32_e32 v205, v53
+    v_mov_b32_e32 v206, v54
+    v_mov_b32_e32 v207, v55
+
+    // Select tile0 vs tile1 packed P based on lane bit5
+    v_and_b32_e32 v59, 32, v10
+    v_cmp_eq_u32_e32 vcc, 0, v59
+    v_cndmask_b32_e32 v100, v204, v200, vcc
+    v_cndmask_b32_e32 v101, v205, v201, vcc
+    v_cndmask_b32_e32 v102, v206, v202, vcc
+    v_cndmask_b32_e32 v103, v207, v203, vcc
+
+    // row = lane & 31
+    v_and_b32_e32 v57, 31, v10
+
+    // row_reg = (row >> 2) & 3
+    v_lshrrev_b32_e32 v62, 2, v57
+    v_and_b32_e32 v62, 3, v62
 
     // byte_shift = (row & 3) * 8
     v_and_b32_e32 v59, 3, v57
     v_lshlrev_b32_e32 v63, 3, v59
 
-    // group = (row & ~4) >> 3
-    v_and_b32_e32 v62, 0xFFFFFFFB, v57
-    v_lshrrev_b32_e32 v62, 3, v62
+    // lane_offset = (lane ^ 32) + row_reg (test row-sensitive bpermute base)
+    v_xor_b32_e32 v56, 32, v10
+    v_add_u32_e32 v56, v56, v62
 
-    // Select packed source word for tile0 (v32) and tile1 (v33)
-    v_mov_b32_e32 v32, v48
-    v_cmp_eq_u32_e32 vcc, 1, v62
-    v_cndmask_b32_e32 v32, v32, v49, vcc
-    v_cmp_eq_u32_e32 vcc, 2, v62
-    v_cndmask_b32_e32 v32, v32, v50, vcc
-    v_cmp_eq_u32_e32 vcc, 3, v62
-    v_cndmask_b32_e32 v32, v32, v51, vcc
-
-    v_mov_b32_e32 v33, v52
-    v_cmp_eq_u32_e32 vcc, 1, v62
-    v_cndmask_b32_e32 v33, v33, v53, vcc
-    v_cmp_eq_u32_e32 vcc, 2, v62
-    v_cndmask_b32_e32 v33, v33, v54, vcc
-    v_cmp_eq_u32_e32 vcc, 3, v62
-    v_cndmask_b32_e32 v33, v33, v55, vcc
-
-    // col_base = (lane & 32) >> 1  (0 or 16)
-    v_and_b32_e32 v58, 32, v10
-    v_lshrrev_b32_e32 v58, 1, v58
-
-    // Group 0 -> v48 (cols 0..3)
-    v_add_u32_e32 v4, v58, v56
+    // Group 0 -> v48 (cols 0..3) using per-row source selection
+    v_mov_b32_e32 v4, v56
     v_lshlrev_b32_e32 v4, 2, v4
-    ds_bpermute_b32 v0, v4, v33
+    ds_bpermute_b32 v0, v4, v100
+    ds_bpermute_b32 v8, v4, v101
+    ds_bpermute_b32 v12, v4, v102
+    ds_bpermute_b32 v16, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v1, v4, v33
+    ds_bpermute_b32 v1, v4, v100
+    ds_bpermute_b32 v9, v4, v101
+    ds_bpermute_b32 v13, v4, v102
+    ds_bpermute_b32 v17, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v2, v4, v33
+    ds_bpermute_b32 v2, v4, v100
+    ds_bpermute_b32 v10, v4, v101
+    ds_bpermute_b32 v14, v4, v102
+    ds_bpermute_b32 v18, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v3, v4, v33
+    ds_bpermute_b32 v3, v4, v100
+    ds_bpermute_b32 v11, v4, v101
+    ds_bpermute_b32 v15, v4, v102
+    ds_bpermute_b32 v19, v4, v103
     s_waitcnt lgkmcnt(0)
     v_lshrrev_b32_e32 v0, v63, v0
     v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v8, v63, v8
+    v_and_b32_e32 v8, 0xFF, v8
+    v_lshrrev_b32_e32 v12, v63, v12
+    v_and_b32_e32 v12, 0xFF, v12
+    v_lshrrev_b32_e32 v16, v63, v16
+    v_and_b32_e32 v16, 0xFF, v16
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v0, v0, v8, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v0, v0, v12, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v0, v0, v16, vcc
     v_lshrrev_b32_e32 v1, v63, v1
     v_and_b32_e32 v1, 0xFF, v1
-    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v9, v63, v9
+    v_and_b32_e32 v9, 0xFF, v9
+    v_lshrrev_b32_e32 v13, v63, v13
+    v_and_b32_e32 v13, 0xFF, v13
+    v_lshrrev_b32_e32 v17, v63, v17
+    v_and_b32_e32 v17, 0xFF, v17
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v1, v1, v9, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v1, v1, v13, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v1, v1, v17, vcc
     v_lshrrev_b32_e32 v2, v63, v2
     v_and_b32_e32 v2, 0xFF, v2
-    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v10, v63, v10
+    v_and_b32_e32 v10, 0xFF, v10
+    v_lshrrev_b32_e32 v14, v63, v14
+    v_and_b32_e32 v14, 0xFF, v14
+    v_lshrrev_b32_e32 v18, v63, v18
+    v_and_b32_e32 v18, 0xFF, v18
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v2, v2, v10, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v2, v2, v14, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v2, v2, v18, vcc
     v_lshrrev_b32_e32 v3, v63, v3
     v_and_b32_e32 v3, 0xFF, v3
+    v_lshrrev_b32_e32 v11, v63, v11
+    v_and_b32_e32 v11, 0xFF, v11
+    v_lshrrev_b32_e32 v15, v63, v15
+    v_and_b32_e32 v15, 0xFF, v15
+    v_lshrrev_b32_e32 v19, v63, v19
+    v_and_b32_e32 v19, 0xFF, v19
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v3, v3, v11, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v3, v3, v15, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v3, v3, v19, vcc
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshlrev_b32_e32 v2, 16, v2
     v_lshlrev_b32_e32 v3, 24, v3
     v_or_b32_e32 v0, v0, v1
     v_or_b32_e32 v0, v0, v2
     v_or_b32_e32 v0, v0, v3
     v_mov_b32_e32 v48, v0
 
-    // Group 1 -> v49 (cols 4..7)
-    v_add_u32_e32 v4, v58, v56
-    v_add_u32_e32 v4, 4, v4
+    // Group 1 -> v49 (cols 4..7) using per-row source selection
+    v_add_u32_e32 v4, 4, v56
     v_lshlrev_b32_e32 v4, 2, v4
-    ds_bpermute_b32 v0, v4, v33
+    ds_bpermute_b32 v0, v4, v100
+    ds_bpermute_b32 v8, v4, v101
+    ds_bpermute_b32 v12, v4, v102
+    ds_bpermute_b32 v16, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v1, v4, v33
+    ds_bpermute_b32 v1, v4, v100
+    ds_bpermute_b32 v9, v4, v101
+    ds_bpermute_b32 v13, v4, v102
+    ds_bpermute_b32 v17, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v2, v4, v33
+    ds_bpermute_b32 v2, v4, v100
+    ds_bpermute_b32 v10, v4, v101
+    ds_bpermute_b32 v14, v4, v102
+    ds_bpermute_b32 v18, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v3, v4, v33
+    ds_bpermute_b32 v3, v4, v100
+    ds_bpermute_b32 v11, v4, v101
+    ds_bpermute_b32 v15, v4, v102
+    ds_bpermute_b32 v19, v4, v103
     s_waitcnt lgkmcnt(0)
     v_lshrrev_b32_e32 v0, v63, v0
     v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v8, v63, v8
+    v_and_b32_e32 v8, 0xFF, v8
+    v_lshrrev_b32_e32 v12, v63, v12
+    v_and_b32_e32 v12, 0xFF, v12
+    v_lshrrev_b32_e32 v16, v63, v16
+    v_and_b32_e32 v16, 0xFF, v16
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v0, v0, v8, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v0, v0, v12, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v0, v0, v16, vcc
     v_lshrrev_b32_e32 v1, v63, v1
     v_and_b32_e32 v1, 0xFF, v1
-    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v9, v63, v9
+    v_and_b32_e32 v9, 0xFF, v9
+    v_lshrrev_b32_e32 v13, v63, v13
+    v_and_b32_e32 v13, 0xFF, v13
+    v_lshrrev_b32_e32 v17, v63, v17
+    v_and_b32_e32 v17, 0xFF, v17
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v1, v1, v9, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v1, v1, v13, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v1, v1, v17, vcc
     v_lshrrev_b32_e32 v2, v63, v2
     v_and_b32_e32 v2, 0xFF, v2
-    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v10, v63, v10
+    v_and_b32_e32 v10, 0xFF, v10
+    v_lshrrev_b32_e32 v14, v63, v14
+    v_and_b32_e32 v14, 0xFF, v14
+    v_lshrrev_b32_e32 v18, v63, v18
+    v_and_b32_e32 v18, 0xFF, v18
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v2, v2, v10, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v2, v2, v14, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v2, v2, v18, vcc
     v_lshrrev_b32_e32 v3, v63, v3
     v_and_b32_e32 v3, 0xFF, v3
+    v_lshrrev_b32_e32 v11, v63, v11
+    v_and_b32_e32 v11, 0xFF, v11
+    v_lshrrev_b32_e32 v15, v63, v15
+    v_and_b32_e32 v15, 0xFF, v15
+    v_lshrrev_b32_e32 v19, v63, v19
+    v_and_b32_e32 v19, 0xFF, v19
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v3, v3, v11, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v3, v3, v15, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v3, v3, v19, vcc
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshlrev_b32_e32 v2, 16, v2
     v_lshlrev_b32_e32 v3, 24, v3
     v_or_b32_e32 v0, v0, v1
     v_or_b32_e32 v0, v0, v2
     v_or_b32_e32 v0, v0, v3
     v_mov_b32_e32 v49, v0
 
-    // Group 2 -> v50 (cols 8..11)
-    v_add_u32_e32 v4, v58, v56
-    v_add_u32_e32 v4, 8, v4
+    // Group 2 -> v50 (cols 8..11) using per-row source selection
+    v_add_u32_e32 v4, 8, v56
     v_lshlrev_b32_e32 v4, 2, v4
-    ds_bpermute_b32 v0, v4, v33
+    ds_bpermute_b32 v0, v4, v100
+    ds_bpermute_b32 v8, v4, v101
+    ds_bpermute_b32 v12, v4, v102
+    ds_bpermute_b32 v16, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v1, v4, v33
+    ds_bpermute_b32 v1, v4, v100
+    ds_bpermute_b32 v9, v4, v101
+    ds_bpermute_b32 v13, v4, v102
+    ds_bpermute_b32 v17, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v2, v4, v33
+    ds_bpermute_b32 v2, v4, v100
+    ds_bpermute_b32 v10, v4, v101
+    ds_bpermute_b32 v14, v4, v102
+    ds_bpermute_b32 v18, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v3, v4, v33
+    ds_bpermute_b32 v3, v4, v100
+    ds_bpermute_b32 v11, v4, v101
+    ds_bpermute_b32 v15, v4, v102
+    ds_bpermute_b32 v19, v4, v103
     s_waitcnt lgkmcnt(0)
     v_lshrrev_b32_e32 v0, v63, v0
     v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v8, v63, v8
+    v_and_b32_e32 v8, 0xFF, v8
+    v_lshrrev_b32_e32 v12, v63, v12
+    v_and_b32_e32 v12, 0xFF, v12
+    v_lshrrev_b32_e32 v16, v63, v16
+    v_and_b32_e32 v16, 0xFF, v16
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v0, v0, v8, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v0, v0, v12, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v0, v0, v16, vcc
     v_lshrrev_b32_e32 v1, v63, v1
     v_and_b32_e32 v1, 0xFF, v1
-    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v9, v63, v9
+    v_and_b32_e32 v9, 0xFF, v9
+    v_lshrrev_b32_e32 v13, v63, v13
+    v_and_b32_e32 v13, 0xFF, v13
+    v_lshrrev_b32_e32 v17, v63, v17
+    v_and_b32_e32 v17, 0xFF, v17
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v1, v1, v9, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v1, v1, v13, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v1, v1, v17, vcc
     v_lshrrev_b32_e32 v2, v63, v2
     v_and_b32_e32 v2, 0xFF, v2
-    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v10, v63, v10
+    v_and_b32_e32 v10, 0xFF, v10
+    v_lshrrev_b32_e32 v14, v63, v14
+    v_and_b32_e32 v14, 0xFF, v14
+    v_lshrrev_b32_e32 v18, v63, v18
+    v_and_b32_e32 v18, 0xFF, v18
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v2, v2, v10, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v2, v2, v14, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v2, v2, v18, vcc
     v_lshrrev_b32_e32 v3, v63, v3
     v_and_b32_e32 v3, 0xFF, v3
+    v_lshrrev_b32_e32 v11, v63, v11
+    v_and_b32_e32 v11, 0xFF, v11
+    v_lshrrev_b32_e32 v15, v63, v15
+    v_and_b32_e32 v15, 0xFF, v15
+    v_lshrrev_b32_e32 v19, v63, v19
+    v_and_b32_e32 v19, 0xFF, v19
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v3, v3, v11, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v3, v3, v15, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v3, v3, v19, vcc
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshlrev_b32_e32 v2, 16, v2
     v_lshlrev_b32_e32 v3, 24, v3
     v_or_b32_e32 v0, v0, v1
     v_or_b32_e32 v0, v0, v2
     v_or_b32_e32 v0, v0, v3
     v_mov_b32_e32 v50, v0
 
-    // Group 3 -> v51 (cols 12..15)
-    v_add_u32_e32 v4, v58, v56
-    v_add_u32_e32 v4, 12, v4
+    // Group 3 -> v51 (cols 12..15) using per-row source selection
+    v_add_u32_e32 v4, 12, v56
     v_lshlrev_b32_e32 v4, 2, v4
-    ds_bpermute_b32 v0, v4, v33
+    ds_bpermute_b32 v0, v4, v100
+    ds_bpermute_b32 v8, v4, v101
+    ds_bpermute_b32 v12, v4, v102
+    ds_bpermute_b32 v16, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v1, v4, v33
+    ds_bpermute_b32 v1, v4, v100
+    ds_bpermute_b32 v9, v4, v101
+    ds_bpermute_b32 v13, v4, v102
+    ds_bpermute_b32 v17, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v2, v4, v33
+    ds_bpermute_b32 v2, v4, v100
+    ds_bpermute_b32 v10, v4, v101
+    ds_bpermute_b32 v14, v4, v102
+    ds_bpermute_b32 v18, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v3, v4, v33
+    ds_bpermute_b32 v3, v4, v100
+    ds_bpermute_b32 v11, v4, v101
+    ds_bpermute_b32 v15, v4, v102
+    ds_bpermute_b32 v19, v4, v103
     s_waitcnt lgkmcnt(0)
     v_lshrrev_b32_e32 v0, v63, v0
     v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v8, v63, v8
+    v_and_b32_e32 v8, 0xFF, v8
+    v_lshrrev_b32_e32 v12, v63, v12
+    v_and_b32_e32 v12, 0xFF, v12
+    v_lshrrev_b32_e32 v16, v63, v16
+    v_and_b32_e32 v16, 0xFF, v16
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v0, v0, v8, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v0, v0, v12, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v0, v0, v16, vcc
     v_lshrrev_b32_e32 v1, v63, v1
     v_and_b32_e32 v1, 0xFF, v1
-    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v9, v63, v9
+    v_and_b32_e32 v9, 0xFF, v9
+    v_lshrrev_b32_e32 v13, v63, v13
+    v_and_b32_e32 v13, 0xFF, v13
+    v_lshrrev_b32_e32 v17, v63, v17
+    v_and_b32_e32 v17, 0xFF, v17
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v1, v1, v9, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v1, v1, v13, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v1, v1, v17, vcc
     v_lshrrev_b32_e32 v2, v63, v2
     v_and_b32_e32 v2, 0xFF, v2
-    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v10, v63, v10
+    v_and_b32_e32 v10, 0xFF, v10
+    v_lshrrev_b32_e32 v14, v63, v14
+    v_and_b32_e32 v14, 0xFF, v14
+    v_lshrrev_b32_e32 v18, v63, v18
+    v_and_b32_e32 v18, 0xFF, v18
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v2, v2, v10, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v2, v2, v14, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v2, v2, v18, vcc
     v_lshrrev_b32_e32 v3, v63, v3
     v_and_b32_e32 v3, 0xFF, v3
+    v_lshrrev_b32_e32 v11, v63, v11
+    v_and_b32_e32 v11, 0xFF, v11
+    v_lshrrev_b32_e32 v15, v63, v15
+    v_and_b32_e32 v15, 0xFF, v15
+    v_lshrrev_b32_e32 v19, v63, v19
+    v_and_b32_e32 v19, 0xFF, v19
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v3, v3, v11, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v3, v3, v15, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v3, v3, v19, vcc
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshlrev_b32_e32 v2, 16, v2
     v_lshlrev_b32_e32 v3, 24, v3
     v_or_b32_e32 v0, v0, v1
     v_or_b32_e32 v0, v0, v2
     v_or_b32_e32 v0, v0, v3
     v_mov_b32_e32 v51, v0
 
-    // Group 4 -> v52 (cols 16..19)
-    v_add_u32_e32 v4, v58, v56
+    // Group 4 -> v52 (cols 16..19) using per-row source selection
+    v_add_u32_e32 v4, 16, v56
     v_lshlrev_b32_e32 v4, 2, v4
-    ds_bpermute_b32 v0, v4, v32
+    ds_bpermute_b32 v0, v4, v100
+    ds_bpermute_b32 v8, v4, v101
+    ds_bpermute_b32 v12, v4, v102
+    ds_bpermute_b32 v16, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v1, v4, v32
+    ds_bpermute_b32 v1, v4, v100
+    ds_bpermute_b32 v9, v4, v101
+    ds_bpermute_b32 v13, v4, v102
+    ds_bpermute_b32 v17, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v2, v4, v32
+    ds_bpermute_b32 v2, v4, v100
+    ds_bpermute_b32 v10, v4, v101
+    ds_bpermute_b32 v14, v4, v102
+    ds_bpermute_b32 v18, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v3, v4, v32
+    ds_bpermute_b32 v3, v4, v100
+    ds_bpermute_b32 v11, v4, v101
+    ds_bpermute_b32 v15, v4, v102
+    ds_bpermute_b32 v19, v4, v103
     s_waitcnt lgkmcnt(0)
     v_lshrrev_b32_e32 v0, v63, v0
     v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v8, v63, v8
+    v_and_b32_e32 v8, 0xFF, v8
+    v_lshrrev_b32_e32 v12, v63, v12
+    v_and_b32_e32 v12, 0xFF, v12
+    v_lshrrev_b32_e32 v16, v63, v16
+    v_and_b32_e32 v16, 0xFF, v16
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v0, v0, v8, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v0, v0, v12, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v0, v0, v16, vcc
     v_lshrrev_b32_e32 v1, v63, v1
     v_and_b32_e32 v1, 0xFF, v1
-    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v9, v63, v9
+    v_and_b32_e32 v9, 0xFF, v9
+    v_lshrrev_b32_e32 v13, v63, v13
+    v_and_b32_e32 v13, 0xFF, v13
+    v_lshrrev_b32_e32 v17, v63, v17
+    v_and_b32_e32 v17, 0xFF, v17
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v1, v1, v9, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v1, v1, v13, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v1, v1, v17, vcc
     v_lshrrev_b32_e32 v2, v63, v2
     v_and_b32_e32 v2, 0xFF, v2
-    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v10, v63, v10
+    v_and_b32_e32 v10, 0xFF, v10
+    v_lshrrev_b32_e32 v14, v63, v14
+    v_and_b32_e32 v14, 0xFF, v14
+    v_lshrrev_b32_e32 v18, v63, v18
+    v_and_b32_e32 v18, 0xFF, v18
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v2, v2, v10, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v2, v2, v14, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v2, v2, v18, vcc
     v_lshrrev_b32_e32 v3, v63, v3
     v_and_b32_e32 v3, 0xFF, v3
+    v_lshrrev_b32_e32 v11, v63, v11
+    v_and_b32_e32 v11, 0xFF, v11
+    v_lshrrev_b32_e32 v15, v63, v15
+    v_and_b32_e32 v15, 0xFF, v15
+    v_lshrrev_b32_e32 v19, v63, v19
+    v_and_b32_e32 v19, 0xFF, v19
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v3, v3, v11, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v3, v3, v15, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v3, v3, v19, vcc
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshlrev_b32_e32 v2, 16, v2
     v_lshlrev_b32_e32 v3, 24, v3
     v_or_b32_e32 v0, v0, v1
     v_or_b32_e32 v0, v0, v2
     v_or_b32_e32 v0, v0, v3
     v_mov_b32_e32 v52, v0
 
-    // Group 5 -> v53 (cols 20..23)
-    v_add_u32_e32 v4, v58, v56
-    v_add_u32_e32 v4, 4, v4
+    // Group 5 -> v53 (cols 20..23) using per-row source selection
+    v_add_u32_e32 v4, 20, v56
     v_lshlrev_b32_e32 v4, 2, v4
-    ds_bpermute_b32 v0, v4, v32
+    ds_bpermute_b32 v0, v4, v100
+    ds_bpermute_b32 v8, v4, v101
+    ds_bpermute_b32 v12, v4, v102
+    ds_bpermute_b32 v16, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v1, v4, v32
+    ds_bpermute_b32 v1, v4, v100
+    ds_bpermute_b32 v9, v4, v101
+    ds_bpermute_b32 v13, v4, v102
+    ds_bpermute_b32 v17, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v2, v4, v32
+    ds_bpermute_b32 v2, v4, v100
+    ds_bpermute_b32 v10, v4, v101
+    ds_bpermute_b32 v14, v4, v102
+    ds_bpermute_b32 v18, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v3, v4, v32
+    ds_bpermute_b32 v3, v4, v100
+    ds_bpermute_b32 v11, v4, v101
+    ds_bpermute_b32 v15, v4, v102
+    ds_bpermute_b32 v19, v4, v103
     s_waitcnt lgkmcnt(0)
     v_lshrrev_b32_e32 v0, v63, v0
     v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v8, v63, v8
+    v_and_b32_e32 v8, 0xFF, v8
+    v_lshrrev_b32_e32 v12, v63, v12
+    v_and_b32_e32 v12, 0xFF, v12
+    v_lshrrev_b32_e32 v16, v63, v16
+    v_and_b32_e32 v16, 0xFF, v16
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v0, v0, v8, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v0, v0, v12, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v0, v0, v16, vcc
     v_lshrrev_b32_e32 v1, v63, v1
     v_and_b32_e32 v1, 0xFF, v1
-    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v9, v63, v9
+    v_and_b32_e32 v9, 0xFF, v9
+    v_lshrrev_b32_e32 v13, v63, v13
+    v_and_b32_e32 v13, 0xFF, v13
+    v_lshrrev_b32_e32 v17, v63, v17
+    v_and_b32_e32 v17, 0xFF, v17
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v1, v1, v9, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v1, v1, v13, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v1, v1, v17, vcc
     v_lshrrev_b32_e32 v2, v63, v2
     v_and_b32_e32 v2, 0xFF, v2
-    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v10, v63, v10
+    v_and_b32_e32 v10, 0xFF, v10
+    v_lshrrev_b32_e32 v14, v63, v14
+    v_and_b32_e32 v14, 0xFF, v14
+    v_lshrrev_b32_e32 v18, v63, v18
+    v_and_b32_e32 v18, 0xFF, v18
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v2, v2, v10, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v2, v2, v14, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v2, v2, v18, vcc
     v_lshrrev_b32_e32 v3, v63, v3
     v_and_b32_e32 v3, 0xFF, v3
+    v_lshrrev_b32_e32 v11, v63, v11
+    v_and_b32_e32 v11, 0xFF, v11
+    v_lshrrev_b32_e32 v15, v63, v15
+    v_and_b32_e32 v15, 0xFF, v15
+    v_lshrrev_b32_e32 v19, v63, v19
+    v_and_b32_e32 v19, 0xFF, v19
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v3, v3, v11, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v3, v3, v15, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v3, v3, v19, vcc
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshlrev_b32_e32 v2, 16, v2
     v_lshlrev_b32_e32 v3, 24, v3
     v_or_b32_e32 v0, v0, v1
     v_or_b32_e32 v0, v0, v2
     v_or_b32_e32 v0, v0, v3
     v_mov_b32_e32 v53, v0
 
-    // Group 6 -> v54 (cols 24..27)
-    v_add_u32_e32 v4, v58, v56
-    v_add_u32_e32 v4, 8, v4
+    // Group 6 -> v54 (cols 24..27) using per-row source selection
+    v_add_u32_e32 v4, 24, v56
     v_lshlrev_b32_e32 v4, 2, v4
-    ds_bpermute_b32 v0, v4, v32
+    ds_bpermute_b32 v0, v4, v100
+    ds_bpermute_b32 v8, v4, v101
+    ds_bpermute_b32 v12, v4, v102
+    ds_bpermute_b32 v16, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v1, v4, v32
+    ds_bpermute_b32 v1, v4, v100
+    ds_bpermute_b32 v9, v4, v101
+    ds_bpermute_b32 v13, v4, v102
+    ds_bpermute_b32 v17, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v2, v4, v32
+    ds_bpermute_b32 v2, v4, v100
+    ds_bpermute_b32 v10, v4, v101
+    ds_bpermute_b32 v14, v4, v102
+    ds_bpermute_b32 v18, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v3, v4, v32
+    ds_bpermute_b32 v3, v4, v100
+    ds_bpermute_b32 v11, v4, v101
+    ds_bpermute_b32 v15, v4, v102
+    ds_bpermute_b32 v19, v4, v103
     s_waitcnt lgkmcnt(0)
     v_lshrrev_b32_e32 v0, v63, v0
     v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v8, v63, v8
+    v_and_b32_e32 v8, 0xFF, v8
+    v_lshrrev_b32_e32 v12, v63, v12
+    v_and_b32_e32 v12, 0xFF, v12
+    v_lshrrev_b32_e32 v16, v63, v16
+    v_and_b32_e32 v16, 0xFF, v16
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v0, v0, v8, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v0, v0, v12, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v0, v0, v16, vcc
     v_lshrrev_b32_e32 v1, v63, v1
     v_and_b32_e32 v1, 0xFF, v1
-    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v9, v63, v9
+    v_and_b32_e32 v9, 0xFF, v9
+    v_lshrrev_b32_e32 v13, v63, v13
+    v_and_b32_e32 v13, 0xFF, v13
+    v_lshrrev_b32_e32 v17, v63, v17
+    v_and_b32_e32 v17, 0xFF, v17
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v1, v1, v9, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v1, v1, v13, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v1, v1, v17, vcc
     v_lshrrev_b32_e32 v2, v63, v2
     v_and_b32_e32 v2, 0xFF, v2
-    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v10, v63, v10
+    v_and_b32_e32 v10, 0xFF, v10
+    v_lshrrev_b32_e32 v14, v63, v14
+    v_and_b32_e32 v14, 0xFF, v14
+    v_lshrrev_b32_e32 v18, v63, v18
+    v_and_b32_e32 v18, 0xFF, v18
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v2, v2, v10, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v2, v2, v14, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v2, v2, v18, vcc
     v_lshrrev_b32_e32 v3, v63, v3
     v_and_b32_e32 v3, 0xFF, v3
+    v_lshrrev_b32_e32 v11, v63, v11
+    v_and_b32_e32 v11, 0xFF, v11
+    v_lshrrev_b32_e32 v15, v63, v15
+    v_and_b32_e32 v15, 0xFF, v15
+    v_lshrrev_b32_e32 v19, v63, v19
+    v_and_b32_e32 v19, 0xFF, v19
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v3, v3, v11, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v3, v3, v15, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v3, v3, v19, vcc
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshlrev_b32_e32 v2, 16, v2
     v_lshlrev_b32_e32 v3, 24, v3
     v_or_b32_e32 v0, v0, v1
     v_or_b32_e32 v0, v0, v2
     v_or_b32_e32 v0, v0, v3
     v_mov_b32_e32 v54, v0
 
-    // Group 7 -> v55 (cols 28..31)
-    v_add_u32_e32 v4, v58, v56
-    v_add_u32_e32 v4, 12, v4
+    // Group 7 -> v55 (cols 28..31) using per-row source selection
+    v_add_u32_e32 v4, 28, v56
     v_lshlrev_b32_e32 v4, 2, v4
-    ds_bpermute_b32 v0, v4, v32
+    ds_bpermute_b32 v0, v4, v100
+    ds_bpermute_b32 v8, v4, v101
+    ds_bpermute_b32 v12, v4, v102
+    ds_bpermute_b32 v16, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v1, v4, v32
+    ds_bpermute_b32 v1, v4, v100
+    ds_bpermute_b32 v9, v4, v101
+    ds_bpermute_b32 v13, v4, v102
+    ds_bpermute_b32 v17, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v2, v4, v32
+    ds_bpermute_b32 v2, v4, v100
+    ds_bpermute_b32 v10, v4, v101
+    ds_bpermute_b32 v14, v4, v102
+    ds_bpermute_b32 v18, v4, v103
     v_add_u32_e32 v4, 4, v4
-    ds_bpermute_b32 v3, v4, v32
+    ds_bpermute_b32 v3, v4, v100
+    ds_bpermute_b32 v11, v4, v101
+    ds_bpermute_b32 v15, v4, v102
+    ds_bpermute_b32 v19, v4, v103
     s_waitcnt lgkmcnt(0)
     v_lshrrev_b32_e32 v0, v63, v0
     v_and_b32_e32 v0, 0xFF, v0
+    v_lshrrev_b32_e32 v8, v63, v8
+    v_and_b32_e32 v8, 0xFF, v8
+    v_lshrrev_b32_e32 v12, v63, v12
+    v_and_b32_e32 v12, 0xFF, v12
+    v_lshrrev_b32_e32 v16, v63, v16
+    v_and_b32_e32 v16, 0xFF, v16
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v0, v0, v8, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v0, v0, v12, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v0, v0, v16, vcc
     v_lshrrev_b32_e32 v1, v63, v1
     v_and_b32_e32 v1, 0xFF, v1
-    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshrrev_b32_e32 v9, v63, v9
+    v_and_b32_e32 v9, 0xFF, v9
+    v_lshrrev_b32_e32 v13, v63, v13
+    v_and_b32_e32 v13, 0xFF, v13
+    v_lshrrev_b32_e32 v17, v63, v17
+    v_and_b32_e32 v17, 0xFF, v17
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v1, v1, v9, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v1, v1, v13, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v1, v1, v17, vcc
     v_lshrrev_b32_e32 v2, v63, v2
     v_and_b32_e32 v2, 0xFF, v2
-    v_lshlrev_b32_e32 v2, 16, v2
+    v_lshrrev_b32_e32 v10, v63, v10
+    v_and_b32_e32 v10, 0xFF, v10
+    v_lshrrev_b32_e32 v14, v63, v14
+    v_and_b32_e32 v14, 0xFF, v14
+    v_lshrrev_b32_e32 v18, v63, v18
+    v_and_b32_e32 v18, 0xFF, v18
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v2, v2, v10, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v2, v2, v14, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v2, v2, v18, vcc
     v_lshrrev_b32_e32 v3, v63, v3
     v_and_b32_e32 v3, 0xFF, v3
+    v_lshrrev_b32_e32 v11, v63, v11
+    v_and_b32_e32 v11, 0xFF, v11
+    v_lshrrev_b32_e32 v15, v63, v15
+    v_and_b32_e32 v15, 0xFF, v15
+    v_lshrrev_b32_e32 v19, v63, v19
+    v_and_b32_e32 v19, 0xFF, v19
+    v_cmp_eq_u32_e32 vcc, 1, v62
+    v_cndmask_b32_e32 v3, v3, v11, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v62
+    v_cndmask_b32_e32 v3, v3, v15, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v62
+    v_cndmask_b32_e32 v3, v3, v19, vcc
+    v_lshlrev_b32_e32 v1, 8, v1
+    v_lshlrev_b32_e32 v2, 16, v2
     v_lshlrev_b32_e32 v3, 24, v3
     v_or_b32_e32 v0, v0, v1
     v_or_b32_e32 v0, v0, v2
     v_or_b32_e32 v0, v0, v3
     v_mov_b32_e32 v55, v0
-
+PV_MFMA_START:
     // PV MFMA using TR8 V reads (K=64, tiles 0+1)
-    // Triton-style base swizzle (bitop3:0x36 + XOR bases)
-    v_lshlrev_b32_e32 v2, 6, v60         // v14 = tid << 6
-    v_lshlrev_b32_e32 v3, 2, v60         // v141 = tid << 2
+    v_lshlrev_b32_e32 v2, 6, v60
+    v_lshlrev_b32_e32 v3, 2, v60
     v_and_b32_e32 v4, 48, v3
-    v_and_or_b32 v2, v2, s25, v4         // v14 = (v14 & ~0xb80) | (v141 & 0xb80)
+    v_and_or_b32 v2, v2, s25, v4
     v_and_b32_e32 v5, 16, v60
     v_lshlrev_b32_e32 v6, 3, v60
     v_and_b32_e32 v6, 8, v6
-    v_bitop3_b32 v2, v2, v5, v6 bitop3:0x36  // base (relative)
+    v_bitop3_b32 v2, v2, v5, v6 bitop3:0x36
 
     v_xor_b32_e32 v3, 0x20, v2
     v_xor_b32_e32 v4, 0x460, v2
@@ -607,7 +1138,7 @@ K_LOOP:
     v_add_u32_e32 v9, s42, v9
     v_add_u32_e32 v10, s42, v10
 
-    // Preserve TR8 base addresses (avoid clobber by reads)
+    // Preserve TR8 base addresses
     v_mov_b32_e32 v20, v2
     v_mov_b32_e32 v21, v3
     v_mov_b32_e32 v22, v4
@@ -618,34 +1149,579 @@ K_LOOP:
     v_mov_b32_e32 v27, v9
     v_mov_b32_e32 v28, v10
 
-
-    ds_read_b64_tr_b8 v[0:1], v20 offset:0
-    ds_read_b64_tr_b8 v[2:3], v20 offset:1088
-    ds_read_b64_tr_b8 v[4:5], v20 offset:4096
-    ds_read_b64_tr_b8 v[6:7], v20 offset:5184
+    // TR8 A reads into v200..v231 (4 sets)
+    ds_read_b64_tr_b8 v[200:201], v20 offset:0
+    ds_read_b64_tr_b8 v[202:203], v20 offset:256
+    ds_read_b64_tr_b8 v[204:205], v20 offset:512
+    ds_read_b64_tr_b8 v[206:207], v20 offset:768
+    ds_read_b64_tr_b8 v[208:209], v21 offset:1024
+    ds_read_b64_tr_b8 v[210:211], v22 offset:1152
+    ds_read_b64_tr_b8 v[212:213], v23 offset:1280
+    ds_read_b64_tr_b8 v[214:215], v24 offset:1408
+    ds_read_b64_tr_b8 v[216:217], v20 offset:2048
+    ds_read_b64_tr_b8 v[218:219], v20 offset:2176
+    ds_read_b64_tr_b8 v[220:221], v20 offset:2304
+    ds_read_b64_tr_b8 v[222:223], v20 offset:2432
+    ds_read_b64_tr_b8 v[224:225], v25 offset:3072
+    ds_read_b64_tr_b8 v[226:227], v26 offset:3200
+    ds_read_b64_tr_b8 v[228:229], v27 offset:3328
+    ds_read_b64_tr_b8 v[230:231], v28 offset:3456
     s_waitcnt lgkmcnt(0)
-    v_mfma_f32_32x32x64_f8f6f4 v[64:79], v[48:55], v[0:7], v[64:79]
 
-    ds_read_b64_tr_b8 v[0:1], v21
-    ds_read_b64_tr_b8 v[2:3], v22
-    ds_read_b64_tr_b8 v[4:5], v23
-    ds_read_b64_tr_b8 v[6:7], v24
-    s_waitcnt lgkmcnt(0)
-    v_mfma_f32_32x32x64_f8f6f4 v[80:95], v[48:55], v[0:7], v[80:95]
+    // Build A regs for group0 (lane0)
+    v_mov_b32_e32 v0, 0
+    v_mov_b32_e32 v1, 0
+    v_mov_b32_e32 v2, 0
+    v_mov_b32_e32 v3, 0
+    v_mov_b32_e32 v4, 0
+    v_mov_b32_e32 v5, 0
+    v_mov_b32_e32 v6, 0
+    v_mov_b32_e32 v7, 0
+    v_lshrrev_b32_e32 v180, 16, v203
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v0, v0, v180
+    v_lshrrev_b32_e32 v180, 24, v203
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v0, v0, v180
+    v_lshrrev_b32_e32 v180, 16, v205
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v0, v0, v180
+    v_lshrrev_b32_e32 v180, 24, v205
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v0, v0, v180
+    v_lshrrev_b32_e32 v180, 24, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v1, v1, v180
+    v_lshrrev_b32_e32 v180, 16, v215
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v1, v1, v180
+    v_lshrrev_b32_e32 v180, 24, v215
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v1, v1, v180
+    v_lshrrev_b32_e32 v180, 24, v224
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v1, v1, v180
+    v_lshrrev_b32_e32 v180, 16, v207
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v2, v2, v180
+    v_lshrrev_b32_e32 v180, 24, v207
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v2, v2, v180
+    v_lshrrev_b32_e32 v180, 16, v209
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v2, v2, v180
+    v_lshrrev_b32_e32 v180, 24, v209
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v2, v2, v180
+    v_lshrrev_b32_e32 v180, 0, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v3, v3, v180
+    v_lshrrev_b32_e32 v180, 8, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v3, v3, v180
+    v_lshrrev_b32_e32 v180, 16, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v3, v3, v180
+    v_lshrrev_b32_e32 v180, 24, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v3, v3, v180
+    v_lshrrev_b32_e32 v180, 0, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v4, v4, v180
+    v_lshrrev_b32_e32 v180, 8, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v4, v4, v180
+    v_lshrrev_b32_e32 v180, 16, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v4, v4, v180
+    v_lshrrev_b32_e32 v180, 24, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v4, v4, v180
+    v_lshrrev_b32_e32 v180, 16, v213
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v5, v5, v180
+    v_lshrrev_b32_e32 v180, 0, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v5, v5, v180
+    v_lshrrev_b32_e32 v180, 8, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v5, v5, v180
+    v_lshrrev_b32_e32 v180, 16, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v5, v5, v180
+    v_lshrrev_b32_e32 v180, 0, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v6, v6, v180
+    v_lshrrev_b32_e32 v180, 8, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v6, v6, v180
+    v_lshrrev_b32_e32 v180, 16, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v6, v6, v180
+    v_lshrrev_b32_e32 v180, 24, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v6, v6, v180
+    v_lshrrev_b32_e32 v180, 24, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v7, v7, v180
+    v_lshrrev_b32_e32 v180, 0, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v7, v7, v180
+    v_lshrrev_b32_e32 v180, 8, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v7, v7, v180
+    v_lshrrev_b32_e32 v180, 16, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v7, v7, v180
+    // Build A regs for group1 (lane16)
+    v_mov_b32_e32 v240, 0
+    v_mov_b32_e32 v241, 0
+    v_mov_b32_e32 v242, 0
+    v_mov_b32_e32 v243, 0
+    v_mov_b32_e32 v244, 0
+    v_mov_b32_e32 v245, 0
+    v_mov_b32_e32 v246, 0
+    v_mov_b32_e32 v247, 0
+    v_lshrrev_b32_e32 v180, 16, v203
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v240, v240, v180
+    v_lshrrev_b32_e32 v180, 24, v203
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v240, v240, v180
+    v_lshrrev_b32_e32 v180, 16, v205
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v240, v240, v180
+    v_lshrrev_b32_e32 v180, 24, v205
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v240, v240, v180
+    v_lshrrev_b32_e32 v180, 24, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v241, v241, v180
+    v_lshrrev_b32_e32 v180, 16, v215
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v241, v241, v180
+    v_lshrrev_b32_e32 v180, 24, v215
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v241, v241, v180
+    v_lshrrev_b32_e32 v180, 24, v224
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v241, v241, v180
+    v_lshrrev_b32_e32 v180, 16, v207
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v242, v242, v180
+    v_lshrrev_b32_e32 v180, 24, v207
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v242, v242, v180
+    v_lshrrev_b32_e32 v180, 16, v209
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v242, v242, v180
+    v_lshrrev_b32_e32 v180, 24, v209
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v242, v242, v180
+    v_lshrrev_b32_e32 v180, 0, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v243, v243, v180
+    v_lshrrev_b32_e32 v180, 8, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v243, v243, v180
+    v_lshrrev_b32_e32 v180, 16, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v243, v243, v180
+    v_lshrrev_b32_e32 v180, 24, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v243, v243, v180
+    v_lshrrev_b32_e32 v180, 0, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v244, v244, v180
+    v_lshrrev_b32_e32 v180, 8, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v244, v244, v180
+    v_lshrrev_b32_e32 v180, 16, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v244, v244, v180
+    v_lshrrev_b32_e32 v180, 24, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v244, v244, v180
+    v_lshrrev_b32_e32 v180, 16, v213
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v245, v245, v180
+    v_lshrrev_b32_e32 v180, 0, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v245, v245, v180
+    v_lshrrev_b32_e32 v180, 8, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v245, v245, v180
+    v_lshrrev_b32_e32 v180, 16, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v245, v245, v180
+    v_lshrrev_b32_e32 v180, 0, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v246, v246, v180
+    v_lshrrev_b32_e32 v180, 8, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v246, v246, v180
+    v_lshrrev_b32_e32 v180, 16, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v246, v246, v180
+    v_lshrrev_b32_e32 v180, 24, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v246, v246, v180
+    v_lshrrev_b32_e32 v180, 24, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v247, v247, v180
+    v_lshrrev_b32_e32 v180, 0, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v247, v247, v180
+    v_lshrrev_b32_e32 v180, 8, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v247, v247, v180
+    v_lshrrev_b32_e32 v180, 16, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v247, v247, v180
+    // Build A regs for group2 (lane32)
+    v_mov_b32_e32 v248, 0
+    v_mov_b32_e32 v249, 0
+    v_mov_b32_e32 v250, 0
+    v_mov_b32_e32 v251, 0
+    v_mov_b32_e32 v252, 0
+    v_mov_b32_e32 v253, 0
+    v_mov_b32_e32 v254, 0
+    v_mov_b32_e32 v255, 0
+    v_lshrrev_b32_e32 v180, 24, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v248, v248, v180
+    v_lshrrev_b32_e32 v180, 16, v215
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v248, v248, v180
+    v_lshrrev_b32_e32 v180, 24, v215
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v248, v248, v180
+    v_lshrrev_b32_e32 v180, 24, v224
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v248, v248, v180
+    v_lshrrev_b32_e32 v180, 16, v203
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v249, v249, v180
+    v_lshrrev_b32_e32 v180, 24, v203
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v249, v249, v180
+    v_lshrrev_b32_e32 v180, 16, v205
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v249, v249, v180
+    v_lshrrev_b32_e32 v180, 24, v205
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v249, v249, v180
+    v_lshrrev_b32_e32 v180, 0, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v250, v250, v180
+    v_lshrrev_b32_e32 v180, 8, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v250, v250, v180
+    v_lshrrev_b32_e32 v180, 16, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v250, v250, v180
+    v_lshrrev_b32_e32 v180, 24, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v250, v250, v180
+    v_lshrrev_b32_e32 v180, 16, v207
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v251, v251, v180
+    v_lshrrev_b32_e32 v180, 24, v207
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v251, v251, v180
+    v_lshrrev_b32_e32 v180, 16, v209
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v251, v251, v180
+    v_lshrrev_b32_e32 v180, 24, v209
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v251, v251, v180
+    v_lshrrev_b32_e32 v180, 16, v213
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v252, v252, v180
+    v_lshrrev_b32_e32 v180, 0, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v252, v252, v180
+    v_lshrrev_b32_e32 v180, 8, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v252, v252, v180
+    v_lshrrev_b32_e32 v180, 16, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v252, v252, v180
+    v_lshrrev_b32_e32 v180, 0, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v253, v253, v180
+    v_lshrrev_b32_e32 v180, 8, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v253, v253, v180
+    v_lshrrev_b32_e32 v180, 16, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v253, v253, v180
+    v_lshrrev_b32_e32 v180, 24, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v253, v253, v180
+    v_lshrrev_b32_e32 v180, 24, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v254, v254, v180
+    v_lshrrev_b32_e32 v180, 0, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v254, v254, v180
+    v_lshrrev_b32_e32 v180, 8, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v254, v254, v180
+    v_lshrrev_b32_e32 v180, 16, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v254, v254, v180
+    v_lshrrev_b32_e32 v180, 0, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v255, v255, v180
+    v_lshrrev_b32_e32 v180, 8, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v255, v255, v180
+    v_lshrrev_b32_e32 v180, 16, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v255, v255, v180
+    v_lshrrev_b32_e32 v180, 24, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v255, v255, v180
+    // Build A regs for group3 (lane48)
+    v_mov_b32_e32 v232, 0
+    v_mov_b32_e32 v233, 0
+    v_mov_b32_e32 v234, 0
+    v_mov_b32_e32 v235, 0
+    v_mov_b32_e32 v236, 0
+    v_mov_b32_e32 v237, 0
+    v_mov_b32_e32 v238, 0
+    v_mov_b32_e32 v239, 0
+    v_lshrrev_b32_e32 v180, 24, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v232, v232, v180
+    v_lshrrev_b32_e32 v180, 16, v215
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v232, v232, v180
+    v_lshrrev_b32_e32 v180, 24, v215
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v232, v232, v180
+    v_lshrrev_b32_e32 v180, 24, v224
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v232, v232, v180
+    v_lshrrev_b32_e32 v180, 16, v203
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v233, v233, v180
+    v_lshrrev_b32_e32 v180, 24, v203
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v233, v233, v180
+    v_lshrrev_b32_e32 v180, 16, v205
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v233, v233, v180
+    v_lshrrev_b32_e32 v180, 24, v205
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v233, v233, v180
+    v_lshrrev_b32_e32 v180, 0, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v234, v234, v180
+    v_lshrrev_b32_e32 v180, 8, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v234, v234, v180
+    v_lshrrev_b32_e32 v180, 16, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v234, v234, v180
+    v_lshrrev_b32_e32 v180, 24, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v234, v234, v180
+    v_lshrrev_b32_e32 v180, 16, v207
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v235, v235, v180
+    v_lshrrev_b32_e32 v180, 24, v207
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v235, v235, v180
+    v_lshrrev_b32_e32 v180, 16, v209
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v235, v235, v180
+    v_lshrrev_b32_e32 v180, 24, v209
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v235, v235, v180
+    v_lshrrev_b32_e32 v180, 16, v213
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v236, v236, v180
+    v_lshrrev_b32_e32 v180, 0, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v236, v236, v180
+    v_lshrrev_b32_e32 v180, 8, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v236, v236, v180
+    v_lshrrev_b32_e32 v180, 16, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v236, v236, v180
+    v_lshrrev_b32_e32 v180, 0, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v237, v237, v180
+    v_lshrrev_b32_e32 v180, 8, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v237, v237, v180
+    v_lshrrev_b32_e32 v180, 16, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v237, v237, v180
+    v_lshrrev_b32_e32 v180, 24, v200
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v237, v237, v180
+    v_lshrrev_b32_e32 v180, 24, v210
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v238, v238, v180
+    v_lshrrev_b32_e32 v180, 0, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v238, v238, v180
+    v_lshrrev_b32_e32 v180, 8, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v238, v238, v180
+    v_lshrrev_b32_e32 v180, 16, v211
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v238, v238, v180
+    v_lshrrev_b32_e32 v180, 0, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v239, v239, v180
+    v_lshrrev_b32_e32 v180, 8, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v239, v239, v180
+    v_lshrrev_b32_e32 v180, 16, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v239, v239, v180
+    v_lshrrev_b32_e32 v180, 24, v201
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v239, v239, v180
 
-    ds_read_b64_tr_b8 v[0:1], v20 offset:64
-    ds_read_b64_tr_b8 v[2:3], v20 offset:1024
-    ds_read_b64_tr_b8 v[4:5], v20 offset:4160
-    ds_read_b64_tr_b8 v[6:7], v20 offset:5120
-    s_waitcnt lgkmcnt(0)
-    v_mfma_f32_32x32x64_f8f6f4 v[96:111], v[48:55], v[0:7], v[96:111]
+    // Select mapping by lane group (0..3)
+    v_lshrrev_b32_e32 v183, 4, v60
+    v_mov_b32_e32 v182, 1
+    v_cmp_eq_u32_e32 vcc, v183, v182
+    v_cndmask_b32_e32 v0, v0, v240, vcc
+    v_cndmask_b32_e32 v1, v1, v241, vcc
+    v_cndmask_b32_e32 v2, v2, v242, vcc
+    v_cndmask_b32_e32 v3, v3, v243, vcc
+    v_cndmask_b32_e32 v4, v4, v244, vcc
+    v_cndmask_b32_e32 v5, v5, v245, vcc
+    v_cndmask_b32_e32 v6, v6, v246, vcc
+    v_cndmask_b32_e32 v7, v7, v247, vcc
+    v_mov_b32_e32 v182, 2
+    v_cmp_eq_u32_e32 vcc, v183, v182
+    v_cndmask_b32_e32 v0, v0, v248, vcc
+    v_cndmask_b32_e32 v1, v1, v249, vcc
+    v_cndmask_b32_e32 v2, v2, v250, vcc
+    v_cndmask_b32_e32 v3, v3, v251, vcc
+    v_cndmask_b32_e32 v4, v4, v252, vcc
+    v_cndmask_b32_e32 v5, v5, v253, vcc
+    v_cndmask_b32_e32 v6, v6, v254, vcc
+    v_cndmask_b32_e32 v7, v7, v255, vcc
+    v_mov_b32_e32 v182, 3
+    v_cmp_eq_u32_e32 vcc, v183, v182
+    v_cndmask_b32_e32 v0, v0, v232, vcc
+    v_cndmask_b32_e32 v1, v1, v233, vcc
+    v_cndmask_b32_e32 v2, v2, v234, vcc
+    v_cndmask_b32_e32 v3, v3, v235, vcc
+    v_cndmask_b32_e32 v4, v4, v236, vcc
+    v_cndmask_b32_e32 v5, v5, v237, vcc
+    v_cndmask_b32_e32 v6, v6, v238, vcc
+    v_cndmask_b32_e32 v7, v7, v239, vcc
 
-    ds_read_b64_tr_b8 v[0:1], v25
-    ds_read_b64_tr_b8 v[2:3], v26
-    ds_read_b64_tr_b8 v[4:5], v27
-    ds_read_b64_tr_b8 v[6:7], v28
-    s_waitcnt lgkmcnt(0)
-    v_mfma_f32_32x32x64_f8f6f4 v[112:127], v[48:55], v[0:7], v[112:127]
+    v_mfma_f32_32x32x64_f8f6f4 v[64:79], v[0:7], v[48:55], v[64:79]
+    v_mfma_f32_32x32x64_f8f6f4 v[80:95], v[0:7], v[48:55], v[80:95]
+    v_mfma_f32_32x32x64_f8f6f4 v[96:111], v[0:7], v[48:55], v[96:111]
+    v_mfma_f32_32x32x64_f8f6f4 v[112:127], v[0:7], v[48:55], v[112:127]
 
     // Prefetch next tile pair (if any)
     s_add_u32 s34, s30, 2
@@ -677,7 +1753,18 @@ K_LOOP:
     s_and_saveexec_b64 s[22:23], vcc
     v_lshrrev_b32_e32 v4, 3, v60          // row = tid >> 3 (0..31)
     v_and_b32_e32 v5, 7, v60              // col_block = tid & 7 (0..7)
-    v_lshlrev_b32_e32 v4, 7, v4           // row * 128
+    // permute row bits: (b4,b3,b2)->(b3,b2,b4)
+    v_and_b32_e32 v208, 8, v4
+    v_lshlrev_b32_e32 v208, 1, v208
+    v_and_b32_e32 v209, 4, v4
+    v_lshlrev_b32_e32 v209, 1, v209
+    v_and_b32_e32 v210, 16, v4
+    v_lshrrev_b32_e32 v210, 2, v210
+    v_and_b32_e32 v211, 3, v4
+    v_or_b32_e32 v208, v208, v209
+    v_or_b32_e32 v208, v208, v210
+    v_or_b32_e32 v4, v208, v211
+    v_lshlrev_b32_e32 v4, 7, v4           // row_perm * 128
     v_lshlrev_b32_e32 v5, 4, v5           // col_block * 16
     v_add_u32_e32 v2, v4, v5              // byte offset within V
     buffer_load_dwordx4 v[40:43], v2, s[16:19], s38 offen
@@ -757,9 +1844,9 @@ K_LOOP_END:
     .amdhsa_system_sgpr_workgroup_id_x 1
     .amdhsa_system_sgpr_workgroup_id_y 1
     .amdhsa_system_vgpr_workitem_id 0
-    .amdhsa_next_free_vgpr 240
+    .amdhsa_next_free_vgpr 256
     .amdhsa_next_free_sgpr 44
-    .amdhsa_accum_offset 220
+    .amdhsa_accum_offset 256
 .end_amdhsa_kernel
 
 .amdgpu_metadata

@@ -811,3 +811,66 @@ RESULT: PASS (finite outputs) with max_err=0.543720, mean_err=0.086345, max_rel_
 INSIGHT: Random-input numerics are finite but error levels remain high; this is consistent with the known PV B-operand mapping issue.
 NEXT: Derive and apply a cross-register byte permutation for v48..v55 based on mapping report; re-test identity-P rowid/col.
 BLOCKER: Need explicit expected B-layout mapping to generate the permutation.
+
+=== TURN 2026-01-24T00:10:12+00:00 ===
+ACTION: Built MFMA K=64 mapping probe (`fwd_fp8_mfma_map_debug.s` + `test_mfma_map_debug.py`), fixed kernel IO, and ran exhaustive k-range search across lane groups.
+RESULT: Verified mapping with zero error: {0:(16,0), 1:(48,32), 2:(16,0), 3:(48,32)} where (low,high) are k bases for reg0–3 and reg4–7. Added as proven fact in `.domain`.
+INSIGHT: The earlier doc-based mapping is wrong for gfx950; we now have the correct k-range mapping for MFMA K=64 B operand.
+NEXT: Use verified k-range mapping to rebuild P→B packing (replace current Triton mix) and re-test identity-P rowid/col.
+BLOCKER: Need to derive a correct byte permutation from raw packed P to match the verified k-range mapping.
+
+=== TURN 2026-01-24T00:42:07+00:00 ===
+ACTION: Disabled the Triton mix in `fwd_fp8_p_pack_dump.s` to dump raw packed P, regenerated `p_pack_mapping.csv`, and analyzed raw→desired mapping using the verified MFMA K=64 layout.
+RESULT: Raw P-pack follows a simple formula: `src_reg=row>>3`, `src_byte=row&3`, `src_lane=k+32*((row>>2)&1)` for k=1..31, with a single outlier (row0,k0 -> lane63 reg7 byte3). Each desired B dword requires bytes from 4 distinct source lanes.
+INSIGHT: A pure lane permutation or per-dword byte shuffle cannot fix PV-B; the correct layout needs cross-lane byte gathers. This is likely too expensive to implement directly in the hot path.
+NEXT: Decide whether to (a) generate a debug-only bpermute-based pack to validate correctness, or (b) rework the LDS write layout so P is produced in MFMA-ready order.
+BLOCKER: Any direct fix requires cross-lane byte gathers or a new LDS write pattern.
+
+=== TURN 2026-01-24T01:12:43+00:00 ===
+ACTION: Added a debug-only PV-B rebuild path in `fwd_fp8_scaffold.s` using ds_bpermute and the raw pack formula (tile0), and introduced `NUMERICS_K_TILES` to force K tiles in `test_scaffold_numerics.py`. Ran identity-P numerics with K tiles=1.
+RESULT: Rowid still shows row>>1 duplication; col pattern alternates rows. The debug B pack did not fix the row-LSB loss.
+INSIGHT: The persistent row>>1 behavior with identity-P suggests the A operand (V) mapping is likely the current blocker, not B packing.
+NEXT: Audit V LDS layout/TR8 read pattern vs expected MFMA A layout and run an A-only mapping probe.
+BLOCKER: Need a reliable A-operand mapping test to confirm whether V reads are transposed or missing row LSB.
+
+=== TURN 2026-01-24T01:29:18+00:00 ===
+ACTION: Added a V LDS read probe (`fwd_fp8_v_read_dump.s` + `test_v_read_map.py`) to dump PV A-operand reads using the same swizzle/base logic as the scaffold. Ran the probe with per-row FP8 codes.
+RESULT: V read mapping shows row duplication by pairs (row>>1) for lanes 0..7; row LSB is dropped in the A operand.
+INSIGHT: The PV A-operand (V) LDS layout or read base swizzle is wrong; this is the source of the row LSB loss seen in identity-P tests.
+NEXT: Derive corrected V LDS layout or read base (bitop3/xor constants) to restore row LSB in A operand.
+BLOCKER: Need to determine which bit in the V read base swizzle drops row bit0.
+
+=== TURN 2026-01-24T02:18:41+00:00 ===
+ACTION: Replaced PV A reads with an explicit row-mapped base (row = lane%16 + 16*(lane>>5)) and zero offsets in `fwd_fp8_scaffold.s`, rebuilt, and ran identity-P rowid/col with K tiles=1.
+RESULT: Rowid now matches reference (rows 0..7 correct); col remains mismatched (expected given B layout and missing K offsets).
+INSIGHT: Row-LSB loss is caused by the TR8 base swizzle for V reads; a row-mapped base restores rowid.
+NEXT: Derive a corrected TR8 base mapping (or linear-read fallback with proper K offsets) that preserves row bit0, then re-test rowid/col.
+BLOCKER: Need to translate row-mapped base into a TR8-compatible base/offset scheme.
+
+=== TURN 2026-01-24T02:45:12+00:00 ===
+ACTION: Switched PV A reads to a row-mapped base (row = lane%16 + 16*(lane>>5)) with zero offsets in `fwd_fp8_scaffold.s` and rebuilt; ran identity-P rowid/col.
+RESULT: Rowid now matches reference (rows 0..7 correct). Col remains incorrect; this is expected because B layout and A K-offsets are not handled in this debug path.
+INSIGHT: TR8 base swizzle in PV A reads is the source of row-LSB loss. A row-mapped base fixes rowid, so the TR8 base/offset scheme must be rederived.
+NEXT: Derive the A-operand K-offset mapping (likely from MFMA map debug) and build a corrected PV A read path that preserves row bit0.
+BLOCKER: Need A-side K-range mapping for MFMA K=64 to compute offsets.
+
+=== TURN 2026-01-24T03:12:09+00:00 ===
+ACTION: Extended `fwd_fp8_v_read_dump.s` + `test_v_read_map.py` to dump four PV A read sets (matching scaffold bases/offsets) and emit `v_read_mapping.csv`.
+RESULT: TR8 read mapping (row perm + scaffold base/offsets) only covers k values with bit2=0: {0..3,8..11,16..19,24..27} for lane0; all four read sets return the same k subset.
+INSIGHT: The current TR8 base/offset scheme never toggles k bit2, so A reads cannot cover the full k=0..31 range.
+NEXT: Modify PV A base/offset scheme to explicitly toggle k bit2 (and possibly bit3) or rebuild A via explicit k-indexed reads for debug.
+BLOCKER: Need a practical mapping that covers all k (0..31) without per-byte gathers.
+
+=== TURN 2026-01-24T03:32:56+00:00 ===
+ACTION: Updated the V read probe to encode columns (V_READ_MAP=col) and swept TR8 offsets (256-step then 128-step) to see which column bits are reachable.
+RESULT: TR8 PV A reads only hit column codes 0 and 16; offsets do not expose other column bits. This indicates the current TR8 base/offset scheme collapses column bits and only toggles bit4.
+INSIGHT: The PV A TR8 path is fundamentally missing column address bits; fixing requires changing the V LDS write layout or TR8 base formula, not just offset tweaks.
+NEXT: Redesign V LDS layout to be TR8-friendly (or use a debug transpose) and re-derive a base/offset scheme that reaches all column bits.
+BLOCKER: Need a practical TR8-friendly V layout or a confirmed mapping from CK/Triton to replicate.
+
+=== TURN 2026-01-24T05:12:21+00:00 ===
+ACTION: Added TR8 A-pack dump with tile shifts (v_read_packed.csv), updated V read offsets to 0/256/512/768, restored LDS write swizzle in the probe, and derived group-specific A packing for tile0/1. Updated scaffold A packing per lane group (0/1 vs 2/3) and added NUMERICS_P_ONES + NUMERICS_V_RANGE for targeted tests.
+RESULT: V read dump now shows packed k order 0..31 for tile0 and 32..63 for tile1; lane groups 0/1 share mapping and 2/3 share mapping. Scaffold identity-P rowid still incorrect after A packing update (values like 16/18/20/52/56), and P-ones/V-range tests remain far from reference.
+INSIGHT: PV A operand packing is now correct at the LDS/TR8 level; remaining mismatch is in B (P) mapping/order or MFMA k ordering within each range.
+NEXT: Verify B operand packing/order with identity-P and column/row range masks, then fix PV B mapping to match MFMA k ordering.
+BLOCKER: Need a direct B-side mapping probe (post-mix pack) to align B regs with MFMA k order.

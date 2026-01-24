@@ -61,9 +61,13 @@ def main():
     num_q_blocks = (S + 127) // 128
     if num_q_blocks % 2 != 0:
         num_q_blocks += 1
-    num_k_tiles = (S + 31) // 32
-    if num_k_tiles % 2 != 0:
-        num_k_tiles += 1
+    env_k_tiles = os.environ.get("NUMERICS_K_TILES")
+    if env_k_tiles is not None:
+        num_k_tiles = int(env_k_tiles)
+    else:
+        num_k_tiles = (S + 31) // 32
+        if num_k_tiles % 2 != 0:
+            num_k_tiles += 1
     s_q = num_q_blocks * 128
     s_k = num_k_tiles * 32
 
@@ -98,6 +102,16 @@ def main():
         elif v_pattern == "rowid":
             for r in range(s_k):
                 Vf32[0, 0, r, :] = float(r)
+        elif v_pattern == "rowbits":
+            for r in range(s_k):
+                Vf32[0, 0, r, :] = float(r & 0xF)
+        elif v_pattern.startswith("rowbit"):
+            try:
+                bit = int(v_pattern.replace("rowbit", ""))
+            except ValueError as exc:
+                raise RuntimeError(f"Invalid rowbit pattern: {v_pattern}") from exc
+            for r in range(s_k):
+                Vf32[0, 0, r, :] = float((r >> bit) & 1)
         elif v_pattern == "rowcol":
             cols = (torch.arange(D, device="cuda", dtype=torch.float32) / 128.0)
             for r in range(s_k):
@@ -107,6 +121,13 @@ def main():
                 Vf32[0, 0, r, :] = r / 64.0
         Q = Qf32.to(fp8_dtype)
         K = Kf32.to(fp8_dtype)
+        v_range = os.environ.get("NUMERICS_V_RANGE")
+        if v_range:
+            start_s, end_s = v_range.split(":")
+            start_k = int(start_s)
+            end_k = int(end_s)
+            Vf32[:, :, :start_k, :] = 0
+            Vf32[:, :, end_k:, :] = 0
         V = Vf32.to(fp8_dtype)
     elif os.environ.get("NUMERICS_ONES", "0") == "1":
         Q = torch.ones(B, H, s_q, D, device="cuda", dtype=torch.float32).to(fp8_dtype)
@@ -175,7 +196,10 @@ def main():
     if os.environ.get("NUMERICS_ZERO_ODD_V", "0") == "1":
         Vf_ref = Vf.clone()
         Vf_ref[:, :, 1::2, :] = 0
-    P = torch.matmul(Qf, Kf.transpose(-1, -2))
+    if os.environ.get("NUMERICS_P_ONES", "0") == "1":
+        P = torch.ones((B, H, s_q, s_k), device="cuda", dtype=torch.float32)
+    else:
+        P = torch.matmul(Qf, Kf.transpose(-1, -2))
     P_fp8 = P.to(torch.float8_e4m3fn)
     O_ref = torch.matmul(P_fp8.float(), Vf_ref)
 

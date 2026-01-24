@@ -1,9 +1,7 @@
-STATUS: exploring
-APPROACH: Derive PV B-operand mapping after Triton lane-mix (no extra post-mix), then apply a precise lane/byte permutation to restore identity-P (row/col).
-KEY_PARAMS: P packed via `v_cvt_scalef32_pk_fp8_f32` into v48-v55; B operand mix uses Triton lane-mix (v237 = (lane<<2)^0x80, vcc = lane<32); V uses `ds_read_b64` (no TR8) as A operand; MFMA uses v[0:7] (V) x v[48:55] (P).
+STATUS: testing
+APPROACH: Use TR8 A reads (0/256/512/768 + 1k/2k/3k offsets) and group-specific A packing derived from v_read_mapping.csv for tile0/1.
+KEY_PARAMS: TR8 set offsets = {0,256,512,768} + {1024,1152,1280,1408} + {2048,2176,2304,2432} + {3072,3200,3328,3456}; lane groups 0/1 share mapping, 2/3 share mapping; k ordering per group follows gfx950 K=64 ranges.
 TEST_RESULT:
-  - Build: PASS
-  - Scaffold numerics (test_scaffold_numerics.py):
-    * NUMERICS_IDENTITY_P=1 NUMERICS_V_PATTERN=col: FAIL (columns repeat in 8-wide groups)
-    * NUMERICS_IDENTITY_P=1 NUMERICS_V_PATTERN=rowid: FAIL (row>>1; rows duplicated)
-NEXT_STEP: Analyze `p_pack_mapping.csv` + layout probes to derive exact B-operand permutation (lane/byte) that restores identity-P.
+  - V read dump: v_read_packed.csv shows k order 0..31 (tile0) and 32..63 (tile1)
+  - Scaffold: identity-P rowid still incorrect (B mapping likely still wrong)
+NEXT_STEP: Validate B operand mapping/order vs MFMA k layout with identity-P + V range masks, then adjust B packing.
