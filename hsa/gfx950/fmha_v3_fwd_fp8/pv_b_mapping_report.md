@@ -1,6 +1,6 @@
 # PV B-Operand Mapping Report
 
-- Generated: `2026-01-23T05:04:41Z`
+- Generated: `2026-01-23T18:05:45Z`
 - Source CSV: `/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8/p_pack_mapping.csv`
 
 ## Coverage
@@ -93,3 +93,15 @@ Format: `row -> (lane, byte_pos)` where byte_pos = src_reg*4 + src_byte.
 ## Notes
 - Row LSB parity is preserved in byte parity, but identity-P rowid still collapses, implying MFMA B expects a different byte placement.
 - Diagonal entries show lane remapping for row 0 and rows 16..31; this likely indicates missing lane/byte permute after mix.
+
+## Row Mapping (identity-P, rowbit probe)
+Output row -> observed row (0..63):
+- 00-07: [0, 0, 1, 1, 2, 2, 3, 3]
+- 08-15: [4, 4, 5, 5, 6, 6, 7, 7]
+- 16-23: [0, 0, 1, 1, 2, 2, 3, 3]
+- 24-31: [4, 4, 5, 5, 6, 6, 7, 7]
+- 32-39: [32, 32, 33, 33, 34, 34, 35, 35]
+- 40-47: [36, 36, 37, 37, 38, 38, 39, 39]
+- 48-55: [32, 32, 33, 33, 34, 34, 35, 35]
+- 56-63: [36, 36, 37, 37, 38, 38, 39, 39]
+- This mapping shows row bit0 and bit4 are dropped (rows fold by r>>1 within 0..15 and 16..31).

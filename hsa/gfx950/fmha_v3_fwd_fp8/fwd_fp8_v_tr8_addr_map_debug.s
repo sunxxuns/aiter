@@ -1,20 +1,18 @@
-// Debug kernel: load V into LDS (swizzled) and read via ds_read_b64_tr_b8
-// Outputs 64 bytes per thread (8x ds_read_b64_tr_b8).
+// Debug kernel: fill LDS with known pattern, then TR8 read map.
 .text
 .p2align 8
-.globl _fwd_fp8_v_tr8_debug
-.type _fwd_fp8_v_tr8_debug, @function
+.globl _fwd_fp8_v_tr8_addr_map_debug
+.type _fwd_fp8_v_tr8_addr_map_debug, @function
 
-.set V_LDS0, 0
 .set LDS_SIZE, 8192
 
-_fwd_fp8_v_tr8_debug:
+_fwd_fp8_v_tr8_addr_map_debug:
     s_mov_b64 exec, -1
     // Load kernel args (scaffold-compatible)
     s_load_dwordx2 s[4:5], s[0:1], 0      // O_ptr
     s_load_dwordx2 s[8:9], s[0:1], 8      // Q_ptr (unused)
     s_load_dwordx2 s[12:13], s[0:1], 16   // K_ptr (unused)
-    s_load_dwordx2 s[16:17], s[0:1], 24   // V_ptr
+    s_load_dwordx2 s[16:17], s[0:1], 24   // V_ptr (pattern)
     s_load_dword s20, s[0:1], 32          // num_k_tiles (unused)
     s_load_dword s21, s[0:1], 36          // stride_qh (unused)
     s_load_dword s22, s[0:1], 40          // stride_kh (unused)
@@ -34,81 +32,59 @@ _fwd_fp8_v_tr8_debug:
 
     v_mov_b32_e32 v60, v0                 // tid
 
-    // Load V (tid < 256): 16B for row r and row r+32
-    v_mov_b32_e32 v2, 256
-    v_cmp_lt_u32_e32 vcc, v60, v2
-    s_and_saveexec_b64 s[8:9], vcc
-    v_lshrrev_b32_e32 v4, 3, v60          // row = tid >> 3 (0..31)
-    v_and_b32_e32 v5, 7, v60              // col_block = tid & 7 (0..7)
-    v_lshlrev_b32_e32 v4, 7, v4           // row * 128
-    v_lshlrev_b32_e32 v5, 4, v5           // col_block * 16
-    v_add_u32_e32 v2, v4, v5              // byte offset within V
+    // Load 16B pattern for [0..4095] and [4096..8191]
+    v_lshlrev_b32_e32 v2, 4, v60          // tid * 16 bytes
     buffer_load_dwordx4 v[40:43], v2, s[16:19], 0 offen
-    v_add_u32_e32 v3, 4096, v2            // row + 32
+    v_add_u32_e32 v3, 4096, v2
     buffer_load_dwordx4 v[44:47], v3, s[16:19], 0 offen
     s_waitcnt vmcnt(0)
 
-    // Triton-style LDS write swizzle (bitop3:0x78)
-    s_movk_i32 s26, 0x70
-    v_lshlrev_b32_e32 v4, 4, v60          // tid * 16 bytes
-    v_bitop3_b32 v4, v4, v60, s26 bitop3:0x78
-    ds_write_b128 v4, v[40:43]
-    ds_write_b128 v4, v[44:47] offset:4096
-    s_mov_b64 exec, s[8:9]
+    // Write pattern into LDS (no swizzle)
+    ds_write_b128 v2, v[40:43]
+    ds_write_b128 v2, v[44:47] offset:4096
     s_waitcnt lgkmcnt(0)
     s_barrier
 
     // TR8 base (same as scaffold)
     s_movk_i32 s25, 0xb80
-    v_lshlrev_b32_e32 v2, 6, v60
-    v_lshlrev_b32_e32 v3, 2, v60
-    v_and_b32_e32 v4, 48, v3
-    v_and_or_b32 v2, v2, s25, v4
-    v_and_b32_e32 v5, 16, v60
-    v_lshlrev_b32_e32 v6, 3, v60
-    v_and_b32_e32 v6, 8, v6
-    v_bitop3_b32 v2, v2, v5, v6 bitop3:0x36
+    v_lshlrev_b32_e32 v20, 6, v60
+    v_lshlrev_b32_e32 v21, 2, v60
+    v_and_b32_e32 v22, 48, v21
+    v_and_or_b32 v20, v20, s25, v22
+    v_and_b32_e32 v23, 16, v60
+    v_lshlrev_b32_e32 v24, 3, v60
+    v_and_b32_e32 v24, 8, v24
+    v_bitop3_b32 v20, v20, v23, v24 bitop3:0x36
 
-    v_xor_b32_e32 v3, 0x20, v2
-    v_xor_b32_e32 v4, 0x460, v2
-    v_xor_b32_e32 v5, 0x1020, v2
-    v_xor_b32_e32 v6, 0x1460, v2
-    v_xor_b32_e32 v7, 0x60, v2
-    v_xor_b32_e32 v8, 0x420, v2
-    v_xor_b32_e32 v9, 0x1060, v2
-    v_xor_b32_e32 v10, 0x1420, v2
-    // Preserve TR8 base addresses (avoid clobber by reads)
-    v_mov_b32_e32 v48, v2
-    v_mov_b32_e32 v49, v3
-    v_mov_b32_e32 v50, v4
-    v_mov_b32_e32 v51, v5
-    v_mov_b32_e32 v52, v6
-    v_mov_b32_e32 v53, v7
-    v_mov_b32_e32 v54, v8
-    v_mov_b32_e32 v55, v9
-    v_mov_b32_e32 v56, v10
+    v_xor_b32_e32 v21, 0x20, v20
+    v_xor_b32_e32 v22, 0x460, v20
+    v_xor_b32_e32 v23, 0x1020, v20
+    v_xor_b32_e32 v24, 0x1460, v20
+    v_xor_b32_e32 v25, 0x60, v20
+    v_xor_b32_e32 v26, 0x420, v20
+    v_xor_b32_e32 v27, 0x1060, v20
+    v_xor_b32_e32 v28, 0x1420, v20
 
-    // Read 16x b64 (4 from base v2 with offsets, 4 from v3..v6,
-    // then 4 from base v2 offset by 64, and 4 from v7..v10)
-    ds_read_b64_tr_b8 v[0:1], v48 offset:0
-    ds_read_b64_tr_b8 v[2:3], v48 offset:1088
-    ds_read_b64_tr_b8 v[4:5], v48 offset:4096
-    ds_read_b64_tr_b8 v[6:7], v48 offset:5184
+    // Read 16x b64 (same order as scaffold)
+    ds_read_b64_tr_b8 v[0:1], v20 offset:0
+    ds_read_b64_tr_b8 v[2:3], v20 offset:1088
+    ds_read_b64_tr_b8 v[4:5], v20 offset:4096
+    ds_read_b64_tr_b8 v[6:7], v20 offset:5184
 
-    ds_read_b64_tr_b8 v[8:9], v49
-    ds_read_b64_tr_b8 v[10:11], v50
-    ds_read_b64_tr_b8 v[12:13], v51
-    ds_read_b64_tr_b8 v[14:15], v52
+    ds_read_b64_tr_b8 v[8:9], v21
+    ds_read_b64_tr_b8 v[10:11], v22
+    ds_read_b64_tr_b8 v[12:13], v23
+    ds_read_b64_tr_b8 v[14:15], v24
 
-    ds_read_b64_tr_b8 v[16:17], v48 offset:64
-    ds_read_b64_tr_b8 v[18:19], v48 offset:1024
-    ds_read_b64_tr_b8 v[20:21], v48 offset:4160
-    ds_read_b64_tr_b8 v[22:23], v48 offset:5120
+    ds_read_b64_tr_b8 v[16:17], v20 offset:64
+    ds_read_b64_tr_b8 v[18:19], v20 offset:1024
+    ds_read_b64_tr_b8 v[20:21], v20 offset:4160
+    ds_read_b64_tr_b8 v[22:23], v20 offset:5120
 
-    ds_read_b64_tr_b8 v[24:25], v53
-    ds_read_b64_tr_b8 v[26:27], v54
-    ds_read_b64_tr_b8 v[28:29], v55
-    ds_read_b64_tr_b8 v[30:31], v56
+    ds_read_b64_tr_b8 v[24:25], v25
+    ds_read_b64_tr_b8 v[26:27], v26
+    ds_read_b64_tr_b8 v[28:29], v27
+    ds_read_b64_tr_b8 v[30:31], v28
     s_waitcnt lgkmcnt(0)
 
     // Store 128 bytes per thread
@@ -134,7 +110,7 @@ _fwd_fp8_v_tr8_debug:
 
 .rodata
 .p2align 6
-.amdhsa_kernel _fwd_fp8_v_tr8_debug
+.amdhsa_kernel _fwd_fp8_v_tr8_addr_map_debug
 .amdhsa_group_segment_fixed_size 8192
     .amdhsa_private_segment_fixed_size 0
     .amdhsa_kernarg_size 52
@@ -152,8 +128,8 @@ _fwd_fp8_v_tr8_debug:
 ---
 amdhsa.version: [1, 2]
 amdhsa.kernels:
-  - .name: _fwd_fp8_v_tr8_debug
-    .symbol: _fwd_fp8_v_tr8_debug.kd
+  - .name: _fwd_fp8_v_tr8_addr_map_debug
+    .symbol: _fwd_fp8_v_tr8_addr_map_debug.kd
     .kernarg_segment_size: 52
     .group_segment_fixed_size: 8192
     .private_segment_fixed_size: 0

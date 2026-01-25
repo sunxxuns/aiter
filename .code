@@ -874,3 +874,27 @@ RESULT: V read dump now shows packed k order 0..31 for tile0 and 32..63 for tile
 INSIGHT: PV A operand packing is now correct at the LDS/TR8 level; remaining mismatch is in B (P) mapping/order or MFMA k ordering within each range.
 NEXT: Verify B operand packing/order with identity-P and column/row range masks, then fix PV B mapping to match MFMA k ordering.
 BLOCKER: Need a direct B-side mapping probe (post-mix pack) to align B regs with MFMA k order.
+
+=== TURN 2026-01-24T07:02:11+00:00 ===
+ACTION: Re-enabled mixed P pack in fwd_fp8_p_pack_dump.s, added tile-select for bpermute sources, and built multiple mapping probes (bit/digit/product/random) to decode mixed P layout. Attempted a debug B rebuild in scaffold using raw-pack formula and MFMA k-order parity, plus a counter-based k loop to avoid v_add immediate errors.
+RESULT: Mixed pack probes still produced ambiguous/partial mappings (k coverage stuck around 0..31 or inconsistent), and the debug B rebuild (k_base parity + row_reg-selected src reg) still fails identity-P rowid with large errors (max_err ~19k).
+INSIGHT: Current P mix path is not directly decodable with simple codebook or bit/digit probes; the raw-pack-based B rebuild is still missing a mapping detail (likely lane base or k order per byte/row).
+NEXT: Derive B mapping directly from raw pack formula with a verified lane base and per-byte k ordering (consider per-row k offset or lane-group-specific base), then update scaffold B packing accordingly and re-test identity-P.
+
+=== TURN 2026-01-24T08:12:03+00:00 ===
+ACTION: Swapped PV MFMA operands (use P as A, V as B), enabled P_A_TRANSPOSE path, restored row_reg = row>>2, and reordered k groups to [16..31,0..15] for tile0. Ran identity-P rowid with NUMERICS_K_TILES=1 and added a lane-group mask (groups 1/3) to isolate tile0.
+RESULT: After swap, rows 1-4 match reference for tile0; rows 5-7 still map to k=10/12/14 (k LSB loss), and row0 remains incorrect. Lane-group masking reduces noise but does not fix row5-7 or row0.
+INSIGHT: Operand swap aligns row dimension; remaining failure is in P_A_TRANSPOSE k/byte mapping for odd rows and row0 special cases in mixed pack. k order is closer but still wrong for rows with bit0=1.
+NEXT: Use p_pack_mapping_tile0.csv to derive per-row k correction (row0, row5/6 anomalies) and adjust P_A_TRANSPOSE byte selection to restore k LSB for odd rows; then re-enable tile1 and derive its mapping.
+
+=== TURN 2026-01-24T10:07:39+00:00 ===
+ACTION: Tried row0/row5/row6 fixes in P_A_TRANSPOSE using mixed-pack mapping and targeted byte overrides; reverted to baseline (tile select bit5, row_reg row>>2, k order 16..31/0..15). Added targeted row5/6 fix block based on per-k mismatches.
+RESULT: Identity-P rowid with NUMERICS_K_TILES=1 still yields rows 5-7 as 10/12/14 (rowbit0 dropped) and row0 remains incorrect; row5/6 overrides did not change output.
+INSIGHT: P_A_TRANSPOSE row handling is not respecting per-row overrides as expected; likely need a direct dump of post-transpose A regs to verify mapping rather than relying on mixed-pack CSV.
+NEXT: Add a debug dump of A regs after P_A_TRANSPOSE (post overrides) to map actual (row,k) layout, then rederive row-specific byte corrections from that dump.
+
+=== TURN 2026-01-23T09:45:00+00:00 ===
+ACTION: Added A/B register dump with raw FP8 bytes, updated MFMA replay to consume bytes, and probed row mapping with identity-P + rowid V. Tested lane>=32 B selection, lane mirror, and reverted row mapping to `row = lane & 31`.
+RESULT: A regs show rows 1–3 mapped (pos17–19) but lane0 row0 is zero; B lane>=32 mapping yields k16..31 offset (lane32 pos16..19 = 4..7). MFMA replay confirms output col0 uses B lane0, so lane>=32 mapping is wrong and corrupts rows 4+.
+INSIGHT: Remaining failure is a bad B mapping for lanes 32–63 plus missing row0 A mapping; row mapping should be `lane & 31`, and B selection by lane>=32 must be rebuilt, not mirrored.
+NEXT: Recompute row0 A mapping from raw P-pack bytes; rebuild lane>=32 B mapping with verified k-range bases; re-test identity-P rowid.

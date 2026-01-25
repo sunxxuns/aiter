@@ -2,7 +2,8 @@
 
 .set Q_LDS, 0                 // 128x128 (pitch-132)
 .set K_LDS, 16896             // 32x128 (row-major)
-.set LDS_SIZE, 24576          // Q + K (>= 20992)
+.set K_LDS1, 20992            // ping-pong (K_LDS + 4096)
+.set LDS_SIZE, 24576          // Q + K0 + K1 (>= 20992)
 
 .text
 .globl _fwd_fp8_p_pack_dump
@@ -71,13 +72,17 @@ _fwd_fp8_p_pack_dump:
     ds_write_b128 v20, v[52:55]
 
     // ------------------------------------------------------------------------
-    // Load K tile to LDS (row-major, 256 threads)
+    // Load K tiles to LDS (row-major, 256 threads)
     // ------------------------------------------------------------------------
     v_lshlrev_b32_e32 v13, 4, v60        // tid * 16 bytes
     buffer_load_dwordx4 v[20:23], v13, s[12:15], 0 offen
+    v_add_u32_e32 v37, 4096, v13
+    buffer_load_dwordx4 v[24:27], v37, s[12:15], 0 offen
     s_waitcnt vmcnt(0)
     v_add_u32_e32 v38, K_LDS, v13
     ds_write_b128 v38, v[20:23]
+    v_add_u32_e32 v39, K_LDS1, v13
+    ds_write_b128 v39, v[24:27]
 
     s_waitcnt lgkmcnt(0)
     s_barrier
@@ -110,7 +115,7 @@ _fwd_fp8_p_pack_dump:
     v_add_u32_e32 v24, v58, v11          // Q addr1
     v_add_u32_e32 v25, v58, v12          // Q addr2
 
-    v_add_u32_e32 v26, K_LDS, v18        // K base + row
+    v_add_u32_e32 v26, K_LDS, v18        // K base + row (tile0)
     v_add_u32_e32 v27, v26, v11          // K addr1
     v_add_u32_e32 v28, v26, v12          // K addr2
 
@@ -136,7 +141,7 @@ _fwd_fp8_p_pack_dump:
     v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
 
     // ------------------------------------------------------------------------
-    // Pack P0 (tile 0) to FP8 (v48-v51); tile1 zeroed (v52-v55)
+    // Pack P0 (tile 0) to FP8 (v48-v51)
     // ------------------------------------------------------------------------
     s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
     v_cvt_scalef32_pk_fp8_f32 v48, v32, v33, 1.0
@@ -150,6 +155,45 @@ _fwd_fp8_p_pack_dump:
     s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
     v_cvt_scalef32_pk_fp8_f32 v51, v44, v45, 1.0
     v_cvt_scalef32_pk_fp8_f32 v51, v46, v47, 1.0 op_sel:[0,0,0,1]
+
+    // Compute Q/K addresses for tile 1
+    v_add_u32_e32 v26, K_LDS1, v18       // K base + row (tile1)
+    v_add_u32_e32 v27, v26, v11          // K addr1
+    v_add_u32_e32 v28, v26, v12          // K addr2
+
+    // QK MFMA (K=64 x 2) for tile 1
+    .irp i, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47
+        v_mov_b32_e32 v\i, 0
+    .endr
+    ds_read_b128 v[0:3], v24
+    ds_read_b128 v[4:7], v25
+    ds_read_b128 v[16:19], v27
+    ds_read_b128 v[20:23], v28
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
+
+    ds_read_b128 v[0:3], v24 offset:64
+    ds_read_b128 v[4:7], v25 offset:64
+    ds_read_b128 v[16:19], v27 offset:64
+    ds_read_b128 v[20:23], v28 offset:64
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
+
+    // Pack P1 (tile 1) to FP8 (v52-v55)
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+    v_cvt_scalef32_pk_fp8_f32 v52, v32, v33, 1.0
+    v_cvt_scalef32_pk_fp8_f32 v52, v34, v35, 1.0 op_sel:[0,0,0,1]
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+    v_cvt_scalef32_pk_fp8_f32 v53, v36, v37, 1.0
+    v_cvt_scalef32_pk_fp8_f32 v53, v38, v39, 1.0 op_sel:[0,0,0,1]
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+    v_cvt_scalef32_pk_fp8_f32 v54, v40, v41, 1.0
+    v_cvt_scalef32_pk_fp8_f32 v54, v42, v43, 1.0 op_sel:[0,0,0,1]
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+    v_cvt_scalef32_pk_fp8_f32 v55, v44, v45, 1.0
+    v_cvt_scalef32_pk_fp8_f32 v55, v46, v47, 1.0 op_sel:[0,0,0,1]
+
+    // Mixed pack dump: fall through to lane mix before store.
 
     // Triton-style lane mix for P -> B operand layout (for mapping)
     v_lshlrev_b32_e32 v237, 2, v10
@@ -194,7 +238,7 @@ _fwd_fp8_p_pack_dump:
     v_mov_b32_e32 v54, v233
     v_mov_b32_e32 v55, v234
 
-    s_branch STORE_PACKED
+    // Fall through to build A operand from packed P.
 
     // Preserve packed P sources for bpermute
     v_mov_b32_e32 v120, v48
@@ -221,8 +265,9 @@ _fwd_fp8_p_pack_dump:
     v_and_b32_e32 v59, 3, v57
     v_lshlrev_b32_e32 v63, 3, v59
 
-    // lane_offset = lane (no swap) for mapping
-    v_mov_b32_e32 v56, v10
+    // lane_offset = 32 * ((row >> 2) & 1)
+    v_and_b32_e32 v56, 4, v57
+    v_lshlrev_b32_e32 v56, 3, v56
 
     // Select source reg for tile0 (v48..v51) by row_reg
     v_mov_b32_e32 v32, v48
@@ -246,6 +291,12 @@ _fwd_fp8_p_pack_dump:
     v_and_b32_e32 v140, 32, v10
     v_cmp_eq_u32_e32 vcc, 0, v140
     v_cndmask_b32_e32 v32, v33, v32, vcc
+
+    // Select tile sources for bpermute (tile0 vs tile1)
+    v_cndmask_b32_e32 v120, v52, v120, vcc
+    v_cndmask_b32_e32 v121, v53, v121, vcc
+    v_cndmask_b32_e32 v122, v54, v122, vcc
+    v_cndmask_b32_e32 v123, v55, v123, vcc
 
 
     // Group 0 -> v48 (cols 0..3) using per-row source selection

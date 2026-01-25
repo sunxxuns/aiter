@@ -36,6 +36,22 @@ Thread   M/N dimension    k dimension    k dimension
 
 ---
 
+## PROVEN FACT: K=64 MFMA k-range mapping (verified on gfx950)
+
+**CLAIM**: The actual k-range mapping for FP8 MFMA K=64 on gfx950 differs from the doc hypothesis. The observed mapping for lane groups is:
+- Group 0 (lanes 0–15): low regs (v0–v3) → k16–31, high regs (v4–v7) → k0–15
+- Group 1 (lanes 16–31): low regs → k48–63, high regs → k32–47
+- Group 2 (lanes 32–47): low regs → k16–31, high regs → k0–15
+- Group 3 (lanes 48–63): low regs → k48–63, high regs → k32–47
+
+**EVIDENCE**: `hsa/gfx950/fmha_v3_fwd_fp8/test_mfma_map_debug.py` (search over k-range mappings) reports:
+```
+best mean_err: 0.0 ... mapping: {0: (16, 0), 1: (48, 32), 2: (16, 0), 3: (48, 32)}
+```
+where mapping value `(low_base, high_base)` corresponds to k ranges for reg0–3 and reg4–7.
+
+---
+
 ## PROVEN FACT: Triton XOR Swizzle Pattern for LDS Addressing
 
 **CLAIM**: Triton achieves 1294 TF/s using XOR-based swizzle for bank-conflict-free LDS access with K=64 MFMA.

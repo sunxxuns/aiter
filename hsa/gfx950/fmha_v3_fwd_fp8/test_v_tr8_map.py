@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
-"""Debug TR8 V LDS mapping.
-
-Builds fwd_fp8_v_tr8_debug.s, loads a byte-coded V tensor, and prints
-the TR8-read bytes for a few threads.
-"""
+"""Reconstruct TR8 read address mapping via addr_low/high patterns."""
 import ctypes
-import os
 import subprocess
 import torch
 
@@ -37,10 +32,9 @@ def load_kernel(co_path, kernel_name):
     return hip, module, func
 
 
-def main():
+def run_pattern(pattern):
     torch.manual_seed(0)
     torch.cuda.init()
-    co = build_kernel()
 
     # Shapes match scaffold numerics
     s = 64
@@ -54,32 +48,23 @@ def main():
     s_k = num_k_tiles * 32
     d = 128
 
-    # V: 64 rows, 128 cols, byte-coded patterns in FP8 storage
     v = torch.empty((1, 1, s_k, d), device="cuda", dtype=torch.float8_e4m3fn)
     v_bytes = v.view(torch.uint8)
-    pattern = os.environ.get("TR8_V_PATTERN", "col")
-    if pattern == "row":
-        for r in range(s_k):
-            v_bytes[0, 0, r, :] = r & 0xFF
-    elif pattern == "tile":
-        for r in range(s_k):
-            for c in range(d):
-                v_bytes[0, 0, r, c] = ((r & 7) << 3) | (c & 7)
-    elif pattern == "rowcol":
-        for r in range(s_k):
-            for c in range(d):
-                v_bytes[0, 0, r, c] = ((r & 0xF) << 4) | (c & 0xF)
-    else:
+    for r in range(s_k):
         for c in range(d):
-            v_bytes[0, 0, :, c] = c & 0xFF
+            addr = r * 128 + c
+            if pattern == "addr_low":
+                v_bytes[0, 0, r, c] = addr & 0xFF
+            else:
+                v_bytes[0, 0, r, c] = ((addr >> 8) & 0xFF) + 1
 
-    # Dummy Q/K (unused)
     q = torch.zeros((1, 1, s_q, d), device="cuda", dtype=torch.float8_e4m3fn)
     k = torch.zeros((1, 1, s_k, d), device="cuda", dtype=torch.float8_e4m3fn)
 
     # Output: 128 bytes per thread (32 dwords)
     out = torch.zeros(256 * 32, device="cuda", dtype=torch.uint32)
 
+    co = build_kernel()
     hip, module, func = load_kernel(co, "_fwd_fp8_v_tr8_debug")
     args = [
         ctypes.c_void_p(out.data_ptr()),
@@ -107,21 +92,35 @@ def main():
     hip.hipDeviceSynchronize()
 
     out_cpu = out.detach().cpu().numpy().astype("uint32")
-    tids = [0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 32, 33, 34, 35]
-    for tid in tids:
-        words = out_cpu[tid * 32:(tid + 1) * 32]
-        bytes_list = []
-        for w in words:
-            bytes_list.extend(list(int(w).to_bytes(4, "little")))
-        # Group into 8-byte chunks (each ds_read_b64_tr_b8)
-        chunks = [bytes_list[i:i+8] for i in range(0, len(bytes_list), 8)]
-        print(f"tid {tid} chunks:", chunks)
-        print(f"tid {tid} bytes[0:64]:", bytes_list[:64])
-        if pattern == "tile":
-            col_ids = [c[0] & 7 for c in chunks]
-            print(f"tid {tid} col-idx:", col_ids)
-
     hip.hipModuleUnload(module)
+    return out_cpu
+
+
+def main():
+    low = run_pattern("addr_low")
+    high = run_pattern("addr_high")
+    tids = [0, 1, 2, 3, 64, 65, 66, 67, 128, 129, 130, 131]
+    for tid in tids:
+        low_words = low[tid * 32:(tid + 1) * 32]
+        high_words = high[tid * 32:(tid + 1) * 32]
+        low_bytes = []
+        high_bytes = []
+        for w in low_words:
+            low_bytes.extend(list(int(w).to_bytes(4, "little")))
+        for w in high_words:
+            high_bytes.extend(list(int(w).to_bytes(4, "little")))
+
+        addrs = []
+        for lo, hi in zip(low_bytes, high_bytes):
+            addr = lo | ((hi - 1) << 8)
+            addrs.append(addr)
+
+        chunks = [addrs[i:i + 8] for i in range(0, len(addrs), 8)]
+        print(f"\n=== tid {tid} ===")
+        for i, chunk in enumerate(chunks):
+            rows = [(a // 128, a % 128) for a in chunk]
+            print(f"read {i:02d} addrs:", chunk)
+            print(f"read {i:02d} row,col:", rows)
 
 
 if __name__ == "__main__":

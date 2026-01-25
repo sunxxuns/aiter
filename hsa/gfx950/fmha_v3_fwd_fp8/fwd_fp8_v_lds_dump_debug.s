@@ -1,14 +1,12 @@
-// Debug kernel: load V into LDS (swizzled) and read via ds_read_b64_tr_b8
-// Outputs 64 bytes per thread (8x ds_read_b64_tr_b8).
+// Debug kernel: dump LDS bytes for selected addresses.
 .text
 .p2align 8
-.globl _fwd_fp8_v_tr8_debug
-.type _fwd_fp8_v_tr8_debug, @function
+.globl _fwd_fp8_v_lds_dump_debug
+.type _fwd_fp8_v_lds_dump_debug, @function
 
-.set V_LDS0, 0
 .set LDS_SIZE, 8192
 
-_fwd_fp8_v_tr8_debug:
+_fwd_fp8_v_lds_dump_debug:
     s_mov_b64 exec, -1
     // Load kernel args (scaffold-compatible)
     s_load_dwordx2 s[4:5], s[0:1], 0      // O_ptr
@@ -58,83 +56,44 @@ _fwd_fp8_v_tr8_debug:
     s_waitcnt lgkmcnt(0)
     s_barrier
 
-    // TR8 base (same as scaffold)
-    s_movk_i32 s25, 0xb80
-    v_lshlrev_b32_e32 v2, 6, v60
-    v_lshlrev_b32_e32 v3, 2, v60
-    v_and_b32_e32 v4, 48, v3
-    v_and_or_b32 v2, v2, s25, v4
-    v_and_b32_e32 v5, 16, v60
-    v_lshlrev_b32_e32 v6, 3, v60
-    v_and_b32_e32 v6, 8, v6
-    v_bitop3_b32 v2, v2, v5, v6 bitop3:0x36
+    // Only tid 0 dumps LDS
+    v_mov_b32_e32 v30, 0
+    v_cmp_eq_u32_e32 vcc, v60, v30
+    s_and_saveexec_b64 s[8:9], vcc
 
-    v_xor_b32_e32 v3, 0x20, v2
-    v_xor_b32_e32 v4, 0x460, v2
-    v_xor_b32_e32 v5, 0x1020, v2
-    v_xor_b32_e32 v6, 0x1460, v2
-    v_xor_b32_e32 v7, 0x60, v2
-    v_xor_b32_e32 v8, 0x420, v2
-    v_xor_b32_e32 v9, 0x1060, v2
-    v_xor_b32_e32 v10, 0x1420, v2
-    // Preserve TR8 base addresses (avoid clobber by reads)
-    v_mov_b32_e32 v48, v2
-    v_mov_b32_e32 v49, v3
-    v_mov_b32_e32 v50, v4
-    v_mov_b32_e32 v51, v5
-    v_mov_b32_e32 v52, v6
-    v_mov_b32_e32 v53, v7
-    v_mov_b32_e32 v54, v8
-    v_mov_b32_e32 v55, v9
-    v_mov_b32_e32 v56, v10
+    // Read dwords at TR8 read08 addresses (64, 192, 336, 464, 608, 736, 880, 1008)
+    v_mov_b32_e32 v31, 64
+    ds_read_b32 v40, v31
+    v_mov_b32_e32 v31, 192
+    ds_read_b32 v41, v31
+    v_mov_b32_e32 v31, 336
+    ds_read_b32 v42, v31
+    v_mov_b32_e32 v31, 464
+    ds_read_b32 v43, v31
+    v_mov_b32_e32 v31, 608
+    ds_read_b32 v44, v31
+    v_mov_b32_e32 v31, 736
+    ds_read_b32 v45, v31
+    v_mov_b32_e32 v31, 880
+    ds_read_b32 v46, v31
+    v_mov_b32_e32 v31, 1008
+    ds_read_b32 v47, v31
 
-    // Read 16x b64 (4 from base v2 with offsets, 4 from v3..v6,
-    // then 4 from base v2 offset by 64, and 4 from v7..v10)
-    ds_read_b64_tr_b8 v[0:1], v48 offset:0
-    ds_read_b64_tr_b8 v[2:3], v48 offset:1088
-    ds_read_b64_tr_b8 v[4:5], v48 offset:4096
-    ds_read_b64_tr_b8 v[6:7], v48 offset:5184
-
-    ds_read_b64_tr_b8 v[8:9], v49
-    ds_read_b64_tr_b8 v[10:11], v50
-    ds_read_b64_tr_b8 v[12:13], v51
-    ds_read_b64_tr_b8 v[14:15], v52
-
-    ds_read_b64_tr_b8 v[16:17], v48 offset:64
-    ds_read_b64_tr_b8 v[18:19], v48 offset:1024
-    ds_read_b64_tr_b8 v[20:21], v48 offset:4160
-    ds_read_b64_tr_b8 v[22:23], v48 offset:5120
-
-    ds_read_b64_tr_b8 v[24:25], v53
-    ds_read_b64_tr_b8 v[26:27], v54
-    ds_read_b64_tr_b8 v[28:29], v55
-    ds_read_b64_tr_b8 v[30:31], v56
     s_waitcnt lgkmcnt(0)
 
-    // Store 128 bytes per thread
-    v_lshlrev_b32_e32 v32, 7, v60         // tid * 128 bytes
-    buffer_store_dwordx4 v[0:3], v32, s[4:7], 0 offen
-    v_add_u32_e32 v33, 16, v32
-    buffer_store_dwordx4 v[4:7], v33, s[4:7], 0 offen
-    v_add_u32_e32 v33, 32, v32
-    buffer_store_dwordx4 v[8:11], v33, s[4:7], 0 offen
-    v_add_u32_e32 v33, 48, v32
-    buffer_store_dwordx4 v[12:15], v33, s[4:7], 0 offen
-    v_add_u32_e32 v33, 64, v32
-    buffer_store_dwordx4 v[16:19], v33, s[4:7], 0 offen
-    v_add_u32_e32 v33, 80, v32
-    buffer_store_dwordx4 v[20:23], v33, s[4:7], 0 offen
-    v_add_u32_e32 v33, 96, v32
-    buffer_store_dwordx4 v[24:27], v33, s[4:7], 0 offen
-    v_add_u32_e32 v33, 112, v32
-    buffer_store_dwordx4 v[28:31], v33, s[4:7], 0 offen
+    // Store 8 dwords to output
+    v_mov_b32_e32 v31, 0
+    buffer_store_dwordx4 v[40:43], v31, s[4:7], 0 offen
+    v_add_u32_e32 v31, 16, v31
+    buffer_store_dwordx4 v[44:47], v31, s[4:7], 0 offen
 
+    s_mov_b64 exec, s[8:9]
     s_waitcnt vmcnt(0)
     s_endpgm
 
 .rodata
 .p2align 6
-.amdhsa_kernel _fwd_fp8_v_tr8_debug
+.amdhsa_kernel _fwd_fp8_v_lds_dump_debug
 .amdhsa_group_segment_fixed_size 8192
     .amdhsa_private_segment_fixed_size 0
     .amdhsa_kernarg_size 52
@@ -152,8 +111,8 @@ _fwd_fp8_v_tr8_debug:
 ---
 amdhsa.version: [1, 2]
 amdhsa.kernels:
-  - .name: _fwd_fp8_v_tr8_debug
-    .symbol: _fwd_fp8_v_tr8_debug.kd
+  - .name: _fwd_fp8_v_lds_dump_debug
+    .symbol: _fwd_fp8_v_lds_dump_debug.kd
     .kernarg_segment_size: 52
     .group_segment_fixed_size: 8192
     .private_segment_fixed_size: 0

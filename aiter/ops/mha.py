@@ -11,6 +11,23 @@ from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 
+try:
+    from aiter.ops.triton.attention import mha_v3 as _triton_mha_v3
+
+    _TRITON_MHA_V3_AVAILABLE = True
+    _TRITON_MHA_V3_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - optional dependency
+    _TRITON_MHA_V3_AVAILABLE = False
+    _TRITON_MHA_V3_IMPORT_ERROR = exc
+
+
+def _require_triton_mha_v3() -> None:
+    if not _TRITON_MHA_V3_AVAILABLE:
+        raise ImportError(
+            "AMD Triton FlashAttention v3 is not available. "
+            "Install/enable Triton or use the default AITER MHA path."
+        ) from _TRITON_MHA_V3_IMPORT_ERROR
+
 
 def cmdGenFunc_mha_fwd(
     q: Tensor,
@@ -2893,3 +2910,217 @@ def flash_attn_varlen_fp8_pertensor_func(
     )
     out = out_padded[..., :head_size_v_og]
     return out
+
+
+def flash_attn_triton_v3_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    qv: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    window_size: Tuple[int, int] = (-1, -1),
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+):
+    """AMD Triton FlashAttention v3 (forward + backward)."""
+    _require_triton_mha_v3()
+    return _triton_mha_v3.flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        qv=qv,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        window_size=window_size,
+        attention_chunk=attention_chunk,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        deterministic=deterministic,
+        sm_margin=sm_margin,
+    )
+
+
+def flash_attn_triton_v3_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    window_size: Tuple[int, int] = (-1, -1),
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+):
+    """AMD Triton FlashAttention v3 (varlen)."""
+    _require_triton_mha_v3()
+    return _triton_mha_v3.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        window_size=window_size,
+        attention_chunk=attention_chunk,
+        softcap=softcap,
+        deterministic=deterministic,
+        sm_margin=sm_margin,
+    )
+
+
+def flash_attn_triton_v3_fp8_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+):
+    """AMD Triton FlashAttention v3 with FP8 path."""
+    _require_triton_mha_v3()
+    return _triton_mha_v3.flash_attn_fp8_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        attention_chunk=attention_chunk,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        deterministic=deterministic,
+        sm_margin=sm_margin,
+    )
+
+
+def flash_attn_triton_v3_varlen_fp8_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+):
+    """AMD Triton FlashAttention v3 varlen with FP8 path."""
+    _require_triton_mha_v3()
+    return _triton_mha_v3.flash_attn_varlen_fp8_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        attention_chunk=attention_chunk,
+        softcap=softcap,
+        deterministic=deterministic,
+        sm_margin=sm_margin,
+    )
+
+
+def flash_attn_triton_v3_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    qv: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = True,
+    window_size: Tuple[int, int] = (-1, -1),
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    num_splits: int = 0,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    return_softmax_lse: bool = False,
+    page_table: Optional[torch.Tensor] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    rotary_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+):
+    """AMD Triton FlashAttention v3 with KV cache support."""
+    _require_triton_mha_v3()
+    return _triton_mha_v3.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=k,
+        v=v,
+        qv=qv,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        attention_chunk=attention_chunk,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        sm_margin=sm_margin,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        max_seqlen_q=max_seqlen_q,
+        return_softmax_lse=return_softmax_lse,
+        page_table=page_table,
+        cache_batch_idx=cache_batch_idx,
+        cache_leftpad=cache_leftpad,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        rotary_seqlens=rotary_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k_new=cu_seqlens_k_new,
+    )

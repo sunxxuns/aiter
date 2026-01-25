@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
-"""Debug TR8 V LDS mapping.
-
-Builds fwd_fp8_v_tr8_debug.s, loads a byte-coded V tensor, and prints
-the TR8-read bytes for a few threads.
-"""
+"""Dump TR8 LDS read addresses for a few threads."""
 import ctypes
-import os
 import subprocess
 import torch
 
 
 def build_kernel():
     base_dir = "/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8"
-    src = f"{base_dir}/fwd_fp8_v_tr8_debug.s"
-    obj = f"{base_dir}/fwd_fp8_v_tr8_debug.o"
-    co = f"{base_dir}/fwd_fp8_v_tr8_debug.co"
+    src = f"{base_dir}/fwd_fp8_v_tr8_addr_debug.s"
+    obj = f"{base_dir}/fwd_fp8_v_tr8_addr_debug.o"
+    co = f"{base_dir}/fwd_fp8_v_tr8_addr_debug.co"
     cmd = (
         f"/opt/rocm/llvm/bin/clang -x assembler -target amdgcn-amd-amdhsa "
         f"-mcpu=gfx950 -mno-xnack -c {src} -o {obj} && "
@@ -42,7 +37,7 @@ def main():
     torch.cuda.init()
     co = build_kernel()
 
-    # Shapes match scaffold numerics
+    # Dummy buffers to satisfy scaffold-compatible args
     s = 64
     num_q_blocks = (s + 127) // 128
     if num_q_blocks % 2 != 0:
@@ -54,33 +49,14 @@ def main():
     s_k = num_k_tiles * 32
     d = 128
 
-    # V: 64 rows, 128 cols, byte-coded patterns in FP8 storage
-    v = torch.empty((1, 1, s_k, d), device="cuda", dtype=torch.float8_e4m3fn)
-    v_bytes = v.view(torch.uint8)
-    pattern = os.environ.get("TR8_V_PATTERN", "col")
-    if pattern == "row":
-        for r in range(s_k):
-            v_bytes[0, 0, r, :] = r & 0xFF
-    elif pattern == "tile":
-        for r in range(s_k):
-            for c in range(d):
-                v_bytes[0, 0, r, c] = ((r & 7) << 3) | (c & 7)
-    elif pattern == "rowcol":
-        for r in range(s_k):
-            for c in range(d):
-                v_bytes[0, 0, r, c] = ((r & 0xF) << 4) | (c & 0xF)
-    else:
-        for c in range(d):
-            v_bytes[0, 0, :, c] = c & 0xFF
-
-    # Dummy Q/K (unused)
     q = torch.zeros((1, 1, s_q, d), device="cuda", dtype=torch.float8_e4m3fn)
     k = torch.zeros((1, 1, s_k, d), device="cuda", dtype=torch.float8_e4m3fn)
+    v = torch.zeros((1, 1, s_k, d), device="cuda", dtype=torch.float8_e4m3fn)
 
-    # Output: 128 bytes per thread (32 dwords)
-    out = torch.zeros(256 * 32, device="cuda", dtype=torch.uint32)
+    # Output: 16 dwords per thread (64 bytes)
+    out = torch.zeros(256 * 16, device="cuda", dtype=torch.uint32)
 
-    hip, module, func = load_kernel(co, "_fwd_fp8_v_tr8_debug")
+    hip, module, func = load_kernel(co, "_fwd_fp8_v_tr8_addr_debug")
     args = [
         ctypes.c_void_p(out.data_ptr()),
         ctypes.c_void_p(q.data_ptr()),
@@ -107,19 +83,14 @@ def main():
     hip.hipDeviceSynchronize()
 
     out_cpu = out.detach().cpu().numpy().astype("uint32")
-    tids = [0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 32, 33, 34, 35]
+    tids = [0, 1, 2, 3, 8, 9, 10, 11, 32, 33, 34, 35]
+    print("addr dump order: v2+0, v2+1088, v2+4096, v2+5184, v3, v4, v5, v6, v2+64, v2+1024, v2+4160, v2+5120, v7, v8, v9, v10")
     for tid in tids:
-        words = out_cpu[tid * 32:(tid + 1) * 32]
-        bytes_list = []
-        for w in words:
-            bytes_list.extend(list(int(w).to_bytes(4, "little")))
-        # Group into 8-byte chunks (each ds_read_b64_tr_b8)
-        chunks = [bytes_list[i:i+8] for i in range(0, len(bytes_list), 8)]
-        print(f"tid {tid} chunks:", chunks)
-        print(f"tid {tid} bytes[0:64]:", bytes_list[:64])
-        if pattern == "tile":
-            col_ids = [c[0] & 7 for c in chunks]
-            print(f"tid {tid} col-idx:", col_ids)
+        addrs = out_cpu[tid * 16:(tid + 1) * 16]
+        print(f"\n--- tid {tid} ---")
+        print("addrs:", addrs.tolist())
+        rows = [(int(a) // 128, int(a) % 128) for a in addrs]
+        print("row,col:", rows)
 
     hip.hipModuleUnload(module)
 

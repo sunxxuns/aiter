@@ -108,6 +108,33 @@ def swizzle_cols_16x8(v):
     return v.index_select(-1, perm)
 
 
+def swizzle_tr8_8x8(v):
+    """Swap row/col low-3 bits within 8x8 blocks."""
+    s = v.shape[-2]
+    d = v.shape[-1]
+    out = torch.empty_like(v)
+    for r in range(s):
+        for c in range(d):
+            r2 = (r & ~7) | (c & 7)
+            c2 = (c & ~7) | (r & 7)
+            out[0, 0, r2, c2] = v[0, 0, r, c]
+    return out
+
+
+def swizzle_row_rot16(v):
+    """Rotate columns by (row>>1)*16 within each 64-col half."""
+    s = v.shape[-2]
+    d = v.shape[-1]
+    out = torch.empty_like(v)
+    for r in range(s):
+        shift = ((r >> 1) & 3) * 16
+        for c in range(64):
+            out[0, 0, r, (c + shift) & 63] = v[0, 0, r, c]
+        for c in range(64, d):
+            out[0, 0, r, 64 + ((c - 64 + shift) & 63)] = v[0, 0, r, c]
+    return out
+
+
 def main():
     torch.manual_seed(0)
     dtype_name = os.environ.get("NUMERICS_FP8", "e4m3fn")
@@ -142,6 +169,12 @@ def main():
              num_q_blocks, num_k_tiles, s_q, s_k, d)
     v_col_swz = swizzle_cols_16x8(v_col)
     run_case("identity P + V col-pattern (swizzle16x8)", q, k, v_col_swz.to(fp8_dtype),
+             num_q_blocks, num_k_tiles, s_q, s_k, d)
+    v_tr8 = swizzle_tr8_8x8(v_col)
+    run_case("identity P + V col-pattern (tr8-8x8)", q, k, v_tr8.to(fp8_dtype),
+             num_q_blocks, num_k_tiles, s_q, s_k, d)
+    v_rot16 = swizzle_row_rot16(v_col)
+    run_case("identity P + V col-pattern (row-rot16)", q, k, v_rot16.to(fp8_dtype),
              num_q_blocks, num_k_tiles, s_q, s_k, d)
 
     v_rowid = torch.zeros(1, 1, s_k, d, device="cuda", dtype=torch.float32)

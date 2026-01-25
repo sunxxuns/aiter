@@ -11,10 +11,47 @@ import datetime as dt
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import ctypes
+import torch
+
 
 BASE_DIR = Path("/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8")
 CSV_PATH = BASE_DIR / "p_pack_mapping.csv"
 REPORT_PATH = BASE_DIR / "pv_b_mapping_report.md"
+SCAFFOLD_CO = BASE_DIR / "fwd_fp8_scaffold.co"
+
+
+def load_kernel(co_path, kernel_name):
+    hip = ctypes.CDLL("/opt/rocm/lib/libamdhip64.so")
+    module = ctypes.c_void_p()
+    func = ctypes.c_void_p()
+    ret = hip.hipModuleLoad(ctypes.byref(module), str(co_path).encode())
+    if ret != 0:
+        raise RuntimeError(f"hipModuleLoad failed: {ret}")
+    ret = hip.hipModuleGetFunction(ctypes.byref(func), module, kernel_name.encode())
+    if ret != 0:
+        raise RuntimeError(f"hipModuleGetFunction failed: {ret}")
+    return hip, module, func
+
+
+def decode_scaffold_output(raw, s_q, d, waves_per_block=8):
+    mapping = []
+    for col_off in (0, 32, 64, 96):
+        for row_8 in range(4):
+            for row_mod4 in range(4):
+                mapping.append((row_mod4, row_8, col_off))
+    decoded = torch.empty((s_q, d), dtype=torch.float32)
+    for tid in range(waves_per_block * 64):
+        lane = tid & 63
+        wave = tid >> 6
+        col = lane & 31
+        row_base = ((lane >> 5) & 1) * 4
+        wave_row = wave * 32
+        base = tid * 64
+        for i, (row_mod4, row_8, col_off) in enumerate(mapping):
+            row = row_mod4 + row_base + row_8 * 8 + wave_row
+            decoded[row, col + col_off] = raw[base + i]
+    return decoded
 
 
 def load_mapping():
@@ -70,6 +107,73 @@ def summarize(rows):
     }
 
 
+def run_rowbit_mapping():
+    if not SCAFFOLD_CO.exists():
+        raise RuntimeError(f"Missing scaffold co: {SCAFFOLD_CO}")
+
+    torch.manual_seed(0)
+    B, H, D = 1, 1, 128
+    S = 64
+    num_q_blocks = 2
+    num_k_tiles = 2
+    s_q, s_k = 256, 64
+
+    Qf32 = torch.zeros(B, H, s_q, D, device="cuda", dtype=torch.float32)
+    Kf32 = torch.zeros(B, H, s_k, D, device="cuda", dtype=torch.float32)
+    for r in range(min(s_k, D)):
+        Qf32[0, 0, r, r] = 1.0
+        Kf32[0, 0, r, r] = 1.0
+
+    Q = Qf32.to(torch.float8_e4m3fn)
+    K = Kf32.to(torch.float8_e4m3fn)
+
+    hip, module, func = load_kernel(SCAFFOLD_CO, "_fwd_fp8_scaffold")
+    bit_outputs = []
+    for bit in range(6):
+        Vf32 = torch.zeros(B, H, s_k, D, device="cuda", dtype=torch.float32)
+        for r in range(s_k):
+            Vf32[0, 0, r, :] = float((r >> bit) & 1)
+        V = Vf32.to(torch.float8_e4m3fn)
+        O = torch.zeros(B, H, s_q, D, device="cuda", dtype=torch.float32)
+        args = [
+            ctypes.c_void_p(O.data_ptr()),
+            ctypes.c_void_p(Q.data_ptr()),
+            ctypes.c_void_p(K.data_ptr()),
+            ctypes.c_void_p(V.data_ptr()),
+            ctypes.c_int32(num_k_tiles),
+            ctypes.c_int32(s_q * D),
+            ctypes.c_int32(s_k * D),
+            ctypes.c_int32(s_k * D),
+            ctypes.c_int32(s_q * D * 4),
+        ]
+        args_ptrs = (ctypes.c_void_p * len(args))(
+            *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]
+        )
+        hip.hipModuleLaunchKernel(
+            func,
+            num_q_blocks // 2, 1, 1,
+            512, 1, 1,
+            50176,
+            None,
+            args_ptrs,
+            None,
+        )
+        hip.hipDeviceSynchronize()
+        raw = O.detach().cpu().view(-1)
+        decoded = decode_scaffold_output(raw, s_q, D)
+        bit_outputs.append([int(round(decoded[r, 0].item())) for r in range(s_k)])
+
+    hip.hipModuleUnload(module)
+    observed = []
+    for r in range(s_k):
+        val = 0
+        for bit in range(6):
+            if bit_outputs[bit][r]:
+                val |= (1 << bit)
+        observed.append(val)
+    return observed
+
+
 def write_report(summary):
     ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = []
@@ -123,6 +227,20 @@ def write_report(summary):
         "- Diagonal entries show lane remapping for row 0 and rows 16..31; "
         "this likely indicates missing lane/byte permute after mix."
     )
+    lines.append("")
+    lines.append("## Row Mapping (identity-P, rowbit probe)")
+    try:
+        observed = run_rowbit_mapping()
+        lines.append("Output row -> observed row (0..63):")
+        for base in range(0, 64, 8):
+            chunk = observed[base:base + 8]
+            lines.append(f"- {base:02d}-{base+7:02d}: {chunk}")
+        lines.append(
+            "- This mapping shows row bit0 and bit4 are dropped "
+            "(rows fold by r>>1 within 0..15 and 16..31)."
+        )
+    except Exception as exc:
+        lines.append(f"- Row mapping probe failed: {exc}")
 
     REPORT_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

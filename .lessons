@@ -194,6 +194,16 @@ V_READ_TILE=1 V_READ_MAP=row python test_v_read_map.py
 # Expect packed k order 0..31 for tile0 and 32..63 for tile1
 ```
 
+### 5.6 Dump Raw FP8 Bytes (Avoid Decode Ambiguity)
+SYMPTOM: MFMA replay shows unexpected values after dumping A/B regs.
+CAUSE: FP8 decode can alias values; re-encoding floats back to bytes loses exact bit patterns.
+FIX: Dump raw bytes alongside decoded FP8 and replay MFMA using raw bytes.
+EXAMPLE:
+```text
+test_scaffold_a_dump.py writes val_byte + val_fp8
+test_mfma_from_pv_dump.py prefers val_byte when present
+```
+
 ---
 
 ## 6. FP8 FORMAT

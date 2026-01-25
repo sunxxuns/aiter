@@ -52,6 +52,46 @@ Next focus:
 1. Use the report to derive a cross-register byte permutation for `v48..v55`.
 2. Apply the permutation post-mix and re-test `NUMERICS_IDENTITY_P=1` with `rowid` + `col`.
 
+## MFMA K=64 mapping verified (2026-01-24)
+`test_mfma_map_debug.py` exhaustively searched k-range mappings and matched hardware with zero error:
+- Lane group 0/2: reg0–3 → k16–31, reg4–7 → k0–15
+- Lane group 1/3: reg0–3 → k48–63, reg4–7 → k32–47
+
+This is now recorded as a proven fact in `.domain`.
+
+## Raw P-pack mapping formula (mix disabled)
+Using `fwd_fp8_p_pack_dump.s` with the mix skipped, the raw packed P layout follows:
+- `src_reg = row >> 3`
+- `src_byte = row & 3`
+- `src_lane = k + 32 * ((row >> 2) & 1)` for k=1..31
+- Special case: row0,k0 → lane63 reg7 byte3
+
+Implication: each desired B dword pulls bytes from **four different source lanes**; a simple lane-only or byte-only permute cannot fix this.
+
+## PV A-operand mapping (V LDS reads)
+Using the new probe `fwd_fp8_v_read_dump.s` + `test_v_read_map.py`, the current V LDS read pattern maps rows as `row>>1` for lanes 0..7 (rows duplicate in pairs). This matches the observed identity-P rowid failure and confirms the A operand (V) mapping is dropping row LSB.
+
+## PV A base debug (row-mapped)
+Replacing the TR8 base with an explicit row-mapped base in `fwd_fp8_scaffold.s` restores identity-P rowid (rows 0..7 correct). This confirms the TR8 base swizzle is the source of the row-LSB loss; col still mismatches due to B layout and missing K offsets in this debug path.
+
+Next: derive MFMA A-side K-offset mapping for K=64 and rebuild PV A reads (row-mapped base + correct K offsets) to validate full PV.
+
+## PV A TR8 mapping gap
+`v_read_mapping.csv` (from `test_v_read_map.py`) shows TR8 PV A reads only hit k values with bit2=0: {0..3,8..11,16..19,24..27}. This explains the persistent row>>1 behavior when using the current TR8 base/offset scheme.
+
+Col-coded probe update: when V encodes columns, TR8 reads only see column codes 0 and 16 (bit4 toggling). This confirms the TR8 base/offset scheme collapses column bits and cannot reach full k without a layout/base change.
+
+## Recent findings (2026-01-23)
+- Added raw-byte A/B dump in `test_scaffold_a_dump.py` and MFMA replay in `test_mfma_from_pv_dump.py`.
+- A regs show rows 1–3 mapped (pos17–19) but row0 is missing (lane0 A all zeros).
+- B lane>=32 mapping is wrong: lane32 pos16..19 = 4..7 (should be 0..3). This corrupts rows 4+.
+- MFMA replay confirms output col0 uses B lane0; lane>=32 mapping must be rebuilt (mirroring lanes is insufficient).
+- Row mapping should be `row = lane & 31` for identity-P rowid (row0 output zeros with current mapping).
+
+Next:
+1. Recompute row0 A mapping from raw P-pack bytes (post-transpose).
+2. Rebuild lane>=32 B mapping using the verified k-range bases.
+
 ## Perf note
 - Current benchmark ~33.3 ms (~0.65 PF eq) because GPU0 sclk is stuck at ~150MHz (DPM level 1). Attempts to raise sclk via `rocm-smi` failed (manual/perf determinism not permitted).
 

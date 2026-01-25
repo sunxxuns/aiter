@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Map packed P bytes to k index and row index."""
+"""Map packed P -> A operand bytes (post-transpose)."""
 import ctypes
 import os
 import subprocess
@@ -65,8 +65,8 @@ def map_to_codes(values, codes):
 def run_dump(pattern, codes=None):
     B, H, D = 1, 1, 128
     Q_rows = 128
-    K_rows = int(os.environ.get("P_PACK_K_ROWS", "32"))
-    tile = int(os.environ.get("P_PACK_TILE", "0"))
+    K_rows = int(os.environ.get("P_A_K_ROWS", "32"))
+    tile = int(os.environ.get("P_A_TILE", "0"))
     dtype = torch.float8_e4m3fn
 
     Q_f32 = torch.zeros(B, H, Q_rows, D, device="cuda", dtype=torch.float32)
@@ -77,7 +77,7 @@ def run_dump(pattern, codes=None):
             raise RuntimeError("codes required for k_code/row_code")
         codes_f = codes.to(device="cuda", dtype=torch.float32)
         Q_f32[0, 0, :K_rows, :K_rows] = torch.eye(K_rows, device="cuda")
-        if tile == 1 and int(os.environ.get("P_PACK_Q_SHIFT", "1")):
+        if tile == 1 and int(os.environ.get("P_A_Q_SHIFT", "1")):
             Q_f32.zero_()
             for r in range(32):
                 Q_f32[0, 0, r, 32 + r] = 1.0
@@ -97,10 +97,6 @@ def run_dump(pattern, codes=None):
             else:
                 K_f32[0, 0, :32, :32] = codes_f.view(1, 32).expand(32, 32)
                 K_f32[0, 0, 32:64, :32] = codes_f.view(1, 32).expand(32, 32)
-    elif pattern == "rowdiag":
-        for r in range(K_rows):
-            Q_f32[0, 0, r, r] = float(r) / 64.0
-            K_f32[0, 0, r, r] = 1.0
     else:
         for r in range(K_rows):
             Q_f32[0, 0, r, r] = 1.0
@@ -148,7 +144,7 @@ def main():
     row_vals = run_dump("row_code", codes=codes)
 
     k_idx = map_to_codes(k_vals, codes)
-    pack_tile = int(os.environ.get("P_PACK_TILE", "0"))
+    pack_tile = int(os.environ.get("P_A_TILE", "0"))
     if pack_tile == 1:
         k_idx = k_idx + 32
     elif pack_tile > 1:
@@ -156,35 +152,11 @@ def main():
         k_idx = k_idx + ((lane_ids >= 32).to(torch.int32) * 32)
     row_idx = map_to_codes(row_vals, codes)
 
-    # Build mapping: (row,k) -> (lane,pos)
-    mapping = {}
-    for lane in range(64):
-        for pos in range(32):
-            r = int(row_idx[lane, pos].item())
-            k = int(k_idx[lane, pos].item())
-            mapping[(r, k)] = (lane, pos)
-
-    # Summary: check if each dest reg uses one source lane/reg
-    for row in range(4):
-        for reg in range(2):
-            srcs = []
-            for byte in range(4):
-                k = reg * 4 + byte
-                if (row, k) in mapping:
-                    srcs.append(mapping[(row, k)])
-            if not srcs:
-                print(f"row {row} reg {reg} src_lanes [] src_regs [] (missing)")
-                continue
-            lanes = {s[0] for s in srcs}
-            regs = {s[1] // 4 for s in srcs}
-            print(f"row {row} reg {reg} src_lanes {sorted(lanes)} src_regs {sorted(regs)}")
-
     # Dump a CSV for full mapping (allow missing entries)
     out_path = os.environ.get(
-        "P_PACK_OUT",
-        "/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8/p_pack_mapping.csv",
+        "P_A_OUT",
+        "/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8/p_a_mapping.csv",
     )
-    pack_tile = int(os.environ.get("P_PACK_TILE", "0"))
     if pack_tile > 1:
         k_base = 0
         k_span = 64
@@ -199,14 +171,23 @@ def main():
                 dst_lane = row
                 dst_reg = (k - k_base) // 4
                 dst_byte = (k - k_base) % 4
-                src = mapping.get((row, k))
-                if src is None:
+                # find source in decoded output
+                src_lane = -1
+                src_reg = -1
+                src_byte = -1
+                for lane in range(64):
+                    for pos in range(32):
+                        r = int(row_idx[lane, pos].item())
+                        kk = int(k_idx[lane, pos].item())
+                        if r == row and kk == k:
+                            src_lane = lane
+                            src_reg = pos // 4
+                            src_byte = pos % 4
+                            break
+                    if src_lane >= 0:
+                        break
+                if src_lane < 0:
                     missing += 1
-                    src_lane, src_reg, src_byte = -1, -1, -1
-                else:
-                    src_lane, src_pos = src
-                    src_reg = src_pos // 4
-                    src_byte = src_pos % 4
                 f.write(f"{row},{k},{dst_lane},{dst_reg},{dst_byte},{src_lane},{src_reg},{src_byte}\n")
     if missing:
         print(f"missing mappings: {missing}")

@@ -21,6 +21,7 @@ aiter/install_mode
 *.so
 *.dylib
 *.dll
+*.co
 build
 blob
 
@@ -56,3 +57,12 @@ aiter_logs
 # artifacts
 aiter_meta
 aiter/install_mode
+
+# crash dumps / local backups
+gpucore.*
+backup/
+
+# local debug artifacts (fp8 scaffold)
+hsa/gfx950/fmha_v3_fwd_fp8/*_dump.csv
+hsa/gfx950/fmha_v3_fwd_fp8/*_mapping*.csv
+hsa/gfx950/fmha_v3_fwd_fp8/v_read_*.csv
