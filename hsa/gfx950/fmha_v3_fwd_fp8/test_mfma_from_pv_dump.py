@@ -59,7 +59,7 @@ def main():
             reg = int(row["reg"])
             byte = int(row["byte"])
             bank = row["bank"]
-            if bank == "A":
+            if bank == "B":
                 reg += 8
             if "val_byte" in row and row["val_byte"] != "":
                 b = int(row["val_byte"])

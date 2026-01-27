@@ -92,6 +92,11 @@ Next:
 1. Recompute row0 A mapping from raw P-pack bytes (post-transpose).
 2. Rebuild lane>=32 B mapping using the verified k-range bases.
 
+Update (2026-01-23):
+- Row0 A byte forced from lane0 packed-P now sets A pos16=1.0, but MFMA replay still outputs row0=4.
+- This points to a **k-order mismatch** in P_A_TRANSPOSE (A pos→k mapping) rather than missing row0 data.
+- Next: derive A pos→k ordering with controlled B codebook and rebuild P_A_TRANSPOSE k order.
+
 ## Perf note
 - Current benchmark ~33.3 ms (~0.65 PF eq) because GPU0 sclk is stuck at ~150MHz (DPM level 1). Attempts to raise sclk via `rocm-smi` failed (manual/perf determinism not permitted).
 

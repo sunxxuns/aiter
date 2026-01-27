@@ -898,3 +898,9 @@ ACTION: Added A/B register dump with raw FP8 bytes, updated MFMA replay to consu
 RESULT: A regs show rows 1–3 mapped (pos17–19) but lane0 row0 is zero; B lane>=32 mapping yields k16..31 offset (lane32 pos16..19 = 4..7). MFMA replay confirms output col0 uses B lane0, so lane>=32 mapping is wrong and corrupts rows 4+.
 INSIGHT: Remaining failure is a bad B mapping for lanes 32–63 plus missing row0 A mapping; row mapping should be `lane & 31`, and B selection by lane>=32 must be rebuilt, not mirrored.
 NEXT: Recompute row0 A mapping from raw P-pack bytes; rebuild lane>=32 B mapping with verified k-range bases; re-test identity-P rowid.
+
+=== TURN 2026-01-23T10:30:00+00:00 ===
+ACTION: Forced row0 A pos16 from lane0 packed P byte0 (post-transpose) and re-ran A/B dump + MFMA replay.
+RESULT: lane0 A now has pos16=1.0, but MFMA replay and numerics still output row0=4 (rows 1–3 remain 6/8/10). This indicates A pos→k order is still misaligned with V (B) k order.
+INSIGHT: The row0 fix makes A nonzero, but the A pos→k mapping is wrong; need to map A positions to k directly (using controlled B codes) and rebuild P_A_TRANSPOSE accordingly.
+NEXT: Use mfma_map_debug with a codebook B (k-coded) to derive A pos→k ordering, then rewire P_A_TRANSPOSE k packing per row.

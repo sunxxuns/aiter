@@ -38,8 +38,55 @@ def main():
         Kf32[0, 0, r, r] = 1.0
 
     V_pattern = os.environ.get("NUMERICS_V_PATTERN", "rowid")
+    use_v_raw = os.environ.get("NUMERICS_V_RAW", "0") == "1"
     Vf32 = torch.zeros(B, H, s_k, D, device="cuda", dtype=torch.float32)
-    if V_pattern == "rowid":
+    V_raw = None
+    if V_pattern == "codebook32":
+        table = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+        finite = table[torch.isfinite(table)]
+        finite = finite[(finite > 0) & (finite <= 16.0)]
+        unique = torch.unique(finite)
+        unique, _ = torch.sort(unique)
+        idx = torch.linspace(0, unique.numel() - 1, steps=32).round().long()
+        codes = unique[idx]
+        for r in range(s_k):
+            Vf32[0, 0, r, :] = float(codes[r % 32].item())
+    elif V_pattern == "colbyte":
+        byte_lut = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(device="cuda")
+        col_bytes = torch.arange(D, dtype=torch.long, device="cuda")
+        col_vals = byte_lut[col_bytes].float()
+        Vf32[0, 0, :, :] = col_vals
+    elif V_pattern == "blockk":
+        col_bytes = torch.arange(D, dtype=torch.long, device="cuda")
+        col_blocks = (col_bytes // 32) & 3
+        if use_v_raw:
+            v_bytes = torch.empty((s_k, D), dtype=torch.uint8, device="cuda")
+            for r in range(s_k):
+                k_id = r & 31
+                byte_ids = ((col_blocks << 5) | k_id).to(torch.uint8)
+                v_bytes[r, :] = byte_ids
+            V_raw = v_bytes.view(torch.float8_e4m3fn)
+            Vf32[0, 0, :, :] = V_raw.float()
+        else:
+            byte_lut = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(device="cuda")
+            for r in range(s_k):
+                k_id = r & 31
+                byte_ids = ((col_blocks << 5) | k_id).to(torch.long)
+                Vf32[0, 0, r, :] = byte_lut[byte_ids].float()
+    elif V_pattern == "kbyte":
+        if use_v_raw:
+            v_bytes = torch.empty((s_k, D), dtype=torch.uint8, device="cuda")
+            for r in range(s_k):
+                k_id = r & 31
+                v_bytes[r, :] = k_id
+            V_raw = v_bytes.view(torch.float8_e4m3fn)
+            Vf32[0, 0, :, :] = V_raw.float()
+        else:
+            byte_lut = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(device="cuda")
+            for r in range(s_k):
+                k_id = r & 31
+                Vf32[0, 0, r, :] = byte_lut[k_id].float()
+    elif V_pattern == "rowid":
         for r in range(s_k):
             Vf32[0, 0, r, :] = float(r)
     else:
@@ -48,16 +95,26 @@ def main():
 
     Q = Qf32.to(torch.float8_e4m3fn)
     K = Kf32.to(torch.float8_e4m3fn)
-    V = Vf32.to(torch.float8_e4m3fn)
+    if use_v_raw and V_raw is not None:
+        V = V_raw
+    else:
+        V = Vf32.to(torch.float8_e4m3fn)
 
     # Debug dump: 16 dwords per thread (B regs + A regs)
     threads = (num_q_blocks // 2) * B * H * 512
-    O = torch.zeros(threads * 16, device="cuda", dtype=torch.uint32)
+    debug_mask = int(os.environ.get("NUMERICS_DEBUG_MASK", "0"), 0)
+    # Default: 16 dwords per thread (A/B regs). TR8 raw dump needs 32 dwords.
+    o_dwords = threads * 16
+    if debug_mask & 0x01000000:
+        o_dwords = threads * 32
+    O = torch.zeros(o_dwords, device="cuda", dtype=torch.uint32)
 
     stride_qh = s_q * D
     stride_kh = s_k * D
     stride_vh = s_k * D
-    stride_oh = (s_q * D * 4) | 0x80000000
+    debug_mask = int(os.environ.get("NUMERICS_DEBUG_MASK", "0"), 0)
+    debug_a = os.environ.get("NUMERICS_DISABLE_A_DEBUG", "0") != "1"
+    stride_oh = (s_q * D * 4) | (0x80000000 if debug_a else 0) | debug_mask
 
     args = [
         ctypes.c_void_p(O.data_ptr()),
@@ -94,6 +151,72 @@ def main():
     hip.hipDeviceSynchronize()
     hip.hipModuleUnload(module)
 
+    raw_bytes = O.detach().cpu().view(torch.uint8)
+    raw_dump = os.environ.get("NUMERICS_RAW_DUMP", "0")
+    if raw_dump == "1":
+        out_path = os.environ.get(
+            "A_DUMP_OUT",
+            "/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8/p_a_regs_dump.csv",
+        )
+        with open(out_path, "w") as f:
+            f.write("reg,byte,val_byte\n")
+            max_bytes = min(128, raw_bytes.numel())
+            for pos in range(max_bytes):
+                reg = (pos % 128) // 4
+                byte = pos % 4
+                val = int(raw_bytes[pos].item())
+                f.write(f"{reg},{byte},{val}\n")
+        print(f"wrote {out_path}")
+        return
+    if raw_dump == "2":
+        out_path = os.environ.get(
+            "A_DUMP_OUT",
+            "/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8/p_a_regs_dump.csv",
+        )
+        with open(out_path, "w") as f:
+            f.write("pos,val_byte\n")
+            max_bytes = min(64, raw_bytes.numel())
+            for pos in range(max_bytes):
+                val = int(raw_bytes[pos].item())
+                f.write(f"{pos},{val}\n")
+        print(f"wrote {out_path}")
+        return
+    if raw_dump == "3":
+        out_path = os.environ.get(
+            "A_DUMP_OUT",
+            "/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8/p_a_regs_dump.csv",
+        )
+        with open(out_path, "w") as f:
+            f.write("word,val_u32\n")
+            max_bytes = min(48, raw_bytes.numel())
+            for i in range(0, max_bytes, 4):
+                b0 = int(raw_bytes[i + 0].item())
+                b1 = int(raw_bytes[i + 1].item())
+                b2 = int(raw_bytes[i + 2].item())
+                b3 = int(raw_bytes[i + 3].item())
+                val = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+                f.write(f"{i // 4},{val}\n")
+        print(f"wrote {out_path}")
+        return
+    if raw_dump == "4":
+        out_path = os.environ.get(
+            "A_DUMP_OUT",
+            "/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8/p_a_regs_dump.csv",
+        )
+        bytes_per_lane = 128 if (debug_mask & 0x01000000) else 64
+        lanes = min(threads, raw_bytes.numel() // bytes_per_lane)
+        with open(out_path, "w") as f:
+            f.write("lane,reg,byte,val_byte\n")
+            for lane in range(lanes):
+                base = lane * bytes_per_lane
+                for reg in range(bytes_per_lane // 4):
+                    for byte in range(4):
+                        pos = base + reg * 4 + byte
+                        val = int(raw_bytes[pos].item())
+                        f.write(f"{lane},{reg},{byte},{val}\n")
+        print(f"wrote {out_path}")
+        return
+
     raw = O.detach().cpu().view(threads, 16)
     bytes_flat = raw.view(torch.uint8).view(threads, 16, 4)
     vals = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
@@ -116,7 +239,7 @@ def main():
                     f.write(f"{lane},{bank},{reg_id},{byte},{bval},{val}\n")
 
     print(f"wrote {out_path}")
-    for lane in (0, 5, 6, 7):
+    for lane in (0, 1, 2, 3, 5, 6, 7):
         if lane >= threads:
             continue
         b_vals = [float(decoded[lane, i].item()) for i in range(32)]

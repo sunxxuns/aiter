@@ -12,10 +12,22 @@
 _fwd_fp8_v_read_dump:
     s_mov_b64 exec, -1
 
-    // Args: out_ptr, V_ptr, stride_vh (bytes)
+    // Args: out_ptr, V_ptr, stride_vh (bytes), v_read_offset (bytes), v_read_lane_xor, v_read_base_xor, v_read_s25_xor, v_read_v4_add, v_read_cb, v_read_s25_mask, v_read_v2_add, v_read_v3_xor, v_read_v3_add, v_read_base_add, v_read_s25_override
     s_load_dwordx2 s[4:5], s[0:1], 0
     s_load_dwordx2 s[8:9], s[0:1], 8
     s_load_dword s12, s[0:1], 16
+    s_load_dword s13, s[0:1], 20
+    s_load_dword s14, s[0:1], 24
+    s_load_dword s15, s[0:1], 28
+    s_load_dword s16, s[0:1], 32
+    s_load_dword s17, s[0:1], 36
+    s_load_dword s18, s[0:1], 40
+    s_load_dword s19, s[0:1], 44
+    s_load_dword s20, s[0:1], 48
+    s_load_dword s21, s[0:1], 52
+    s_load_dword s22, s[0:1], 56
+    s_load_dword s23, s[0:1], 60
+    s_load_dword s24, s[0:1], 64
     s_waitcnt lgkmcnt(0)
 
     // Buffer descriptors
@@ -24,6 +36,12 @@ _fwd_fp8_v_read_dump:
     s_mov_b32 s10, -1
     s_mov_b32 s11, 0x20000
     s_movk_i32 s25, 0xb80
+    s_xor_b32 s25, s25, s16
+    s_xor_b32 s25, s25, s19
+    s_cmp_eq_u32 s24, 0
+    s_cbranch_scc1 SKIP_S25_OVERRIDE
+    s_mov_b32 s25, s24
+SKIP_S25_OVERRIDE:
 
     // tid
     v_mov_b32_e32 v60, v0
@@ -72,11 +90,23 @@ _fwd_fp8_v_read_dump:
     s_waitcnt lgkmcnt(0)
     s_barrier
 
-    // PV read base (scaffold-style)
-    v_lshlrev_b32_e32 v2, 6, v60
-    v_lshlrev_b32_e32 v3, 2, v60
+    // PV read base (scaffold-style), with optional col_block override
+    v_mov_b32_e32 v61, v60
+    v_add_u32_e32 v61, s14, v61
+    v_lshlrev_b32_e32 v2, 6, v61
+    v_lshlrev_b32_e32 v3, 2, v61
+    v_mov_b32_e32 v62, s21
+    v_xor_b32_e32 v3, v62, v3
+    v_mov_b32_e32 v62, s22
+    v_add_u32_e32 v3, v62, v3
+    v_mov_b32_e32 v62, s18
+    v_and_b32_e32 v62, 3, v62
+    v_lshlrev_b32_e32 v62, 4, v62
+    v_add_u32_e32 v3, v62, v3
     v_and_b32_e32 v4, 48, v3
+    v_add_u32_e32 v4, s17, v4
     v_and_or_b32 v2, v2, s25, v4
+    v_add_u32_e32 v2, s20, v2
     v_and_b32_e32 v5, 16, v60
     v_lshlrev_b32_e32 v6, 3, v60
     v_and_b32_e32 v6, 8, v6
@@ -102,8 +132,26 @@ _fwd_fp8_v_read_dump:
     v_add_u32_e32 v8, V_LDS0, v8
     v_add_u32_e32 v9, V_LDS0, v9
     v_add_u32_e32 v10, V_LDS0, v10
+    v_add_u32_e32 v2, s13, v2
+    v_add_u32_e32 v3, s13, v3
+    v_add_u32_e32 v4, s13, v4
+    v_add_u32_e32 v5, s13, v5
+    v_add_u32_e32 v6, s13, v6
+    v_add_u32_e32 v7, s13, v7
+    v_add_u32_e32 v8, s13, v8
+    v_add_u32_e32 v9, s13, v9
+    v_add_u32_e32 v10, s13, v10
+    v_xor_b32_e32 v2, s15, v2
+    v_xor_b32_e32 v3, s15, v3
+    v_xor_b32_e32 v4, s15, v4
+    v_xor_b32_e32 v5, s15, v5
+    v_xor_b32_e32 v6, s15, v6
+    v_xor_b32_e32 v7, s15, v7
+    v_xor_b32_e32 v8, s15, v8
+    v_xor_b32_e32 v9, s15, v9
+    v_xor_b32_e32 v10, s15, v10
 
-    // Preserve base addresses like scaffold
+    // Preserve base addresses like scaffold (+ optional base add)
     v_mov_b32_e32 v20, v2
     v_mov_b32_e32 v21, v3
     v_mov_b32_e32 v22, v4
@@ -113,6 +161,15 @@ _fwd_fp8_v_read_dump:
     v_mov_b32_e32 v26, v8
     v_mov_b32_e32 v27, v9
     v_mov_b32_e32 v28, v10
+    v_add_u32_e32 v20, s23, v20
+    v_add_u32_e32 v21, s23, v21
+    v_add_u32_e32 v22, s23, v22
+    v_add_u32_e32 v23, s23, v23
+    v_add_u32_e32 v24, s23, v24
+    v_add_u32_e32 v25, s23, v25
+    v_add_u32_e32 v26, s23, v26
+    v_add_u32_e32 v27, s23, v27
+    v_add_u32_e32 v28, s23, v28
 
     // Read A operand sets (same pattern as PV)
     // Set 0: v20 offsets

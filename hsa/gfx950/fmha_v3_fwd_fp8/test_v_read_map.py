@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Dump PV A-operand reads (V LDS) and map to row ids."""
 import ctypes
+import os
 import subprocess
 import torch
 
@@ -42,7 +43,7 @@ def build_codebook(count=32):
     table = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
     finite = table[torch.isfinite(table)]
     finite = finite[finite > 0]
-    finite = finite[(finite >= 1.0) & (finite <= 16.0)]
+    finite = finite[finite <= 16.0]
     unique = torch.unique(finite)
     unique, _ = torch.sort(unique)
     if unique.numel() < count:
@@ -69,18 +70,51 @@ def main():
     codes = build_codebook(32)
     codes_f = codes.to(device="cuda", dtype=torch.float32)
     B, H, D = 1, 1, 128
-    S_k = 128
+    S_k = int(os_env.get("V_READ_SK", "128"))
     V = torch.zeros(B, H, S_k, D, device="cuda", dtype=torch.float32)
+    V_raw = None
     v_map = os_env.get("V_READ_MAP", "row")
     tile = int(os_env.get("V_READ_TILE", "0"))
+    use_v_raw = os.environ.get("V_READ_RAW", "0") == "1"
     if v_map == "col":
         for c in range(32):
             V[0, 0, :, c] = codes_f[c]
             V[0, 0, :, 32 + c] = codes_f[c]
+    elif v_map == "blockk":
+        col_bytes = torch.arange(128, dtype=torch.long, device="cuda")
+        col_blocks = (col_bytes // 32) & 3
+        if use_v_raw:
+            v_bytes = torch.empty((S_k, 128), dtype=torch.uint8, device="cuda")
+            for r in range(S_k):
+                k_id = r & 31
+                byte_ids = ((col_blocks << 5) | k_id).to(torch.uint8)
+                v_bytes[r, :] = byte_ids
+            V_raw = v_bytes.view(torch.float8_e4m3fn)
+            V[0, 0, :, :] = V_raw.float()
+        else:
+            byte_lut = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(device="cuda")
+            for r in range(S_k):
+                k_id = r & 31
+                byte_ids = ((col_blocks << 5) | k_id).to(torch.long)
+                V[0, 0, r, :] = byte_lut[byte_ids].float()
+    elif v_map == "colbyte":
+        byte_lut = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(device="cuda")
+        col_bytes = torch.arange(128, dtype=torch.long, device="cuda")
+        col_vals = byte_lut[col_bytes].float()
+        V[0, 0, :, :] = col_vals
+    elif v_map == "colblock":
+        block_codes = codes_f[:4]
+        for b in range(4):
+            c0 = b * 32
+            c1 = c0 + 32
+            V[0, 0, :, c0:c1] = float(block_codes[b].item())
     else:
         for r in range(S_k):
             V[0, 0, r, :] = codes_f[r % 32]
-    V = V.to(torch.float8_e4m3fn)
+    if use_v_raw and V_raw is not None:
+        V = V_raw
+    else:
+        V = V.to(torch.float8_e4m3fn)
 
     out = torch.zeros(256 * 40, device="cuda", dtype=torch.uint32)
 
@@ -88,10 +122,34 @@ def main():
     module, func = load_kernel(co, "_fwd_fp8_v_read_dump")
 
     stride_vh = ctypes.c_int32(S_k * D)
+    v_read_offset = ctypes.c_int32(int(os_env.get("V_READ_OFFSET", "0")))
+    v_read_lane_xor = ctypes.c_int32(int(os_env.get("V_READ_LANE_XOR", "0"), 0))
+    v_read_base_xor = ctypes.c_int32(int(os_env.get("V_READ_BASE_XOR", "0"), 0))
+    v_read_s25_xor = ctypes.c_int32(int(os_env.get("V_READ_S25_XOR", "0"), 0))
+    v_read_v4_add = ctypes.c_int32(int(os_env.get("V_READ_V4_ADD", "0"), 0))
+    v_read_cb = ctypes.c_int32(int(os_env.get("V_READ_CB", "0"), 0))
+    v_read_s25_mask = ctypes.c_int32(int(os_env.get("V_READ_S25_MASK", "0"), 0))
+    v_read_v2_add = ctypes.c_int32(int(os_env.get("V_READ_V2_ADD", "0"), 0))
+    v_read_v3_xor = ctypes.c_int32(int(os_env.get("V_READ_V3_XOR", "0"), 0))
+    v_read_v3_add = ctypes.c_int32(int(os_env.get("V_READ_V3_ADD", "0"), 0))
+    v_read_base_add = ctypes.c_int32(int(os_env.get("V_READ_BASE_ADD", "0"), 0))
+    v_read_s25_override = ctypes.c_int32(int(os_env.get("V_READ_S25_OVERRIDE", "0"), 0))
     args = [
         ctypes.c_void_p(out.data_ptr()),
         ctypes.c_void_p(V.data_ptr()),
         stride_vh,
+        v_read_offset,
+        v_read_lane_xor,
+        v_read_base_xor,
+        v_read_s25_xor,
+        v_read_v4_add,
+        v_read_cb,
+        v_read_s25_mask,
+        v_read_v2_add,
+        v_read_v3_xor,
+        v_read_v3_add,
+        v_read_base_add,
+        v_read_s25_override,
     ]
     args_ptrs = (ctypes.c_void_p * len(args))(
         *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]
@@ -111,11 +169,17 @@ def main():
     raw = out.detach().cpu().view(256, 40)
     bytes_flat = raw[:, :32].contiguous().view(torch.uint8).view(256, 32, 4)
     decoded = decode_fp8_bytes(bytes_flat).reshape(256, 128)
-    row_idx = map_to_codes(decoded, codes) + tile * 32
+    if v_map in ("colbyte", "blockk"):
+        row_idx = bytes_flat.reshape(256, 128).to(torch.int32)
+    else:
+        row_idx = map_to_codes(decoded, codes) + tile * 32
 
     packed_bytes = raw[:, 32:40].contiguous().view(torch.uint8).view(256, 8, 4)
     packed_decoded = decode_fp8_bytes(packed_bytes).reshape(256, 32)
-    packed_row_idx = map_to_codes(packed_decoded, codes) + tile * 32
+    if v_map in ("colbyte", "blockk"):
+        packed_row_idx = packed_bytes.reshape(256, 32).to(torch.int32)
+    else:
+        packed_row_idx = map_to_codes(packed_decoded, codes) + tile * 32
 
     # Report mapping for first wave (lanes 0..31)
     lane_rows = [int(row_idx[lane, 0].item()) for lane in range(32)]
@@ -128,6 +192,10 @@ def main():
     print("lane0 k_idx set1 pos32..47:", row_idx[0, 32:48].tolist())
     print("lane0 k_idx set2 pos64..79:", row_idx[0, 64:80].tolist())
     print("lane0 k_idx set3 pos96..111:", row_idx[0, 96:112].tolist())
+
+    if os_env.get("V_READ_DEBUG", "0") == "1":
+        print("lane0 decoded pos28..40:", decoded[0, 28:41].tolist())
+        print("lane0 decoded pos48..56:", decoded[0, 48:57].tolist())
 
     # Dump mapping CSV (raw TR8 read sets)
     out_path = f"{BASE_DIR}/v_read_mapping.csv"
