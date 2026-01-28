@@ -168,6 +168,16 @@ def main():
     stride_vh = s_k * D
     stride_oh = s_q * D * 4    # bytes for FP32
     debug_flags = int(os.environ.get("NUMERICS_DEBUG_FLAGS", "0"), 0)
+    v_read_cb = int(os.environ.get("NUMERICS_V_READ_CB", "0"), 0)
+    v_read_lane_add = int(os.environ.get("NUMERICS_V_READ_LANE_ADD", "0"), 0)
+    v_read_v3_xor = int(os.environ.get("NUMERICS_V_READ_V3_XOR", "0"), 0)
+    v_read_v3_add = int(os.environ.get("NUMERICS_V_READ_V3_ADD", "0"), 0)
+    v_read_v4_add = int(os.environ.get("NUMERICS_V_READ_V4_ADD", "0"), 0)
+    v_read_v2_add = int(os.environ.get("NUMERICS_V_READ_V2_ADD", "0"), 0)
+    v_read_base_add = int(os.environ.get("NUMERICS_V_READ_BASE_ADD", "0"), 0)
+    v_read_base_xor = int(os.environ.get("NUMERICS_V_READ_BASE_XOR", "0"), 0)
+    v_read_base_extra_add = int(os.environ.get("NUMERICS_V_READ_BASE_EXTRA_ADD", "0"), 0)
+    v_read_s25_override = int(os.environ.get("NUMERICS_V_READ_S25_OVERRIDE", "0"), 0)
 
     args = [
         ctypes.c_void_p(O.data_ptr()),
@@ -180,6 +190,16 @@ def main():
         ctypes.c_int32(stride_vh),
         ctypes.c_int32(stride_oh),
         ctypes.c_int32(debug_flags),
+        ctypes.c_int32(v_read_cb),
+        ctypes.c_int32(v_read_lane_add),
+        ctypes.c_int32(v_read_v3_xor),
+        ctypes.c_int32(v_read_v3_add),
+        ctypes.c_int32(v_read_v4_add),
+        ctypes.c_int32(v_read_v2_add),
+        ctypes.c_int32(v_read_base_add),
+        ctypes.c_int32(v_read_base_xor),
+        ctypes.c_int32(v_read_base_extra_add),
+        ctypes.c_int32(v_read_s25_override),
     ]
     args_ptrs = (ctypes.c_void_p * len(args))(
         *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]

@@ -135,6 +135,8 @@ def run_rowbit_mapping():
             Vf32[0, 0, r, :] = float((r >> bit) & 1)
         V = Vf32.to(torch.float8_e4m3fn)
         O = torch.zeros(B, H, s_q, D, device="cuda", dtype=torch.float32)
+        debug_flags = int(os.environ.get("SCAFFOLD_DEBUG_FLAGS", "0"), 0)
+        v_read_cb = int(os.environ.get("SCAFFOLD_V_READ_CB", "0"), 0)
         args = [
             ctypes.c_void_p(O.data_ptr()),
             ctypes.c_void_p(Q.data_ptr()),
@@ -145,6 +147,17 @@ def run_rowbit_mapping():
             ctypes.c_int32(s_k * D),
             ctypes.c_int32(s_k * D),
             ctypes.c_int32(s_q * D * 4),
+            ctypes.c_int32(debug_flags),
+            ctypes.c_int32(v_read_cb),
+        ctypes.c_int32(v_read_lane_add),
+        ctypes.c_int32(v_read_v3_xor),
+        ctypes.c_int32(v_read_v3_add),
+        ctypes.c_int32(v_read_v4_add),
+        ctypes.c_int32(v_read_v2_add),
+        ctypes.c_int32(v_read_base_add),
+        ctypes.c_int32(v_read_base_xor),
+        ctypes.c_int32(v_read_base_extra_add),
+        ctypes.c_int32(v_read_s25_override),
         ]
         args_ptrs = (ctypes.c_void_p * len(args))(
             *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]

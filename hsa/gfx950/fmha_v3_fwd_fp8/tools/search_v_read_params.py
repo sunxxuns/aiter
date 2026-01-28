@@ -53,9 +53,14 @@ def load_packed_csv() -> List[List[int]]:
     with open(PACKED_CSV, "r") as f:
         r = csv.DictReader(f)
         for row in r:
-            lane = int(row["lane"])
-            k = int(row["k"])
-            rid = int(row["row"])
+            if not row.get("lane") or not row.get("k") or not row.get("row"):
+                continue
+            try:
+                lane = int(row["lane"])
+                k = int(row["k"])
+                rid = int(row["row"])
+            except ValueError:
+                continue
             if 0 <= lane < 64 and 0 <= k < 32:
                 rows[lane][k] = rid
     return rows
@@ -69,8 +74,12 @@ def score_identity(rows: List[int], base: int = 0) -> int:
 def main() -> None:
     base_xors = [0x0, 0x20, 0x60, 0x420, 0x460, 0x1020, 0x1060, 0x1420, 0x1460]
     perm_ids = [0, 1, 2, 3, 4, 5]  # encoded as (perm_id<<2) in V_READ_CB
-    write_modes = [0, 1]           # encoded as (write_mode<<8) in V_READ_CB
-    s25_overrides = [0, 0xB80, 0xF80, 0xFF0, 0xFFF]
+    # encoded as (write_mode<<8) in V_READ_CB; mode2 selects solver-derived write swizzle (bitop3 0x7a,c=0)
+    # Focused search: we care most about write_mode=2 (bitop3 ttbl=0x7a, c=0x0),
+    # since it matches the scaffold TR8 reads much better than the baseline.
+    write_modes = [2]
+    # Keep a small but meaningful set of s25 overrides (these control which lane bits survive in tr8_base).
+    s25_overrides = [0xB80, 0xFF0, 0xFFF]
 
     best: List[Candidate] = []
     total = 0

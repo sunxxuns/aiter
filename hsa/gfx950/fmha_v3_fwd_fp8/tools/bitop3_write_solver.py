@@ -73,8 +73,8 @@ class Cand:
 def main() -> None:
     reads = load_scaffold_read_addrs("/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8/scaffold_tr8_addrs.csv")
 
-    # Try a few C constants (s26 is 0x70 today, but we allow a bit more)
-    c_candidates = [0x00, 0x0F, 0x30, 0x70, 0xFF]
+    # Search all C constants (0..255). This is still small (256*256 candidates).
+    c_candidates = list(range(256))
 
     best: List[Cand] = []
 

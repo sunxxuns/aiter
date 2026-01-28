@@ -59,6 +59,7 @@ def main() -> None:
     stride_vh = s_k * D
     stride_oh = 64  # bytes per tid slot (matches debug stores)
     debug_flags = 0x02000000
+    v_read_cb = int(os.environ.get("SCAFFOLD_V_READ_CB", "0"), 0)
 
     args = [
         ctypes.c_void_p(out.data_ptr()),
@@ -71,6 +72,16 @@ def main() -> None:
         ctypes.c_int32(stride_vh),
         ctypes.c_int32(stride_oh),
         ctypes.c_int32(debug_flags),
+        ctypes.c_int32(v_read_cb),
+        ctypes.c_int32(v_read_lane_add),
+        ctypes.c_int32(v_read_v3_xor),
+        ctypes.c_int32(v_read_v3_add),
+        ctypes.c_int32(v_read_v4_add),
+        ctypes.c_int32(v_read_v2_add),
+        ctypes.c_int32(v_read_base_add),
+        ctypes.c_int32(v_read_base_xor),
+        ctypes.c_int32(v_read_base_extra_add),
+        ctypes.c_int32(v_read_s25_override),
     ]
     args_ptrs = (ctypes.c_void_p * len(args))(
         *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]

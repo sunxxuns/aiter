@@ -68,6 +68,7 @@ def _launch_dump(
     stride_vh: int,
     stride_oh: int,
     debug_flags: int,
+    v_read_cb: int = 0,
 ):
     # out_u32 is used as O_ptr for debug dumps (raw u32 stores)
     args = [
@@ -81,6 +82,16 @@ def _launch_dump(
         ctypes.c_int32(stride_vh),
         ctypes.c_int32(stride_oh),
         ctypes.c_int32(debug_flags),
+        ctypes.c_int32(v_read_cb),
+        ctypes.c_int32(v_read_lane_add),
+        ctypes.c_int32(v_read_v3_xor),
+        ctypes.c_int32(v_read_v3_add),
+        ctypes.c_int32(v_read_v4_add),
+        ctypes.c_int32(v_read_v2_add),
+        ctypes.c_int32(v_read_base_add),
+        ctypes.c_int32(v_read_base_xor),
+        ctypes.c_int32(v_read_base_extra_add),
+        ctypes.c_int32(v_read_s25_override),
     ]
     args_ptrs = (ctypes.c_void_p * len(args))(
         *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]

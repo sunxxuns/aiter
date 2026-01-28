@@ -59,6 +59,7 @@ def main():
     stride_vh = s_k * D
     stride_oh = 32  # bytes per thread slot for dump
     debug_flags = int(os.environ.get("DUMP_FLAGS", "0x00020000"), 0)
+    v_read_cb = int(os.environ.get("DUMP_V_READ_CB", "0"), 0)
 
     args = [
         ctypes.c_void_p(out.data_ptr()),
@@ -71,6 +72,16 @@ def main():
         ctypes.c_int32(stride_vh),
         ctypes.c_int32(stride_oh),
         ctypes.c_int32(debug_flags),
+        ctypes.c_int32(v_read_cb),
+        ctypes.c_int32(v_read_lane_add),
+        ctypes.c_int32(v_read_v3_xor),
+        ctypes.c_int32(v_read_v3_add),
+        ctypes.c_int32(v_read_v4_add),
+        ctypes.c_int32(v_read_v2_add),
+        ctypes.c_int32(v_read_base_add),
+        ctypes.c_int32(v_read_base_xor),
+        ctypes.c_int32(v_read_base_extra_add),
+        ctypes.c_int32(v_read_s25_override),
     ]
     args_ptrs = (ctypes.c_void_p * len(args))(
         *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]

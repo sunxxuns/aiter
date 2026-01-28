@@ -22,7 +22,9 @@ import argparse
 import itertools
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Set, Tuple
+from typing import Dict, Iterable, List, Set, Tuple
+
+import csv
 
 
 def bitop3(a: int, b: int, c: int, ttbl: int) -> int:
@@ -54,6 +56,12 @@ def tr8_base(lane: int, s25: int) -> int:
 def write_base(lane: int) -> int:
     v4 = (lane << 4) & 0xFFFFFFFF
     v4 = bitop3(v4, lane, 0x70, 0x78)
+    return v4 & 0xFFFFFFFF
+
+
+def write_base_bitop3(tid: int, c: int, ttbl: int) -> int:
+    v4 = (tid << 4) & 0xFFFFFFFF
+    v4 = bitop3(v4, tid, c, ttbl)
     return v4 & 0xFFFFFFFF
 
 
@@ -119,14 +127,48 @@ def scaffold_read_addrs(base0: int, v_lds0: int) -> List[int]:
     return addrs
 
 
-def build_write_bytes(v_lds0: int) -> Set[int]:
+def build_write_bytes(v_lds0: int, write_c: int, write_ttbl: int) -> Set[int]:
     w: Set[int] = set()
     for tid in range(256):
-        b = v_lds0 + write_base(tid)  # preload uses tid, not lane
+        b = v_lds0 + write_base_bitop3(tid, write_c, write_ttbl)  # preload uses tid, not lane
         for i in range(16):
             w.add(b + i)
             w.add(b + 4096 + i)
     return w
+
+
+def load_scaffold_read_addrs_csv(path: str) -> Set[int]:
+    # lane -> [v20..v28]
+    vals: Dict[int, List[int]] = {lane: [0] * 9 for lane in range(64)}
+    with open(path, "r") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            if not row.get("tid") or not row.get("word") or not row.get("val_u32"):
+                continue
+            try:
+                tid = int(row["tid"])
+                lane = tid & 63
+                word = int(row["word"])
+                val = int(row["val_u32"])
+            except ValueError:
+                continue
+            if 0 <= lane < 64 and 0 <= word <= 8:
+                vals[lane][word] = val
+
+    def addrs(v: List[int]) -> List[int]:
+        v20, v21, v22, v23, v24, v25, v26, v27, v28 = v
+        out: List[int] = []
+        out += [v20 + o for o in (0, 256, 512, 768)]
+        out += [v21 + 1024, v22 + 1152, v23 + 1280, v24 + 1408]
+        out += [v20 + o for o in (2048, 2176, 2304, 2432)]
+        out += [v25 + 3072, v26 + 3200, v27 + 3328, v28 + 3456]
+        return out
+
+    reads: Set[int] = set()
+    for lane in range(64):
+        for a in addrs(vals[lane]):
+            reads.add(a)
+    return reads
 
 
 @dataclass(frozen=True)
@@ -147,14 +189,33 @@ def main() -> None:
     ap.add_argument("--topk", type=int, default=5)
     ap.add_argument("--s25", type=lambda x: int(x, 0), default=0xB80)
     ap.add_argument("--v-lds0", type=int, default=41984)
+    ap.add_argument(
+        "--csv",
+        type=str,
+        default="/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8/scaffold_tr8_addrs.csv",
+        help="CSV dumped from dump_scaffold_tr8_addrs.py",
+    )
+    ap.add_argument("--write-ttbl", type=lambda x: int(x, 0), default=0x7A)
+    ap.add_argument("--write-c", type=lambda x: int(x, 0), default=0x00)
+    ap.add_argument(
+        "--per-lane-bit",
+        action="store_true",
+        help="brute force inject a single lane bit at a time (tid_mask one-hot) across many tid_shift values",
+    )
     args = ap.parse_args()
 
-    write_bytes = build_write_bytes(args.v_lds0)
+    reads = load_scaffold_read_addrs_csv(args.csv)
+    write_bytes = build_write_bytes(args.v_lds0, args.write_c, args.write_ttbl)
 
-    kinds = ["tr8", "write", "tr8lin", "linear"]
+    # For per-lane-bit brute force, keep the base family simple and focus on injections.
+    kinds = ["tr8", "write"] if args.per_lane_bit else ["tr8", "write", "tr8lin", "linear"]
     base_xors = [0x0, 0x20, 0x60, 0x420, 0x460, 0x1020, 0x1060, 0x1420, 0x1460]
-    tid_masks = [0x0, 0x1, 0x3, 0x7, 0xF, 0x1F, 0x3F]
-    tid_shifts = [3, 4, 5, 6]
+    if args.per_lane_bit:
+        tid_masks = [0x0] + [(1 << b) for b in range(6)]
+        tid_shifts = list(range(0, 13))
+    else:
+        tid_masks = [0x0, 0x1, 0x3, 0x7, 0xF, 0x1F, 0x3F]
+        tid_shifts = [3, 4, 5, 6]
     mod_candidates = [
         (None, None, None),
         (0x1FF, 7, 3),
@@ -168,9 +229,10 @@ def main() -> None:
     ]
     linear_shift_pool = [2, 3, 4, 5, 6, 7, 8]
     linear_sets = [()]
-    for k in (1, 2):
-        for shs in itertools.combinations(linear_shift_pool, k):
-            linear_sets.append(shs)
+    if not args.per_lane_bit:
+        for k in (1, 2):
+            for shs in itertools.combinations(linear_shift_pool, k):
+                linear_sets.append(shs)
 
     start = time.time()
     best: List[Cand] = []
@@ -186,7 +248,8 @@ def main() -> None:
                             evals += 1
                             if args.time_limit and (time.time() - start) > args.time_limit:
                                 break
-                            # compute coverage over lanes 0..63
+                            # compute coverage over lanes 0..63, but only count addresses that
+                            # are both in the *actual scaffold reads* and in written bytes.
                             covered = 0
                             total = 0
                             for lane in range(64):
@@ -196,7 +259,7 @@ def main() -> None:
                                 )
                                 addrs = scaffold_read_addrs(b0, args.v_lds0)
                                 total += len(addrs)
-                                covered += sum(1 for a in addrs if a in write_bytes)
+                                covered += sum(1 for a in addrs if (a in reads and a in write_bytes))
                             cand = Cand(
                                 covered=covered,
                                 total=total,
@@ -211,7 +274,8 @@ def main() -> None:
                             best.sort(key=lambda c: c.covered, reverse=True)
                             best = best[: args.topk]
 
-    print(f"evals={evals} total_reads={best[0].total if best else 0}")
+    print(f"unique_reads={len(reads)} evals={evals} total_reads={best[0].total if best else 0}")
+    print(f"write_map: bitop3(ttbl=0x{args.write_ttbl:02x}, c=0x{args.write_c:02x})")
     for i, c in enumerate(best):
         mm, ms, xs = c.mod
         print(

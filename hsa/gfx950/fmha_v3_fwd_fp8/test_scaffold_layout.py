@@ -25,6 +25,8 @@ def build_identity_qk(s_q, s_k, d, device):
 def run_kernel(q, k, v, num_q_blocks, num_k_tiles, s_q, s_k, d):
     fp8_dtype = v.dtype
     o = torch.zeros(1, 1, s_q, d, device="cuda", dtype=torch.float32)
+    debug_flags = int(os.environ.get("SCAFFOLD_DEBUG_FLAGS", "0"), 0)
+    v_read_cb = int(os.environ.get("SCAFFOLD_V_READ_CB", "0"), 0)
     args = [
         ctypes.c_void_p(o.data_ptr()),
         ctypes.c_void_p(q.data_ptr()),
@@ -35,6 +37,17 @@ def run_kernel(q, k, v, num_q_blocks, num_k_tiles, s_q, s_k, d):
         ctypes.c_int32(s_k * d),
         ctypes.c_int32(s_k * d),
         ctypes.c_int32(s_q * d * 4),
+        ctypes.c_int32(debug_flags),
+        ctypes.c_int32(v_read_cb),
+        ctypes.c_int32(v_read_lane_add),
+        ctypes.c_int32(v_read_v3_xor),
+        ctypes.c_int32(v_read_v3_add),
+        ctypes.c_int32(v_read_v4_add),
+        ctypes.c_int32(v_read_v2_add),
+        ctypes.c_int32(v_read_base_add),
+        ctypes.c_int32(v_read_base_xor),
+        ctypes.c_int32(v_read_base_extra_add),
+        ctypes.c_int32(v_read_s25_override),
     ]
     args_ptrs = (ctypes.c_void_p * len(args))(
         *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]

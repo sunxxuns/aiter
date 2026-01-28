@@ -115,6 +115,8 @@ def main():
     debug_mask = int(os.environ.get("NUMERICS_DEBUG_MASK", "0"), 0)
     debug_a = os.environ.get("NUMERICS_DISABLE_A_DEBUG", "0") != "1"
     stride_oh = (s_q * D * 4) | (0x80000000 if debug_a else 0) | debug_mask
+    debug_flags = int(os.environ.get("NUMERICS_DEBUG_FLAGS", "0"), 0)
+    v_read_cb = int(os.environ.get("NUMERICS_V_READ_CB", "0"), 0)
 
     args = [
         ctypes.c_void_p(O.data_ptr()),
@@ -126,6 +128,17 @@ def main():
         ctypes.c_int32(stride_kh),
         ctypes.c_int32(stride_vh),
         ctypes.c_int32(stride_oh),
+        ctypes.c_int32(debug_flags),
+        ctypes.c_int32(v_read_cb),
+        ctypes.c_int32(v_read_lane_add),
+        ctypes.c_int32(v_read_v3_xor),
+        ctypes.c_int32(v_read_v3_add),
+        ctypes.c_int32(v_read_v4_add),
+        ctypes.c_int32(v_read_v2_add),
+        ctypes.c_int32(v_read_base_add),
+        ctypes.c_int32(v_read_base_xor),
+        ctypes.c_int32(v_read_base_extra_add),
+        ctypes.c_int32(v_read_s25_override),
     ]
     args_ptrs = (ctypes.c_void_p * len(args))(
         *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]
