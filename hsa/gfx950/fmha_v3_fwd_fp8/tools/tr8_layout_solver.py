@@ -63,6 +63,9 @@ def tr8_read_addrs(tid: int, s25: int, base: int) -> Set[int]:
     # set2: base5..8 offsets 2048,2176,2304,2432
     for b, off in zip(bases[5:9], (2048, 2176, 2304, 2432)):
         addrs.add(base + b + off)
+    # set3 (scaffold extension): base5..8 offsets 3072,3200,3328,3456
+    for b, off in zip(bases[5:9], (3072, 3200, 3328, 3456)):
+        addrs.add(base + b + off)
     return addrs
 
 
@@ -124,7 +127,12 @@ def main() -> None:
                         help="V LDS base (default 0xA400 = 41984)")
     parser.add_argument("--s25", type=lambda x: int(x, 0), default=0xB80,
                         help="s25 mask for TR8 base (default 0xb80)")
-    parser.add_argument("--lanes", type=int, default=64, help="Number of lanes")
+    parser.add_argument("--lanes", type=int, default=64,
+                        help="Number of lanes (legacy: used for both reads and writes)")
+    parser.add_argument("--lanes-read", type=int, default=0,
+                        help="If set, number of lanes for TR8 reads (overrides --lanes)")
+    parser.add_argument("--lanes-write", type=int, default=0,
+                        help="If set, number of lanes for V writes (overrides --lanes)")
     parser.add_argument("--write-offsets", type=str, default="0,4096",
                         help="Comma-separated write offsets from base")
     parser.add_argument("--from-dump", type=str, default="",
@@ -144,9 +152,11 @@ def main() -> None:
     write_offsets = [int(x, 0) for x in args.write_offsets.split(",") if x.strip()]
     base = args.base
     s25 = args.s25
+    lanes_read = args.lanes_read or args.lanes
+    lanes_write = args.lanes_write or args.lanes
 
     all_write_addrs: Set[int] = set()
-    for tid in range(args.lanes):
+    for tid in range(lanes_write):
         all_write_addrs |= v_write_addrs(
             tid, base, write_offsets, use_tr8_base=args.write_tr8_base, s25=s25
         )
@@ -154,7 +164,7 @@ def main() -> None:
     coverages: List[Coverage] = []
     total_reads = 0
     total_covered = 0
-    for tid in range(args.lanes):
+    for tid in range(lanes_read):
         reads = tr8_read_addrs(tid, s25, base)
         covered = sum(1 for a in reads if a in all_write_addrs)
         coverages.append(
@@ -169,7 +179,7 @@ def main() -> None:
                   f"covered={c.covered_reads} missing={c.missing_reads}")
 
     print("\nSummary:")
-    print(f"  lanes={args.lanes} base=0x{base:x} s25=0x{s25:x} write_offsets={write_offsets}")
+    print(f"  lanes_read={lanes_read} lanes_write={lanes_write} base=0x{base:x} s25=0x{s25:x} write_offsets={write_offsets}")
     print(f"  total_reads={total_reads} covered={total_covered} missing={total_reads - total_covered}")
 
     if args.from_dump:

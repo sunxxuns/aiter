@@ -54,6 +54,7 @@ def main():
     stride_kh = S_k * D
     stride_vh = S_k * D
     stride_oh = S_q * D * 4    # bytes for FP32
+    debug_flags = int(os.environ.get("SCAFFOLD_DEBUG_FLAGS", "0"), 0)
 
     args = [
         ctypes.c_void_p(O.data_ptr()),
@@ -65,6 +66,7 @@ def main():
         ctypes.c_int32(stride_kh),
         ctypes.c_int32(stride_vh),
         ctypes.c_int32(stride_oh),
+        ctypes.c_int32(debug_flags),
     ]
     args_ptrs = (ctypes.c_void_p * len(args))(
         *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]

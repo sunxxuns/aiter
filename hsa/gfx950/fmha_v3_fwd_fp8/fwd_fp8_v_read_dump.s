@@ -53,17 +53,100 @@ SKIP_S25_OVERRIDE:
 
     v_lshrrev_b32_e32 v4, 3, v60          // row = tid >> 3 (0..31)
     v_and_b32_e32 v5, 7, v60              // col_block = tid & 7 (0..7)
-    // permute row bits: (b4,b3,b2)->(b3,b2,b4)
+    // Row permutation selector for debug/solver:
+    //   perm_id = (v_read_cb >> 2) & 7  (s18 is v_read_cb argument)
+    // Permutes row bits {b4,b3,b2} into new {b4,b3,b2}:
+    //   0: identity          (b4,b3,b2)->(b4,b3,b2)
+    //   1: rot left          (b4,b3,b2)->(b3,b2,b4)   [old scaffold baseline]
+    //   2: rot right         (b4,b3,b2)->(b2,b4,b3)
+    //   3: swap b4<->b3      (b4,b3,b2)->(b3,b4,b2)
+    //   4: swap b4<->b2      (b4,b3,b2)->(b2,b3,b4)
+    //   5: swap b3<->b2      (b4,b3,b2)->(b4,b2,b3)
+    v_mov_b32_e32 v212, s18
+    v_lshrrev_b32_e32 v212, 2, v212
+    v_and_b32_e32 v212, 7, v212
+    v_cmp_eq_u32_e32 vcc, 0, v212
+    s_cbranch_vccnz PERM_DONE
+    v_cmp_eq_u32_e32 vcc, 1, v212
+    s_cbranch_vccnz PERM_1
+    v_cmp_eq_u32_e32 vcc, 2, v212
+    s_cbranch_vccnz PERM_2
+    v_cmp_eq_u32_e32 vcc, 3, v212
+    s_cbranch_vccnz PERM_3
+    v_cmp_eq_u32_e32 vcc, 4, v212
+    s_cbranch_vccnz PERM_4
+    v_cmp_eq_u32_e32 vcc, 5, v212
+    s_cbranch_vccnz PERM_5
+    s_branch PERM_DONE
+
+PERM_1:
+    // (b4,b3,b2)->(b3,b2,b4)
     v_and_b32_e32 v208, 8, v4
-    v_lshlrev_b32_e32 v208, 1, v208
+    v_lshlrev_b32_e32 v208, 1, v208          // b3 -> b4
     v_and_b32_e32 v209, 4, v4
-    v_lshlrev_b32_e32 v209, 1, v209
+    v_lshlrev_b32_e32 v209, 1, v209          // b2 -> b3
     v_and_b32_e32 v210, 16, v4
-    v_lshrrev_b32_e32 v210, 2, v210
+    v_lshrrev_b32_e32 v210, 2, v210          // b4 -> b2
     v_and_b32_e32 v211, 3, v4
     v_or_b32_e32 v208, v208, v209
     v_or_b32_e32 v208, v208, v210
     v_or_b32_e32 v4, v208, v211
+    s_branch PERM_DONE
+
+PERM_2:
+    // (b4,b3,b2)->(b2,b4,b3)
+    v_and_b32_e32 v208, 4, v4
+    v_lshlrev_b32_e32 v208, 2, v208          // b2 -> b4
+    v_and_b32_e32 v209, 16, v4
+    v_lshrrev_b32_e32 v209, 1, v209          // b4 -> b3
+    v_and_b32_e32 v210, 8, v4
+    v_lshrrev_b32_e32 v210, 1, v210          // b3 -> b2
+    v_and_b32_e32 v211, 3, v4
+    v_or_b32_e32 v208, v208, v209
+    v_or_b32_e32 v208, v208, v210
+    v_or_b32_e32 v4, v208, v211
+    s_branch PERM_DONE
+
+PERM_3:
+    // (b4,b3,b2)->(b3,b4,b2)
+    v_and_b32_e32 v208, 8, v4
+    v_lshlrev_b32_e32 v208, 1, v208          // b3 -> b4
+    v_and_b32_e32 v209, 16, v4
+    v_lshrrev_b32_e32 v209, 1, v209          // b4 -> b3
+    v_and_b32_e32 v210, 4, v4                // b2 -> b2
+    v_and_b32_e32 v211, 3, v4
+    v_or_b32_e32 v208, v208, v209
+    v_or_b32_e32 v208, v208, v210
+    v_or_b32_e32 v4, v208, v211
+    s_branch PERM_DONE
+
+PERM_4:
+    // (b4,b3,b2)->(b2,b3,b4)
+    v_and_b32_e32 v208, 4, v4
+    v_lshlrev_b32_e32 v208, 2, v208          // b2 -> b4
+    v_and_b32_e32 v209, 8, v4                // b3 -> b3
+    v_and_b32_e32 v210, 16, v4
+    v_lshrrev_b32_e32 v210, 2, v210          // b4 -> b2
+    v_and_b32_e32 v211, 3, v4
+    v_or_b32_e32 v208, v208, v209
+    v_or_b32_e32 v208, v208, v210
+    v_or_b32_e32 v4, v208, v211
+    s_branch PERM_DONE
+
+PERM_5:
+    // (b4,b3,b2)->(b4,b2,b3)
+    v_and_b32_e32 v208, 16, v4               // b4 -> b4
+    v_and_b32_e32 v209, 4, v4
+    v_lshlrev_b32_e32 v209, 1, v209          // b2 -> b3
+    v_and_b32_e32 v210, 8, v4
+    v_lshrrev_b32_e32 v210, 1, v210          // b3 -> b2
+    v_and_b32_e32 v211, 3, v4
+    v_or_b32_e32 v208, v208, v209
+    v_or_b32_e32 v208, v208, v210
+    v_or_b32_e32 v4, v208, v211
+    s_branch PERM_DONE
+
+PERM_DONE:
     v_lshlrev_b32_e32 v4, 7, v4           // row_perm * 128
     v_lshlrev_b32_e32 v5, 4, v5           // col_block * 16
     v_add_u32_e32 v2, v4, v5              // byte offset within V
@@ -76,11 +159,75 @@ SKIP_S25_OVERRIDE:
     v_add_u32_e32 v5, 12288, v2           // row + 96
     buffer_load_dwordx4 v[52:55], v5, s[8:11], 0 offen
 
-    // Triton-style LDS write swizzle (bitop3:0x78)
+    // LDS write swizzle selector (for solver/oracle search):
+    //   write_mode = (v_read_cb >> 8) & 3   (s18 is v_read_cb argument)
+    //   0: baseline bitop3:0x78 (Triton-style, C=0x70)
+    //   1: solver-derived tr8lin + mod, masked into 4KB window
+    //   2: solver-derived bitop3:0x7a (C=0x0) [collision-free, high read overlap]
     s_movk_i32 s26, 0x70
-    v_lshlrev_b32_e32 v4, 4, v60          // tid * 16 bytes
+    v_mov_b32_e32 v207, s18
+    v_lshrrev_b32_e32 v207, 8, v207
+    v_and_b32_e32 v207, 3, v207
+
+    // base input (tid * 16 bytes)
+    v_lshlrev_b32_e32 v4, 4, v60
+
+    // if write_mode==2, use bitop3:0x7a with C=0
+    v_cmp_eq_u32_e32 vcc, 2, v207
+    s_cbranch_vccz CHECK_MODE0
+    s_mov_b32 s26, 0
+    v_bitop3_b32 v4, v4, v60, s26 bitop3:0x7a
+    s_branch WRITE_MODE_DONE
+CHECK_MODE0:
+    // mode0 base (bitop3:0x78, C=0x70)
     v_bitop3_b32 v4, v4, v60, s26 bitop3:0x78
+
+    // if write_mode==1, override v4
+    v_cmp_eq_u32_e32 vcc, 1, v207
+    s_cbranch_vccz WRITE_MODE_DONE
+    // tr8_base(tid, s25) into v4
+    v_lshlrev_b32_e32 v2, 6, v60
+    v_lshlrev_b32_e32 v3, 2, v60
+    v_and_b32_e32 v5, 48, v3
+    v_and_b32_e32 v6, 3, v60
+    v_lshlrev_b32_e32 v6, 4, v6
+    v_or_b32_e32 v5, v5, v6
+    v_and_b32_e32 v2, 0xb80, v2
+    v_or_b32_e32 v2, v2, v5
+    v_and_b32_e32 v5, 16, v60
+    v_lshlrev_b32_e32 v6, 3, v60
+    v_and_b32_e32 v6, 8, v6
+    v_bitop3_b32 v4, v2, v5, v6 bitop3:0x36
+    // tr8lin: ^(tid<<3)^(tid<<4)
+    v_lshlrev_b32_e32 v2, 3, v60
+    v_xor_b32_e32 v4, v4, v2
+    v_lshlrev_b32_e32 v2, 4, v60
+    v_xor_b32_e32 v4, v4, v2
+    // ^((tid&3)<<3)
+    v_and_b32_e32 v2, 3, v60
+    v_lshlrev_b32_e32 v2, 3, v2
+    v_xor_b32_e32 v4, v4, v2
+    // ^(((v4 & 0xFFF)>>10)<<4)
+    v_and_b32_e32 v2, 0xfff, v4
+    v_lshrrev_b32_e32 v2, 10, v2
+    v_lshlrev_b32_e32 v2, 4, v2
+    v_xor_b32_e32 v4, v4, v2
+    // constrain to 4KB window, keep 16B alignment
+    v_and_b32_e32 v4, 0xff0, v4
+WRITE_MODE_DONE:
     v_add_u32_e32 v4, V_LDS0, v4
+    // Debug: dump selected write address for lane0 then exit
+    // Trigger when (v_read_cb & 0x80000000) != 0.
+    s_and_b32 s27, s18, 0x80000000
+    s_cmp_eq_u32 s27, 0
+    s_cbranch_scc1 SKIP_WRITE_ADDR_DUMP
+    v_cmp_eq_u32_e32 vcc, 0, v60
+    s_and_saveexec_b64 s[24:25], vcc
+    v_mov_b32_e32 v30, 0
+    buffer_store_dword v4, v30, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_WRITE_ADDR_DUMP:
     s_waitcnt vmcnt(0)
     ds_write_b128 v4, v[40:43]
     ds_write_b128 v4, v[44:47] offset:4096
@@ -527,7 +674,8 @@ SKIP_S25_OVERRIDE:
 .amdhsa_kernel _fwd_fp8_v_read_dump
     .amdhsa_group_segment_fixed_size 50176
     .amdhsa_private_segment_fixed_size 0
-    .amdhsa_kernarg_size 20
+    // 2x pointers (16B) + 13x i32 (52B) = 68B (round up for alignment)
+    .amdhsa_kernarg_size 72
     .amdhsa_user_sgpr_count 2
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
     .amdhsa_system_vgpr_workitem_id 0
@@ -542,17 +690,28 @@ amdhsa.version: [1, 2]
 amdhsa.kernels:
   - .name: _fwd_fp8_v_read_dump
     .symbol: _fwd_fp8_v_read_dump.kd
-    .kernarg_segment_size: 20
+    .kernarg_segment_size: 72
     .group_segment_fixed_size: 50176
     .private_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .wavefront_size: 64
     .sgpr_count: 28
-    .vgpr_count: 240
+    .vgpr_count: 256
     .max_flat_workgroup_size: 256
     .args:
       - {.name: out_ptr, .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global}
       - {.name: v_ptr, .size: 8, .offset: 8, .value_kind: global_buffer, .address_space: global}
       - {.name: stride_vh, .size: 4, .offset: 16, .value_kind: by_value}
-...
+      - {.name: v_read_offset, .size: 4, .offset: 20, .value_kind: by_value}
+      - {.name: v_read_lane_xor, .size: 4, .offset: 24, .value_kind: by_value}
+      - {.name: v_read_base_xor, .size: 4, .offset: 28, .value_kind: by_value}
+      - {.name: v_read_s25_xor, .size: 4, .offset: 32, .value_kind: by_value}
+      - {.name: v_read_v4_add, .size: 4, .offset: 36, .value_kind: by_value}
+      - {.name: v_read_cb, .size: 4, .offset: 40, .value_kind: by_value}
+      - {.name: v_read_s25_mask, .size: 4, .offset: 44, .value_kind: by_value}
+      - {.name: v_read_v2_add, .size: 4, .offset: 48, .value_kind: by_value}
+      - {.name: v_read_v3_xor, .size: 4, .offset: 52, .value_kind: by_value}
+      - {.name: v_read_v3_add, .size: 4, .offset: 56, .value_kind: by_value}
+      - {.name: v_read_base_add, .size: 4, .offset: 60, .value_kind: by_value}
+      - {.name: v_read_s25_override, .size: 4, .offset: 64, .value_kind: by_value}
 .end_amdgpu_metadata

@@ -34,9 +34,9 @@ _fwd_fp8_scaffold:
     s_load_dword s22, s[0:1], 40          // stride_kh
     s_load_dword s23, s[0:1], 44          // stride_vh
     s_load_dword s24, s[0:1], 48          // stride_oh (bytes)
+    s_load_dword s34, s[0:1], 52          // debug_flags
     s_waitcnt lgkmcnt(0)
-    s_mov_b32 s35, s24                    // preserve stride_oh/debug flags
-    s_and_b32 s24, s24, 0x7fffffff        // clear debug flag bit
+    s_mov_b32 s35, s34                    // debug flags (separate from stride)
 
     // Buffer descriptors (size=-1, flags=0x20000)
     s_mov_b32 s6, -1
@@ -264,7 +264,25 @@ SKIP_LDS_BASE_DEBUG:
     buffer_load_dwordx4 v[44:47], v3, s[16:19], s31 offen
     s_waitcnt vmcnt(0)
 
-    // Triton-style LDS write swizzle (bitop3:0x78)
+    // Debug (B-isolation): force V bytes to FP8(1.0) before LDS write.
+    // This guarantees PV A operand is all-ones in LDS, independent of TR8 mapping.
+    // Flag: debug_flags 0x00010000
+    s_and_b32 s36, s35, 0x00010000
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_FORCE_V_ONES
+    v_mov_b32_e32 v40, 0x38383838
+    v_mov_b32_e32 v41, 0x38383838
+    v_mov_b32_e32 v42, 0x38383838
+    v_mov_b32_e32 v43, 0x38383838
+    v_mov_b32_e32 v44, 0x38383838
+    v_mov_b32_e32 v45, 0x38383838
+    v_mov_b32_e32 v46, 0x38383838
+    v_mov_b32_e32 v47, 0x38383838
+SKIP_FORCE_V_ONES:
+
+    // LDS write swizzle for V preload
+    // Default: Triton-style (bitop3:0x78, C=0x70)
+    // Solver option (debug_flags 0x00400000): bitop3:0x7a, C=0x0
     s_movk_i32 s26, 0x70
     v_lshlrev_b32_e32 v4, 4, v60          // tid * 16 bytes
     // Debug: optionally skip swizzle (identity write)
@@ -273,6 +291,14 @@ SKIP_LDS_BASE_DEBUG:
     s_cbranch_scc1 SKIP_V_WRITE_IDENTITY
     s_branch V_WRITE_ADDR_READY
 SKIP_V_WRITE_IDENTITY:
+    // Select swizzle ttbl based on debug_flags
+    s_and_b32 s36, s35, 0x00400000
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 V_SWIZZLE_78
+    s_mov_b32 s26, 0
+    v_bitop3_b32 v4, v4, v60, s26 bitop3:0x7a
+    s_branch V_WRITE_ADDR_READY
+V_SWIZZLE_78:
     v_bitop3_b32 v4, v4, v60, s26 bitop3:0x78
 V_WRITE_ADDR_READY:
     v_add_u32_e32 v4, 41984, v4
@@ -309,18 +335,36 @@ SKIP_V_ADDR_IMM_DEBUG:
     v_mov_b32_e32 v46, v42
     v_mov_b32_e32 v47, v43
 SKIP_V_DUP0:
-    // Debug: write V using TR8 base layout
+    // Debug: write V using solver layout (TR8 coverage booster)
     s_and_b32 s36, s35, 0x00200000
     s_cmp_eq_u32 s36, 0
     s_cbranch_scc1 SKIP_V_TR8_LAYOUT
-    // Solver candidate (two-base, 10 offsets):
-    // base0 = (tid<<3) ^ (tid<<7) ^ 0x0
-    // base1 = base0 ^ 0x20
-    v_lshlrev_b32_e32 v188, 3, v60
-    v_lshlrev_b32_e32 v189, 7, v60
-    v_xor_b32_e32 v188, v188, v189
+    // Solver result (tools/tr8_multi_base_solver.py, extended read set, lanes=256, offset_count=10):
+    //   base0 = tr8_base(tid, s25=0xb80) ^ 0x0
+    //   base1 = (tid<<3) ^ (tid<<5) ^ 0x0
+    //   offsets = (0,256,512,768,1024,1152,1280,1408,2048,2176)
+    //
+    // base0 = tr8_base(tid)
+    v_lshlrev_b32_e32 v2, 6, v60
+    v_lshlrev_b32_e32 v3, 2, v60
+    v_and_b32_e32 v5, 48, v3
+    v_and_b32_e32 v6, 3, v60
+    v_lshlrev_b32_e32 v6, 4, v6
+    v_or_b32_e32 v5, v5, v6
+    v_and_b32_e32 v2, 0xb80, v2
+    v_or_b32_e32 v2, v2, v5
+    v_and_b32_e32 v5, 16, v60
+    v_lshlrev_b32_e32 v6, 3, v60
+    v_and_b32_e32 v6, 8, v6
+    v_bitop3_b32 v188, v2, v5, v6 bitop3:0x36
     v_add_u32_e32 v188, 41984, v188
-    // base0 writes
+    // base1 = (tid<<3)^(tid<<5)
+    v_lshlrev_b32_e32 v189, 3, v60
+    v_lshlrev_b32_e32 v190, 5, v60
+    v_xor_b32_e32 v189, v189, v190
+    v_add_u32_e32 v189, 41984, v189
+
+    // writes at base0
     ds_write_b128 v188, v[40:43] offset:0
     ds_write_b128 v188, v[44:47] offset:256
     ds_write_b128 v188, v[40:43] offset:512
@@ -331,18 +375,18 @@ SKIP_V_DUP0:
     ds_write_b128 v188, v[44:47] offset:1408
     ds_write_b128 v188, v[40:43] offset:2048
     ds_write_b128 v188, v[44:47] offset:2176
-    // base1 writes
-    v_xor_b32_e32 v188, 0x20, v188
-    ds_write_b128 v188, v[40:43] offset:0
-    ds_write_b128 v188, v[44:47] offset:256
-    ds_write_b128 v188, v[40:43] offset:512
-    ds_write_b128 v188, v[44:47] offset:768
-    ds_write_b128 v188, v[40:43] offset:1024
-    ds_write_b128 v188, v[44:47] offset:1152
-    ds_write_b128 v188, v[40:43] offset:1280
-    ds_write_b128 v188, v[44:47] offset:1408
-    ds_write_b128 v188, v[40:43] offset:2048
-    ds_write_b128 v188, v[44:47] offset:2176
+
+    // writes at base1
+    ds_write_b128 v189, v[40:43] offset:0
+    ds_write_b128 v189, v[44:47] offset:256
+    ds_write_b128 v189, v[40:43] offset:512
+    ds_write_b128 v189, v[44:47] offset:768
+    ds_write_b128 v189, v[40:43] offset:1024
+    ds_write_b128 v189, v[44:47] offset:1152
+    ds_write_b128 v189, v[40:43] offset:1280
+    ds_write_b128 v189, v[44:47] offset:1408
+    ds_write_b128 v189, v[40:43] offset:2048
+    ds_write_b128 v189, v[44:47] offset:2176
     s_branch SKIP_V_TR8_WRITES
 SKIP_V_TR8_LAYOUT:
     ds_write_b128 v4, v[40:43]
@@ -391,7 +435,28 @@ K_LOOP:
     s_waitcnt lgkmcnt(0)
     v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
 
-    // Pack P0 (tile 0) to FP8 (v48-v51) - Triton-style
+    // Debug: dump QK accumulators (v32..v47) after tile0 MFMA and exit.
+    // Flag: debug_flags 0x00040000
+    s_and_b32 s36, s35, 0x00040000
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_DUMP_QK_ACC
+    v_lshlrev_b32_e32 v180, 6, v60        // tid * 64 bytes
+    buffer_store_dwordx4 v[32:35], v180, s[4:7], 0 offen
+    v_add_u32_e32 v181, 16, v180
+    buffer_store_dwordx4 v[36:39], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 32, v180
+    buffer_store_dwordx4 v[40:43], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 48, v180
+    buffer_store_dwordx4 v[44:47], v181, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_DUMP_QK_ACC:
+
+    // Pack P0 (tile 0) to FP8 (v48-v51) - Triton-style (writes both halves explicitly)
+    v_mov_b32_e32 v48, 0
+    v_mov_b32_e32 v49, 0
+    v_mov_b32_e32 v50, 0
+    v_mov_b32_e32 v51, 0
     s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
     v_cvt_scalef32_pk_fp8_f32 v48, v32, v33, 1.0
     v_cvt_scalef32_pk_fp8_f32 v48, v34, v35, 1.0 op_sel:[0,0,0,1]
@@ -405,7 +470,38 @@ K_LOOP:
     v_cvt_scalef32_pk_fp8_f32 v51, v44, v45, 1.0
     v_cvt_scalef32_pk_fp8_f32 v51, v46, v47, 1.0 op_sel:[0,0,0,1]
 
-    // Compute Q/K read addresses for tile 1
+    // Debug: dump tile0 QK accumulators (v32..v47) and packed tile0 P regs (v48..v51) and exit.
+    // Layout per thread: 20 dwords (80B) = [v32..v47, v48..v51]
+    // Flag: debug_flags 0x00000100
+    s_and_b32 s36, s35, 0x00000100
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_DUMP_TILE0_QK_AND_PACK
+    v_lshlrev_b32_e32 v180, 6, v60        // tid * 64
+    v_lshlrev_b32_e32 v181, 4, v60        // tid * 16
+    v_add_u32_e32 v180, v180, v181        // tid * 80
+    buffer_store_dwordx4 v[32:35], v180, s[4:7], 0 offen
+    v_add_u32_e32 v181, 16, v180
+    buffer_store_dwordx4 v[36:39], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 32, v180
+    buffer_store_dwordx4 v[40:43], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 48, v180
+    buffer_store_dwordx4 v[44:47], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 64, v180
+    buffer_store_dwordx4 v[48:51], v181, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_DUMP_TILE0_QK_AND_PACK:
+
+    // Recompute K row offset (v18) from lane_id (v10) to avoid relying on long-lived v18.
+    // mfma_row = (lane & 15) + 16 * ((lane >> 4) & 1)
+    v_and_b32_e32 v2, 15, v10
+    v_lshrrev_b32_e32 v3, 4, v10
+    v_and_b32_e32 v3, 1, v3
+    v_lshlrev_b32_e32 v3, 4, v3
+    v_add_u32_e32 v2, v2, v3
+    v_lshlrev_b32_e32 v18, 7, v2         // row * 128
+
+    // Compute Q/K read addresses for tile 1 (K tile1)
     v_add_u32_e32 v26, v31, v18                 // K base + row
     v_add_u32_e32 v27, v26, v11                 // K addr1
     v_add_u32_e32 v28, v26, v12                 // K addr2
@@ -428,7 +524,38 @@ K_LOOP:
     s_waitcnt lgkmcnt(0)
     v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
 
+    // Debug: dump QK accumulators (v32..v47) after tile1 MFMA and exit.
+    // Flag: debug_flags 0x00001000
+    s_and_b32 s36, s35, 0x00001000
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_DUMP_QK_ACC1
+    // Layout (per thread, 80B):
+    //   +0:  v26..v29 (K base+row, K addr1, K addr2, K tile0 base)
+    //   +16: v32..v35
+    //   +32: v36..v39
+    //   +48: v40..v43
+    //   +64: v44..v47
+    v_lshlrev_b32_e32 v180, 6, v60        // tid * 64
+    v_lshlrev_b32_e32 v181, 5, v60        // tid * 32
+    v_add_u32_e32 v180, v180, v181        // tid * 96 (enough spacing)
+    buffer_store_dwordx4 v[26:29], v180, s[4:7], 0 offen
+    v_add_u32_e32 v181, 16, v180
+    buffer_store_dwordx4 v[32:35], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 32, v180
+    buffer_store_dwordx4 v[36:39], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 48, v180
+    buffer_store_dwordx4 v[40:43], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 64, v180
+    buffer_store_dwordx4 v[44:47], v181, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_DUMP_QK_ACC1:
+
     // Pack P1 (tile 1) to FP8 (v52-v55) - Triton-style
+    v_mov_b32_e32 v52, 0
+    v_mov_b32_e32 v53, 0
+    v_mov_b32_e32 v54, 0
+    v_mov_b32_e32 v55, 0
     s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
     v_cvt_scalef32_pk_fp8_f32 v52, v32, v33, 1.0
     v_cvt_scalef32_pk_fp8_f32 v52, v34, v35, 1.0 op_sel:[0,0,0,1]
@@ -441,6 +568,46 @@ K_LOOP:
     s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
     v_cvt_scalef32_pk_fp8_f32 v55, v44, v45, 1.0
     v_cvt_scalef32_pk_fp8_f32 v55, v46, v47, 1.0 op_sel:[0,0,0,1]
+
+    // Debug: dump QK accumulators (v32..v47) and packed P regs (v48..v55) and exit.
+    // This is used for rigorous random-input B-path validation in Python.
+    // Layout per thread: 24 dwords (96B) = [v32..v47, v48..v55]
+    // Flag: debug_flags 0x00000200
+    s_and_b32 s36, s35, 0x00000200
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_DUMP_QK_AND_PACKEDP
+    v_lshlrev_b32_e32 v180, 6, v60        // tid * 64
+    v_lshlrev_b32_e32 v181, 5, v60        // tid * 32
+    v_add_u32_e32 v180, v180, v181        // tid * 96
+    // v32..v47 (16 dwords)
+    buffer_store_dwordx4 v[32:35], v180, s[4:7], 0 offen
+    v_add_u32_e32 v181, 16, v180
+    buffer_store_dwordx4 v[36:39], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 32, v180
+    buffer_store_dwordx4 v[40:43], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 48, v180
+    buffer_store_dwordx4 v[44:47], v181, s[4:7], 0 offen
+    // v48..v55 (8 dwords)
+    v_add_u32_e32 v181, 64, v180
+    buffer_store_dwordx4 v[48:51], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 80, v180
+    buffer_store_dwordx4 v[52:55], v181, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_DUMP_QK_AND_PACKEDP:
+
+    // Debug: dump packed P regs (v48..v55) BEFORE mix and exit.
+    // Flag: debug_flags 0x00000800
+    s_and_b32 s36, s35, 0x00000800
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_DUMP_PACKED_P
+    v_lshlrev_b32_e32 v180, 5, v60        // tid * 32 bytes
+    buffer_store_dwordx4 v[48:51], v180, s[4:7], 0 offen
+    v_add_u32_e32 v181, 16, v180
+    buffer_store_dwordx4 v[52:55], v181, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_DUMP_PACKED_P:
 
     // Triton-style lane mix for P -> B operand layout (verbatim mapping with temps)
     v_lshlrev_b32_e32 v237, 2, v10
@@ -470,6 +637,7 @@ K_LOOP:
     v_cndmask_b32_e32 v200, v201, v200, vcc
     v_cndmask_b32_e32 v201, v209, v201, vcc
     ds_bpermute_b32 v209, v237, v202             // t83
+    s_waitcnt lgkmcnt(0)
 
     // Mix stage 2 (Triton)
     v_cndmask_b32_e32 v202, v203, v208, vcc
@@ -488,6 +656,21 @@ K_LOOP:
     v_mov_b32_e32 v53, v205
     v_mov_b32_e32 v54, v206
     v_mov_b32_e32 v55, v207
+
+    // Debug: dump B operand regs (post-mix v48..v55) and exit.
+    // Flag: debug_flags 0x00000400
+    s_and_b32 s36, s35, 0x00000400
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_DUMP_B_POSTMIX
+    // Ensure all ds_bpermute traffic is complete before dumping.
+    s_waitcnt lgkmcnt(0)
+    v_lshlrev_b32_e32 v180, 5, v60        // tid * 32 bytes
+    buffer_store_dwordx4 v[48:51], v180, s[4:7], 0 offen
+    v_add_u32_e32 v181, 16, v180
+    buffer_store_dwordx4 v[52:55], v181, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_DUMP_B_POSTMIX:
 
     s_nop 0
     // Mixed P is ready for use as MFMA B operand.
@@ -4631,10 +4814,26 @@ P_A_TRANSPOSE:
     v_cndmask_b32_e32 v54, v54, v214, vcc
     v_cndmask_b32_e32 v55, v55, v215, vcc
 
+    // Debug: dump B operand regs (packed/mixed P) and exit.
+    // Flag: debug_flags 0x00020000
+    s_and_b32 s36, s35, 0x00020000
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_DUMP_B
+    v_lshlrev_b32_e32 v180, 5, v60        // tid * 32 bytes
+    buffer_store_dwordx4 v[48:51], v180, s[4:7], 0 offen
+    v_add_u32_e32 v181, 16, v180
+    buffer_store_dwordx4 v[52:55], v181, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_DUMP_B:
+
 PV_MFMA_START:
     // PV MFMA using TR8 V reads (K=64, tiles 0+1)
-    v_lshlrev_b32_e32 v2, 6, v60
-    v_lshlrev_b32_e32 v3, 2, v60
+    // Solver-guided tweak (from v_read_dump oracle best in small grid):
+    // add +1 to the base lane before forming (tid<<6, tid<<2) terms.
+    v_add_u32_e32 v61, 1, v60
+    v_lshlrev_b32_e32 v2, 6, v61
+    v_lshlrev_b32_e32 v3, 2, v61
     v_and_b32_e32 v4, 48, v3
     v_and_b32_e32 v180, 3, v60
     v_lshlrev_b32_e32 v180, 4, v180
@@ -9448,7 +9647,7 @@ K_LOOP_END:
 .amdhsa_kernel _fwd_fp8_scaffold
     .amdhsa_group_segment_fixed_size 50176
     .amdhsa_private_segment_fixed_size 0
-    .amdhsa_kernarg_size 52
+    .amdhsa_kernarg_size 56
     .amdhsa_user_sgpr_count 2
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
     .amdhsa_system_sgpr_workgroup_id_x 1
@@ -9465,13 +9664,13 @@ amdhsa.version: [1, 2]
 amdhsa.kernels:
   - .name: _fwd_fp8_scaffold
     .symbol: _fwd_fp8_scaffold.kd
-    .kernarg_segment_size: 52
+    .kernarg_segment_size: 56
     .group_segment_fixed_size: 50176
     .private_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .wavefront_size: 64
     .sgpr_count: 44
-    .vgpr_count: 240
+    .vgpr_count: 256
     .max_flat_workgroup_size: 512
     .args:
       - {.name: O_ptr, .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global}
@@ -9483,5 +9682,6 @@ amdhsa.kernels:
       - {.name: stride_kh, .size: 4, .offset: 40, .value_kind: by_value}
       - {.name: stride_vh, .size: 4, .offset: 44, .value_kind: by_value}
       - {.name: stride_oh, .size: 4, .offset: 48, .value_kind: by_value}
+      - {.name: debug_flags, .size: 4, .offset: 52, .value_kind: by_value}
 ...
 .end_amdgpu_metadata

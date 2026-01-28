@@ -66,3 +66,12 @@ backup/
 hsa/gfx950/fmha_v3_fwd_fp8/*_dump.csv
 hsa/gfx950/fmha_v3_fwd_fp8/*_mapping*.csv
 hsa/gfx950/fmha_v3_fwd_fp8/v_read_*.csv
+
+# PDFs (keep text conversions instead)
+*.pdf
+
+# Triton cache artifacts / binaries
+*.hsaco
+
+# Specific local dump artifacts
+hsa/gfx950/fmha_v3_fwd_fp8/scaffold_tr8_addrs.csv

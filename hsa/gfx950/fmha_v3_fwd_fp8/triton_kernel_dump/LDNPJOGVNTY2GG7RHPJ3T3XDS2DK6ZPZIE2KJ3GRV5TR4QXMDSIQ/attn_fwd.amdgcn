@@ -1,0 +1,2336 @@
+	.amdgcn_target "amdgcn-amd-amdhsa--gfx950"
+	.amdhsa_code_object_version 5
+	.text
+	.globl	attn_fwd                        ; -- Begin function attn_fwd
+	.p2align	8
+	.type	attn_fwd,@function
+attn_fwd:                               ; @attn_fwd
+.Lfunc_begin0:
+	.cfi_sections .debug_frame
+	.cfi_startproc
+; %bb.17:
+	.file	1 "/sgl-workspace/aiter/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd" "fwd_prefill.py"
+	.loc	1 1046 0 prologue_end           ; fwd_prefill.py:1046:0
+	s_load_dwordx2 s[2:3], s[0:1], 0x0
+	s_load_dwordx8 s[4:11], s[0:1], 0x8
+	s_load_dwordx4 s[12:15], s[0:1], 0x28
+	s_waitcnt lgkmcnt(0)
+	s_branch .LBB0_0
+	.loc	1 0 0 is_stmt 0                 ; :0:0
+.Ltmp0:
+	.p2align	8
+; %bb.18:
+.LBB0_0:
+.Ltmp1:
+	.loc	1 1198 36 is_stmt 1             ; fwd_prefill.py:1198:36
+	s_mul_i32 s22, s14, s16
+	.loc	1 1198 28 is_stmt 0             ; fwd_prefill.py:1198:28
+	s_ashr_i32 s23, s22, 31
+	.loc	1 1141 23 is_stmt 1             ; fwd_prefill.py:1141:23
+	s_lshl_b32 s18, s18, 7
+	.loc	1 1198 28                       ; fwd_prefill.py:1198:28
+	s_lshl_b64 s[22:23], s[22:23], 2
+	s_mov_b32 s20, s17
+	s_add_u32 s14, s8, s22
+	s_addc_u32 s23, s9, s23
+	.loc	1 1198 57 is_stmt 0             ; fwd_prefill.py:1198:57
+	s_ashr_i32 s21, s20, 31
+	s_lshl_b64 s[8:9], s[20:21], 2
+	s_add_u32 s22, s14, s8
+	.loc	1 1200 48 is_stmt 1             ; fwd_prefill.py:1200:48
+	s_mul_i32 s14, s15, s16
+	.loc	1 1198 57                       ; fwd_prefill.py:1198:57
+	s_addc_u32 s23, s23, s9
+	.loc	1 1200 40                       ; fwd_prefill.py:1200:40
+	s_ashr_i32 s15, s14, 31
+	s_load_dword s19, s[0:1], 0x38
+	s_load_dwordx2 s[24:25], s[0:1], 0x50
+	s_load_dword s17, s[0:1], 0x58
+	s_lshl_b64 s[14:15], s[14:15], 2
+	s_add_u32 s10, s10, s14
+	s_addc_u32 s11, s11, s15
+	.loc	1 1200 69 is_stmt 0             ; fwd_prefill.py:1200:69
+	s_add_u32 s28, s10, s8
+	.loc	1 1201 48 is_stmt 1             ; fwd_prefill.py:1201:48
+	s_waitcnt lgkmcnt(0)
+	s_mul_i32 s10, s19, s16
+	.loc	1 1200 69                       ; fwd_prefill.py:1200:69
+	s_addc_u32 s29, s11, s9
+	.loc	1 1201 40                       ; fwd_prefill.py:1201:40
+	s_ashr_i32 s11, s10, 31
+	s_lshl_b64 s[10:11], s[10:11], 2
+	s_add_u32 s10, s12, s10
+	s_addc_u32 s11, s13, s11
+	.loc	1 1201 69 is_stmt 0             ; fwd_prefill.py:1201:69
+	s_add_u32 s30, s10, s8
+	.loc	1 1271 20 is_stmt 1             ; fwd_prefill.py:1271:20
+	s_mul_i32 s8, s24, s16
+	.loc	1 1201 69                       ; fwd_prefill.py:1201:69
+	s_addc_u32 s31, s11, s9
+	.loc	1 1271 12                       ; fwd_prefill.py:1271:12
+	s_ashr_i32 s9, s8, 31
+	s_add_u32 s2, s2, s8
+	.loc	1 1271 42 is_stmt 0             ; fwd_prefill.py:1271:42
+	s_mul_i32 s8, s25, s20
+	.loc	1 1271 12                       ; fwd_prefill.py:1271:12
+	s_addc_u32 s3, s3, s9
+	.loc	1 1271 32                       ; fwd_prefill.py:1271:32
+	s_ashr_i32 s9, s8, 31
+	s_add_u32 s2, s2, s8
+	.loc	1 1273 24 is_stmt 1             ; fwd_prefill.py:1273:24
+	s_mul_i32 s8, s17, s18
+	.loc	1 1141 46                       ; fwd_prefill.py:1141:46
+	v_lshrrev_b32_e32 v19, 3, v0
+	.loc	1 1271 32                       ; fwd_prefill.py:1271:32
+	s_addc_u32 s3, s3, s9
+	.loc	1 1273 24                       ; fwd_prefill.py:1273:24
+	s_ashr_i32 s9, s8, 31
+	.loc	1 1141 33                       ; fwd_prefill.py:1141:33
+	v_or_b32_e32 v1, s18, v19
+	.loc	1 1273 24                       ; fwd_prefill.py:1273:24
+	s_add_u32 s24, s2, s8
+	.loc	1 1273 64 is_stmt 0             ; fwd_prefill.py:1273:64
+	v_lshlrev_b32_e32 v20, 4, v0
+	s_movk_i32 s8, 0x400
+	.loc	1 1273 24                       ; fwd_prefill.py:1273:24
+	s_addc_u32 s25, s3, s9
+	.loc	1 1273 64                       ; fwd_prefill.py:1273:64
+	v_and_b32_e32 v18, 0x70, v20
+	.loc	1 1306 36 is_stmt 1             ; fwd_prefill.py:1306:36
+	v_cmp_gt_i32_e32 vcc, s8, v1
+	v_mov_b32_e32 v2, 0
+	v_mov_b32_e32 v6, 0
+	v_mov_b32_e32 v7, 0
+	v_mov_b32_e32 v8, 0
+	v_mov_b32_e32 v9, 0
+	.loc	1 1309 16                       ; fwd_prefill.py:1309:16
+	s_and_saveexec_b64 s[2:3], vcc
+	s_cbranch_execz .LBB0_2
+; %bb.1:
+	.loc	1 0 16 is_stmt 0                ; fwd_prefill.py:0:16
+	v_mad_u64_u32 v[4:5], s[10:11], s17, v19, v[18:19]
+	v_ashrrev_i32_e32 v5, 31, v4
+	v_lshl_add_u64 v[4:5], s[24:25], 0, v[4:5]
+	.loc	1 1309 16                       ; fwd_prefill.py:1309:16
+	global_load_dwordx4 v[6:9], v[4:5], off
+.LBB0_2:
+	.loc	1 0 16                          ; fwd_prefill.py:0:16
+	s_or_b64 exec, exec, s[2:3]
+	.loc	1 1141 46 is_stmt 1             ; fwd_prefill.py:1141:46
+	v_or_b32_e32 v1, 32, v19
+	.loc	1 1141 33 is_stmt 0             ; fwd_prefill.py:1141:33
+	v_or_b32_e32 v3, s18, v1
+	.loc	1 1273 24 is_stmt 1             ; fwd_prefill.py:1273:24
+	v_mul_lo_u32 v1, s17, v1
+	.loc	1 1306 36                       ; fwd_prefill.py:1306:36
+	v_cmp_gt_i32_e32 vcc, s8, v3
+	v_mov_b32_e32 v3, 0
+	v_mov_b32_e32 v4, 0
+	v_mov_b32_e32 v5, 0
+	.loc	1 1309 16                       ; fwd_prefill.py:1309:16
+	s_and_saveexec_b64 s[2:3], vcc
+	s_cbranch_execz .LBB0_4
+; %bb.3:
+	.loc	1 1273 54                       ; fwd_prefill.py:1273:54
+	v_add_u32_e32 v2, v1, v18
+	.loc	1 1309 16                       ; fwd_prefill.py:1309:16
+	v_ashrrev_i32_e32 v3, 31, v2
+	v_lshl_add_u64 v[2:3], s[24:25], 0, v[2:3]
+	global_load_dwordx4 v[2:5], v[2:3], off
+.LBB0_4:
+	.loc	1 0 16 is_stmt 0                ; fwd_prefill.py:0:16
+	s_or_b64 exec, exec, s[2:3]
+	.loc	1 1141 33 is_stmt 1             ; fwd_prefill.py:1141:33
+	v_or3_b32 v10, v19, s18, 64
+	s_movk_i32 s33, 0x400
+	.loc	1 1306 36                       ; fwd_prefill.py:1306:36
+	v_cmp_gt_i32_e32 vcc, s33, v10
+	v_mov_b32_e32 v10, 0
+	v_mov_b32_e32 v14, 0
+	v_mov_b32_e32 v15, 0
+	v_mov_b32_e32 v16, 0
+	v_mov_b32_e32 v17, 0
+	.loc	1 1309 16                       ; fwd_prefill.py:1309:16
+	s_and_saveexec_b64 s[2:3], vcc
+	s_cbranch_execz .LBB0_6
+; %bb.5:
+	.loc	1 1273 24                       ; fwd_prefill.py:1273:24
+	s_lshl_b32 s8, s17, 5
+	.loc	1 1273 54 is_stmt 0             ; fwd_prefill.py:1273:54
+	v_add3_u32 v12, v1, s8, v18
+	.loc	1 1309 16 is_stmt 1             ; fwd_prefill.py:1309:16
+	v_ashrrev_i32_e32 v13, 31, v12
+	v_lshl_add_u64 v[12:13], s[24:25], 0, v[12:13]
+	global_load_dwordx4 v[14:17], v[12:13], off
+.LBB0_6:
+	.loc	1 0 16 is_stmt 0                ; fwd_prefill.py:0:16
+	s_or_b64 exec, exec, s[2:3]
+	s_load_dword s19, s[22:23], 0x0
+	s_load_dword s21, s[28:29], 0x0
+	s_load_dwordx4 s[8:11], s[0:1], 0x40
+	s_load_dwordx4 s[12:15], s[0:1], 0x5c
+	s_load_dwordx2 s[26:27], s[0:1], 0x6c
+	s_load_dword s2, s[30:31], 0x0
+	.loc	1 1141 46 is_stmt 1             ; fwd_prefill.py:1141:46
+	v_or_b32_e32 v21, 0x60, v19
+	.loc	1 1141 33 is_stmt 0             ; fwd_prefill.py:1141:33
+	v_or_b32_e32 v1, s18, v21
+	.loc	1 1306 36 is_stmt 1             ; fwd_prefill.py:1306:36
+	v_cmp_gt_i32_e32 vcc, s33, v1
+	v_mov_b32_e32 v11, 0
+	v_mov_b32_e32 v12, 0
+	v_mov_b32_e32 v13, 0
+	.loc	1 1309 16                       ; fwd_prefill.py:1309:16
+	s_and_saveexec_b64 s[22:23], vcc
+	s_cbranch_execz .LBB0_8
+; %bb.7:
+	.loc	1 1273 54                       ; fwd_prefill.py:1273:54
+	v_mad_u64_u32 v[10:11], s[28:29], s17, v21, v[18:19]
+	.loc	1 1309 16                       ; fwd_prefill.py:1309:16
+	v_ashrrev_i32_e32 v11, 31, v10
+	v_lshl_add_u64 v[10:11], s[24:25], 0, v[10:11]
+	global_load_dwordx4 v[10:13], v[10:11], off
+.LBB0_8:
+	.loc	1 0 16 is_stmt 0                ; fwd_prefill.py:0:16
+	s_or_b64 exec, exec, s[22:23]
+	s_load_dwordx2 s[24:25], s[0:1], 0xa8
+	s_load_dword s17, s[0:1], 0x7c
+	s_load_dwordx2 s[22:23], s[0:1], 0x74
+	.loc	1 1275 20 is_stmt 1             ; fwd_prefill.py:1275:20
+	s_waitcnt lgkmcnt(0)
+	s_mul_i32 s0, s12, s16
+	.loc	1 1275 12 is_stmt 0             ; fwd_prefill.py:1275:12
+	s_ashr_i32 s1, s0, 31
+	s_add_u32 s0, s4, s0
+	.loc	1 1275 42                       ; fwd_prefill.py:1275:42
+	s_mul_i32 s3, s13, s20
+	.loc	1 1275 12                       ; fwd_prefill.py:1275:12
+	s_addc_u32 s1, s5, s1
+	.loc	1 1275 32                       ; fwd_prefill.py:1275:32
+	s_ashr_i32 s4, s3, 31
+	s_add_u32 s12, s0, s3
+	s_addc_u32 s13, s1, s4
+	.loc	1 1277 57 is_stmt 1             ; fwd_prefill.py:1277:57
+	v_mad_u64_u32 v[162:163], s[0:1], s14, v19, v[18:19]
+	v_mad_u64_u32 v[168:169], s[0:1], s14, v21, v[18:19]
+	s_lshl_b32 s3, s14, 5
+	.loc	1 1279 20                       ; fwd_prefill.py:1279:20
+	s_mul_i32 s0, s15, s16
+	.loc	1 1277 57                       ; fwd_prefill.py:1277:57
+	v_add_u32_e32 v164, s3, v162
+	.loc	1 1279 12                       ; fwd_prefill.py:1279:12
+	s_ashr_i32 s1, s0, 31
+	.loc	1 1277 57                       ; fwd_prefill.py:1277:57
+	v_add_u32_e32 v166, s3, v164
+	.loc	1 1279 12                       ; fwd_prefill.py:1279:12
+	s_add_u32 s0, s6, s0
+	.loc	1 1279 42 is_stmt 0             ; fwd_prefill.py:1279:42
+	s_mul_i32 s3, s26, s20
+	.loc	1 1279 12                       ; fwd_prefill.py:1279:12
+	s_addc_u32 s1, s7, s1
+	.loc	1 1279 32                       ; fwd_prefill.py:1279:32
+	s_ashr_i32 s4, s3, 31
+	s_add_u32 s6, s0, s3
+	s_addc_u32 s7, s1, s4
+	.loc	1 1281 54 is_stmt 1             ; fwd_prefill.py:1281:54
+	v_mad_u64_u32 v[170:171], s[0:1], s27, v19, v[18:19]
+	v_mad_u64_u32 v[176:177], s[0:1], s27, v21, v[18:19]
+	.loc	1 1309 16                       ; fwd_prefill.py:1309:16
+	v_and_b32_e32 v18, 0x70, v0
+	s_movk_i32 s0, 0xff0
+	v_bitop3_b32 v18, v20, v18, s0 bitop3:0x6c
+	v_add_u32_e32 v181, 0, v18
+	.loc	1 1141 46                       ; fwd_prefill.py:1141:46
+	v_and_b32_e32 v22, 31, v0
+	.loc	1 1309 16                       ; fwd_prefill.py:1309:16
+	s_waitcnt vmcnt(0)
+	ds_write_b128 v181, v[6:9]
+	ds_write_b128 v181, v[2:5] offset:4096
+	ds_write_b128 v181, v[14:17] offset:8192
+	ds_write_b128 v181, v[10:13] offset:12288
+	v_lshlrev_b32_e32 v4, 3, v0
+	.loc	1 1141 46                       ; fwd_prefill.py:1141:46
+	v_and_b32_e32 v23, 0xc0, v0
+	.loc	1 1273 64                       ; fwd_prefill.py:1273:64
+	v_and_b32_e32 v1, 32, v0
+	.loc	1 1309 16                       ; fwd_prefill.py:1309:16
+	v_lshlrev_b32_e32 v2, 7, v22
+	v_and_b32_e32 v5, 0x70, v4
+	v_lshlrev_b32_e32 v3, 6, v23
+	v_lshrrev_b32_e32 v6, 1, v1
+	v_or_b32_e32 v7, v2, v5
+	v_bitop3_b32 v3, v7, v6, v3 bitop3:0x36
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	scratch_store_dword off, v22, off offset:44 ; 4-byte Folded Spill
+	scratch_store_dword off, v23, off offset:48 ; 4-byte Folded Spill
+	v_add_u32_e32 v7, 0, v3
+	v_xad_u32 v8, v3, 32, 0
+	ds_read_b128 v[82:85], v7
+	ds_read_b128 v[86:89], v8
+	v_xad_u32 v7, v3, 64, 0
+	v_xor_b32_e32 v3, 0x60, v3
+	v_bitop3_b32 v182, v2, v6, v5 bitop3:0x36
+	v_lshlrev_b32_e32 v6, 2, v0
+	v_add_u32_e32 v3, 0, v3
+	ds_read_b128 v[90:93], v7
+	ds_read_b128 v[94:97], v3
+	v_xor_b32_e32 v183, 0x80, v6
+	v_lshlrev_b32_e32 v7, 6, v0
+	v_and_b32_e32 v6, 48, v6
+	s_movk_i32 s0, 0xb80
+	v_and_or_b32 v6, v7, s0, v6
+	v_and_b32_e32 v4, 8, v4
+	v_and_b32_e32 v7, 16, v0
+	v_bitop3_b32 v4, v6, v7, v4 bitop3:0x36
+	v_xor_b32_e32 v6, 32, v4
+	scratch_store_dword off, v0, off offset:40 ; 4-byte Folded Spill
+	v_xor_b32_e32 v7, 0x460, v4
+	v_add_u32_e32 v0, 0, v6
+	v_xor_b32_e32 v8, 0x1020, v4
+	scratch_store_dword off, v0, off        ; 4-byte Folded Spill
+	v_add_u32_e32 v0, 0, v7
+	v_xor_b32_e32 v9, 0x1460, v4
+	scratch_store_dword off, v0, off offset:4 ; 4-byte Folded Spill
+	v_add_u32_e32 v0, 0, v8
+	v_xor_b32_e32 v10, 0x2020, v4
+	scratch_store_dword off, v0, off offset:8 ; 4-byte Folded Spill
+	v_add_u32_e32 v0, 0, v9
+	v_xor_b32_e32 v11, 0x2460, v4
+	scratch_store_dword off, v0, off offset:12 ; 4-byte Folded Spill
+	v_add_u32_e32 v0, 0, v10
+	v_xor_b32_e32 v12, 0x3020, v4
+	scratch_store_dword off, v0, off offset:16 ; 4-byte Folded Spill
+	v_add_u32_e32 v0, 0, v11
+	.loc	1 1281 24                       ; fwd_prefill.py:1281:24
+	s_lshl_b32 s3, s27, 5
+	v_xor_b32_e32 v13, 0x3460, v4
+	scratch_store_dword off, v0, off offset:20 ; 4-byte Folded Spill
+	v_add_u32_e32 v0, 0, v12
+	.loc	1 1281 54 is_stmt 0             ; fwd_prefill.py:1281:54
+	v_add_u32_e32 v172, s3, v170
+	v_xor_b32_e32 v14, 0x60, v4
+	scratch_store_dword off, v0, off offset:24 ; 4-byte Folded Spill
+	v_add_u32_e32 v0, 0, v13
+	v_add_u32_e32 v174, s3, v172
+	.loc	1 1309 16 is_stmt 1             ; fwd_prefill.py:1309:16
+	s_mov_b32 s36, 0
+	v_xor_b32_e32 v2, 32, v182
+	v_xor_b32_e32 v3, 64, v182
+	v_xor_b32_e32 v5, 0x60, v182
+	v_xor_b32_e32 v15, 0x420, v4
+	v_xor_b32_e32 v16, 0x1060, v4
+	v_xor_b32_e32 v17, 0x1420, v4
+	v_xor_b32_e32 v18, 0x2060, v4
+	v_xor_b32_e32 v19, 0x2420, v4
+	v_xor_b32_e32 v20, 0x3060, v4
+	v_xor_b32_e32 v21, 0x3420, v4
+	scratch_store_dword off, v0, off offset:28 ; 4-byte Folded Spill
+	v_add_u32_e32 v0, 0, v14
+	v_mov_b32_e32 v156, 0
+	v_ashrrev_i32_e32 v163, 31, v162
+	v_ashrrev_i32_e32 v165, 31, v164
+	v_ashrrev_i32_e32 v167, 31, v166
+	v_ashrrev_i32_e32 v169, 31, v168
+	v_ashrrev_i32_e32 v171, 31, v170
+	v_ashrrev_i32_e32 v173, 31, v172
+	v_ashrrev_i32_e32 v175, 31, v174
+	v_ashrrev_i32_e32 v177, 31, v176
+	v_cmp_eq_u32_e32 vcc, 0, v1
+	v_add_u32_e32 v184, 0, v4
+.Ltmp2:
+	.loc	1 364 60                        ; fwd_prefill.py:364:60 @[ fwd_prefill.py:1430:12 ]
+	s_mov_b32 s3, s2
+	.loc	1 225 47                        ; fwd_prefill.py:225:47 @[ fwd_prefill.py:1430:12 ]
+	s_lshl_b32 s15, s27, 7
+	s_lshl_b32 s14, s14, 7
+	s_movk_i32 s26, 0xff80
+	v_add_u32_e32 v185, 0, v2
+	v_add_u32_e32 v186, 0, v3
+	v_add_u32_e32 v187, 0, v5
+	s_mov_b32 s37, s36
+	s_mov_b32 s38, s36
+	s_mov_b32 s39, s36
+	s_mov_b32 s40, s36
+	s_mov_b32 s41, s36
+	s_mov_b32 s42, s36
+	s_mov_b32 s43, s36
+	s_mov_b32 s44, s36
+	s_mov_b32 s45, s36
+	s_mov_b32 s46, s36
+	s_mov_b32 s47, s36
+	s_mov_b32 s48, s36
+	s_mov_b32 s49, s36
+	s_mov_b32 s50, s36
+	s_mov_b32 s51, s36
+	s_mov_b32 s27, 0x3db504f3
+	s_mov_b32 s28, 0xff800000
+	scratch_store_dword off, v0, off offset:32 ; 4-byte Folded Spill
+	v_add_u32_e32 v0, 0, v15
+	v_add_u32_e32 v198, 0, v16
+	v_add_u32_e32 v199, 0, v17
+	v_add_u32_e32 v200, 0, v18
+	v_add_u32_e32 v201, 0, v19
+	v_add_u32_e32 v202, 0, v20
+	v_add_u32_e32 v203, 0, v21
+	s_mov_b32 s29, s36
+	s_mov_b32 s30, s36
+	v_mov_b32_e32 v157, v156
+	v_mov_b32_e32 v160, v156
+	v_mov_b32_e32 v161, v156
+	v_mov_b32_e32 v152, v156
+	v_mov_b32_e32 v153, v156
+	v_mov_b32_e32 v158, v156
+	v_mov_b32_e32 v159, v156
+	v_mov_b32_e32 v148, v156
+	v_mov_b32_e32 v149, v156
+	v_mov_b32_e32 v154, v156
+	v_mov_b32_e32 v155, v156
+	v_mov_b32_e32 v144, v156
+	v_mov_b32_e32 v145, v156
+	v_mov_b32_e32 v150, v156
+	v_mov_b32_e32 v151, v156
+	v_mov_b32_e32 v140, v156
+	v_mov_b32_e32 v141, v156
+	v_mov_b32_e32 v146, v156
+	v_mov_b32_e32 v147, v156
+	v_mov_b32_e32 v136, v156
+	v_mov_b32_e32 v137, v156
+	v_mov_b32_e32 v142, v156
+	v_mov_b32_e32 v143, v156
+	v_mov_b32_e32 v132, v156
+	v_mov_b32_e32 v133, v156
+	v_mov_b32_e32 v138, v156
+	v_mov_b32_e32 v139, v156
+	v_mov_b32_e32 v128, v156
+	v_mov_b32_e32 v129, v156
+	v_mov_b32_e32 v134, v156
+	v_mov_b32_e32 v135, v156
+	v_mov_b32_e32 v124, v156
+	v_mov_b32_e32 v125, v156
+	v_mov_b32_e32 v130, v156
+	v_mov_b32_e32 v131, v156
+	v_mov_b32_e32 v120, v156
+	v_mov_b32_e32 v121, v156
+	v_mov_b32_e32 v126, v156
+	v_mov_b32_e32 v127, v156
+	v_mov_b32_e32 v116, v156
+	v_mov_b32_e32 v117, v156
+	v_mov_b32_e32 v122, v156
+	v_mov_b32_e32 v123, v156
+	v_mov_b32_e32 v112, v156
+	v_mov_b32_e32 v113, v156
+	v_mov_b32_e32 v118, v156
+	v_mov_b32_e32 v119, v156
+	v_mov_b32_e32 v108, v156
+	v_mov_b32_e32 v109, v156
+	v_mov_b32_e32 v114, v156
+	v_mov_b32_e32 v115, v156
+	v_mov_b32_e32 v104, v156
+	v_mov_b32_e32 v105, v156
+	v_mov_b32_e32 v110, v156
+	v_mov_b32_e32 v111, v156
+	v_mov_b32_e32 v100, v156
+	v_mov_b32_e32 v101, v156
+	v_mov_b32_e32 v106, v156
+	v_mov_b32_e32 v107, v156
+	v_mov_b32_e32 v98, v156
+	v_mov_b32_e32 v99, v156
+	v_mov_b32_e32 v102, v156
+	v_mov_b32_e32 v103, v156
+	v_mov_b32_e32 v206, 1.0
+	v_mov_b32_e32 v204, 0xff800000
+	v_mov_b32_e32 v205, 0xff800000
+	scratch_store_dword off, v1, off offset:52 ; 4-byte Folded Spill
+	scratch_store_dword off, v0, off offset:36 ; 4-byte Folded Spill
+.LBB0_9:                                ; =>This Inner Loop Header: Depth=1
+	.loc	1 227 31                        ; fwd_prefill.py:227:31 @[ fwd_prefill.py:1430:12 ]
+	s_ashr_i32 s1, s29, 31
+	s_add_u32 s0, s12, s29
+	s_addc_u32 s1, s13, s1
+	.loc	1 236 24                        ; fwd_prefill.py:236:24 @[ fwd_prefill.py:1430:12 ]
+	v_lshl_add_u64 v[2:3], s[0:1], 0, v[162:163]
+	v_lshl_add_u64 v[6:7], s[0:1], 0, v[164:165]
+	v_lshl_add_u64 v[10:11], s[0:1], 0, v[166:167]
+	v_lshl_add_u64 v[14:15], s[0:1], 0, v[168:169]
+	global_load_dwordx4 v[2:5], v[2:3], off
+	s_nop 0
+	global_load_dwordx4 v[6:9], v[6:7], off
+	s_nop 0
+	global_load_dwordx4 v[10:13], v[10:11], off
+	s_nop 0
+	global_load_dwordx4 v[14:17], v[14:15], off
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	v_mov_b32_e32 v223, v206
+	v_mov_b32_e32 v178, v205
+	.loc	1 228 31                        ; fwd_prefill.py:228:31 @[ fwd_prefill.py:1430:12 ]
+	s_ashr_i32 s5, s30, 31
+	s_add_u32 s4, s6, s30
+	s_addc_u32 s5, s7, s5
+	.loc	1 236 24                        ; fwd_prefill.py:236:24 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt vmcnt(3)
+	ds_write_b128 v181, v[2:5]
+	s_waitcnt vmcnt(2)
+	ds_write_b128 v181, v[6:9] offset:4096
+	s_waitcnt vmcnt(1)
+	ds_write_b128 v181, v[10:13] offset:8192
+	s_waitcnt vmcnt(0)
+	ds_write_b128 v181, v[14:17] offset:12288
+	v_add_u32_e32 v2, 0, v182
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_read_b128 v[18:21], v2
+	ds_read_b128 v[26:29], v2 offset:4096
+	ds_read_b128 v[206:209], v2 offset:8192
+	ds_read_b128 v[214:217], v2 offset:12288
+	ds_read_b128 v[22:25], v185
+	ds_read_b128 v[30:33], v185 offset:4096
+	ds_read_b128 v[210:213], v185 offset:8192
+	ds_read_b128 v[218:221], v185 offset:12288
+	ds_read_b128 v[34:37], v186
+	ds_read_b128 v[50:53], v186 offset:4096
+	ds_read_b128 v[224:227], v186 offset:8192
+	ds_read_b128 v[232:235], v186 offset:12288
+	ds_read_b128 v[38:41], v187
+	ds_read_b128 v[54:57], v187 offset:4096
+	ds_read_b128 v[228:231], v187 offset:8192
+	ds_read_b128 v[236:239], v187 offset:12288
+	.loc	1 251 28                        ; fwd_prefill.py:251:28 @[ fwd_prefill.py:1430:12 ]
+	v_mov_b64_e32 v[2:3], s[36:37]
+	v_mov_b64_e32 v[4:5], s[38:39]
+	v_mov_b64_e32 v[6:7], s[40:41]
+	v_mov_b64_e32 v[8:9], s[42:43]
+	v_mov_b64_e32 v[10:11], s[44:45]
+	v_mov_b64_e32 v[12:13], s[46:47]
+	v_mov_b64_e32 v[14:15], s[48:49]
+	v_mov_b64_e32 v[16:17], s[50:51]
+	s_waitcnt lgkmcnt(11)
+	s_nop 0
+	v_mfma_f32_32x32x64_f8f6f4 v[66:81], v[18:25], v[82:89], v[2:17]
+	s_waitcnt lgkmcnt(3)
+	v_mfma_f32_32x32x64_f8f6f4 v[66:81], v[34:41], v[90:97], v[66:81]
+	v_mfma_f32_32x32x64_f8f6f4 v[34:49], v[26:33], v[82:89], v[2:17]
+	.loc	1 251 33 is_stmt 0              ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	s_nop 7
+	s_nop 7
+	s_nop 2
+	v_mul_f32_e32 v66, s19, v66
+	v_mul_f32_e32 v67, s19, v67
+	v_mul_f32_e32 v68, s19, v68
+	v_mul_f32_e32 v69, s19, v69
+	.loc	1 251 18                        ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v66, s21, v66, 0
+	v_fma_f32 v67, s21, v67, 0
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v70, s19, v70
+	v_mul_f32_e32 v71, s19, v71
+	.loc	1 251 18                        ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v68, s21, v68, 0
+	v_fma_f32 v69, s21, v69, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v205, 0x3db504f3, v66
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v72, s19, v72
+	v_mul_f32_e32 v73, s19, v73
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v70, s21, v70, 0
+	v_fma_f32 v71, s21, v71, 0
+	.loc	1 251 28                        ; fwd_prefill.py:251:28 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt lgkmcnt(2)
+	v_mfma_f32_32x32x64_f8f6f4 v[34:49], v[50:57], v[90:97], v[34:49]
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v74, s19, v74
+	v_mul_f32_e32 v75, s19, v75
+	.loc	1 251 18                        ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v72, s21, v72, 0
+	v_fma_f32 v73, s21, v73, 0
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v76, s19, v76
+	v_mul_f32_e32 v77, s19, v77
+	.loc	1 251 18                        ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v74, s21, v74, 0
+	v_fma_f32 v75, s21, v75, 0
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v78, s19, v78
+	v_mul_f32_e32 v79, s19, v79
+	.loc	1 251 18                        ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v76, s21, v76, 0
+	v_fma_f32 v77, s21, v77, 0
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v80, s19, v80
+	v_mul_f32_e32 v81, s19, v81
+	.loc	1 251 18                        ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v78, s21, v78, 0
+	.loc	1 251 28                        ; fwd_prefill.py:251:28 @[ fwd_prefill.py:1430:12 ]
+	v_mfma_f32_32x32x64_f8f6f4 v[50:65], v[206:213], v[82:89], v[2:17]
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v206, 0x3db504f3, v67
+	v_mul_f32_e32 v207, 0x3db504f3, v68
+	v_mul_f32_e32 v208, 0x3db504f3, v69
+	.file	2 "/opt/venv/lib/python3.10/site-packages/triton/language" "standard.py"
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max_f32_e32 v205, v205, v206
+	.loc	1 254 25                        ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v209, 0x3db504f3, v70
+	v_mul_f32_e32 v210, 0x3db504f3, v71
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v207, v208
+	.loc	1 254 25                        ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v211, 0x3db504f3, v72
+	v_mul_f32_e32 v212, 0x3db504f3, v73
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v209, v210
+	.loc	1 254 25                        ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v213, 0x3db504f3, v74
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v211, v212
+	.loc	1 251 18                        ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v79, s21, v79, 0
+	.loc	1 251 33 is_stmt 0              ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v34, s19, v34
+	v_mul_f32_e32 v35, s19, v35
+	.loc	1 251 28                        ; fwd_prefill.py:251:28 @[ fwd_prefill.py:1430:12 ]
+	v_mfma_f32_32x32x64_f8f6f4 v[18:33], v[214:221], v[82:89], v[2:17]
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v214, 0x3db504f3, v75
+	v_mul_f32_e32 v215, 0x3db504f3, v76
+	v_mul_f32_e32 v216, 0x3db504f3, v77
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v213, v214
+	.loc	1 251 18                        ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v80, s21, v80, 0
+	v_fma_f32 v81, s21, v81, 0
+	.loc	1 254 25                        ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v217, 0x3db504f3, v78
+	v_mul_f32_e32 v218, 0x3db504f3, v79
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v215, v216
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v36, s19, v36
+	v_mul_f32_e32 v37, s19, v37
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v34, s21, v34, 0
+	v_fma_f32 v35, s21, v35, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v219, 0x3db504f3, v80
+	v_mul_f32_e32 v220, 0x3db504f3, v81
+	.loc	1 251 28                        ; fwd_prefill.py:251:28 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt lgkmcnt(1)
+	v_mfma_f32_32x32x64_f8f6f4 v[50:65], v[224:231], v[90:97], v[50:65]
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v217, v218
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, s19, v38
+	v_mul_f32_e32 v39, s19, v39
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v36, s21, v36, 0
+	v_fma_f32 v37, s21, v37, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v221, 0x3db504f3, v34
+	v_mul_f32_e32 v222, 0x3db504f3, v35
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v219, v220
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v40, s19, v40
+	v_mul_f32_e32 v41, s19, v41
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v38, s21, v38, 0
+	v_fma_f32 v39, s21, v39, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v224, 0x3db504f3, v36
+	v_mul_f32_e32 v225, 0x3db504f3, v37
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v221, v222
+	.loc	1 251 28                        ; fwd_prefill.py:251:28 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt lgkmcnt(0)
+	v_mfma_f32_32x32x64_f8f6f4 v[18:33], v[232:239], v[90:97], v[18:33]
+	.loc	1 251 33 is_stmt 0              ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v42, s19, v42
+	v_mul_f32_e32 v43, s19, v43
+	.loc	1 251 18                        ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v40, s21, v40, 0
+	v_fma_f32 v41, s21, v41, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v226, 0x3db504f3, v38
+	v_mul_f32_e32 v227, 0x3db504f3, v39
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v224, v225
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v44, s19, v44
+	v_mul_f32_e32 v45, s19, v45
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v42, s21, v42, 0
+	v_fma_f32 v43, s21, v43, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v228, 0x3db504f3, v40
+	v_mul_f32_e32 v229, 0x3db504f3, v41
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v226, v227
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v46, s19, v46
+	v_mul_f32_e32 v47, s19, v47
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v44, s21, v44, 0
+	v_fma_f32 v45, s21, v45, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v230, 0x3db504f3, v42
+	v_mul_f32_e32 v231, 0x3db504f3, v43
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v228, v229
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v48, s19, v48
+	v_mul_f32_e32 v49, s19, v49
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v46, s21, v46, 0
+	v_fma_f32 v47, s21, v47, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v232, 0x3db504f3, v44
+	v_mul_f32_e32 v233, 0x3db504f3, v45
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v230, v231
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v50, s19, v50
+	v_mul_f32_e32 v51, s19, v51
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v48, s21, v48, 0
+	v_fma_f32 v49, s21, v49, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v234, 0x3db504f3, v46
+	v_mul_f32_e32 v235, 0x3db504f3, v47
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v232, v233
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v52, s19, v52
+	v_mul_f32_e32 v53, s19, v53
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v50, s21, v50, 0
+	v_fma_f32 v51, s21, v51, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v236, 0x3db504f3, v48
+	v_mul_f32_e32 v237, 0x3db504f3, v49
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v234, v235
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v54, s19, v54
+	v_mul_f32_e32 v55, s19, v55
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v52, s21, v52, 0
+	v_fma_f32 v53, s21, v53, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v238, 0x3db504f3, v50
+	v_mul_f32_e32 v239, 0x3db504f3, v51
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v236, v237
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v56, s19, v56
+	v_mul_f32_e32 v57, s19, v57
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v54, s21, v54, 0
+	v_fma_f32 v55, s21, v55, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v240, 0x3db504f3, v52
+	v_mul_f32_e32 v241, 0x3db504f3, v53
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v238, v239
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v58, s19, v58
+	v_mul_f32_e32 v59, s19, v59
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v56, s21, v56, 0
+	v_fma_f32 v57, s21, v57, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v242, 0x3db504f3, v54
+	v_mul_f32_e32 v243, 0x3db504f3, v55
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v240, v241
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v60, s19, v60
+	v_mul_f32_e32 v61, s19, v61
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v58, s21, v58, 0
+	v_fma_f32 v59, s21, v59, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v244, 0x3db504f3, v56
+	v_mul_f32_e32 v245, 0x3db504f3, v57
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v242, v243
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v62, s19, v62
+	v_mul_f32_e32 v63, s19, v63
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v60, s21, v60, 0
+	v_fma_f32 v61, s21, v61, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v246, 0x3db504f3, v58
+	v_mul_f32_e32 v247, 0x3db504f3, v59
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v244, v245
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v64, s19, v64
+	v_mul_f32_e32 v65, s19, v65
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v62, s21, v62, 0
+	v_fma_f32 v63, s21, v63, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v248, 0x3db504f3, v60
+	v_mul_f32_e32 v249, 0x3db504f3, v61
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v246, v247
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v18, s19, v18
+	v_mul_f32_e32 v19, s19, v19
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v64, s21, v64, 0
+	v_fma_f32 v65, s21, v65, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v250, 0x3db504f3, v62
+	v_mul_f32_e32 v251, 0x3db504f3, v63
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v248, v249
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v20, s19, v20
+	v_mul_f32_e32 v21, s19, v21
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v18, s21, v18, 0
+	v_fma_f32 v19, s21, v19, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v252, 0x3db504f3, v64
+	v_mul_f32_e32 v253, 0x3db504f3, v65
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v250, v251
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v22, s19, v22
+	v_mul_f32_e32 v23, s19, v23
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v20, s21, v20, 0
+	v_fma_f32 v21, s21, v21, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v254, 0x3db504f3, v18
+	v_mul_f32_e32 v255, 0x3db504f3, v19
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v252, v253
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v24, s19, v24
+	v_mul_f32_e32 v25, s19, v25
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v22, s21, v22, 0
+	v_fma_f32 v23, s21, v23, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v1, 0x3db504f3, v20
+	v_mul_f32_e32 v179, 0x3db504f3, v21
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v205, v254, v255
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v26, s19, v26
+	v_mul_f32_e32 v27, s19, v27
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v24, s21, v24, 0
+	v_fma_f32 v25, s21, v25, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v180, 0x3db504f3, v22
+	v_mul_f32_e32 v188, 0x3db504f3, v23
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v1, v205, v1, v179
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v28, s19, v28
+	v_mul_f32_e32 v29, s19, v29
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v26, s21, v26, 0
+	v_fma_f32 v27, s21, v27, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v0, 0x3db504f3, v24
+	v_mul_f32_e32 v189, 0x3db504f3, v25
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v1, v1, v180, v188
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v30, s19, v30
+	v_mul_f32_e32 v31, s19, v31
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v28, s21, v28, 0
+	v_fma_f32 v29, s21, v29, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v190, 0x3db504f3, v26
+	v_mul_f32_e32 v191, 0x3db504f3, v27
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v0, v1, v0, v189
+	.loc	1 251 33                        ; fwd_prefill.py:251:33 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v32, s19, v32
+	v_mul_f32_e32 v33, s19, v33
+	.loc	1 251 18 is_stmt 0              ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v30, s21, v30, 0
+	v_fma_f32 v31, s21, v31, 0
+	.loc	1 254 25 is_stmt 1              ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v192, 0x3db504f3, v28
+	v_mul_f32_e32 v193, 0x3db504f3, v29
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v0, v0, v190, v191
+	.loc	1 251 18                        ; fwd_prefill.py:251:18 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v32, s21, v32, 0
+	v_fma_f32 v33, s21, v33, 0
+	.loc	1 254 25                        ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v194, 0x3db504f3, v30
+	v_mul_f32_e32 v195, 0x3db504f3, v31
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v0, v0, v192, v193
+	.loc	1 254 25                        ; fwd_prefill.py:254:25 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v196, 0x3db504f3, v32
+	v_mul_f32_e32 v197, 0x3db504f3, v33
+	.loc	2 168 27                        ; standard.py:168:27 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v0, v0, v194, v195
+	v_max3_f32 v0, v0, v196, v197
+	.loc	2 189 40                        ; standard.py:189:40 @[ fwd_prefill.py:1430:12 ]
+	v_mov_b32_e32 v1, v0
+	s_nop 1
+	v_permlane32_swap_b32_e32 v0, v1
+	.loc	1 274 31                        ; fwd_prefill.py:274:31 @[ fwd_prefill.py:1430:12 ]
+	v_max3_f32 v205, v178, v0, v1
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v38, v38, s27, -v205
+	.loc	1 278 29 is_stmt 0              ; fwd_prefill.py:278:29 @[ fwd_prefill.py:1430:12 ]
+	v_cmp_eq_f32_e64 s[0:1], s28, v205
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v39, v39, s27, -v205
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v38
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v40, v40, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v180, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v39
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v41, v41, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v188, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v40
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v42, v42, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v189, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v41
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v43, v43, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v190, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v42
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v44, v44, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v191, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v43
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v45, v45, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v192, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v44
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v46, v46, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v193, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v45
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v47, v47, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v194, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v46
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v48, v48, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v195, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v47
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v49, v49, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v196, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v48
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v50, v50, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v197, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v49
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v51, v51, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v206, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v50
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v52, v52, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v209, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v51
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v53, v53, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v210, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v52
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v54, v54, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v211, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v53
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v55, v55, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v212, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v54
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v0, v66, s27, -v205
+	v_fma_f32 v66, v68, s27, -v205
+	v_fma_f32 v68, v70, s27, -v205
+	v_fma_f32 v56, v56, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v213, v38, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v55
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v1, v67, s27, -v205
+	v_fma_f32 v67, v69, s27, -v205
+	v_fma_f32 v69, v71, s27, -v205
+	v_fma_f32 v57, v57, s27, -v205
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v68
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v214, v38, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v56
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v70, v72, s27, -v205
+	v_fma_f32 v72, v74, s27, -v205
+	v_fma_f32 v74, v76, s27, -v205
+	v_fma_f32 v76, v78, s27, -v205
+	v_fma_f32 v78, v80, s27, -v205
+	v_fma_f32 v58, v58, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v80, v68, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v69
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v215, v38, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v57
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v71, v73, s27, -v205
+	v_fma_f32 v73, v75, s27, -v205
+	v_fma_f32 v75, v77, s27, -v205
+	v_fma_f32 v77, v79, s27, -v205
+	v_fma_f32 v79, v81, s27, -v205
+	v_fma_f32 v59, v59, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v81, v68, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v70
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v216, v38, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v58
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v60, v60, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v179, v68, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v71
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v58, v38, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v59
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v61, v61, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v71, v68, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v72
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v59, v38, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v60
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v62, v62, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v72, v68, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v73
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v60, v38, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v61
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v63, v63, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v73, v68, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v74
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v61, v38, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v62
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v64, v64, s27, -v205
+	v_fma_f32 v18, v18, s27, -v205
+	v_fma_f32 v19, v19, s27, -v205
+	v_fma_f32 v20, v20, s27, -v205
+	v_fma_f32 v21, v21, s27, -v205
+	v_fma_f32 v26, v26, s27, -v205
+	v_fma_f32 v27, v27, s27, -v205
+	.loc	1 278 59 is_stmt 0              ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v74, v68, v204, s[0:1]
+	.loc	1 283 41 is_stmt 1              ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v75
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v62, v38, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v63
+	.loc	1 278 71                        ; fwd_prefill.py:278:71 @[ fwd_prefill.py:1430:12 ]
+	v_fma_f32 v34, v34, s27, -v205
+	v_fma_f32 v35, v35, s27, -v205
+	v_fma_f32 v36, v36, s27, -v205
+	v_fma_f32 v37, v37, s27, -v205
+	v_fma_f32 v65, v65, s27, -v205
+	v_fma_f32 v22, v22, s27, -v205
+	v_fma_f32 v23, v23, s27, -v205
+	v_fma_f32 v24, v24, s27, -v205
+	v_fma_f32 v25, v25, s27, -v205
+	v_fma_f32 v28, v28, s27, -v205
+	v_fma_f32 v29, v29, s27, -v205
+	v_fma_f32 v30, v30, s27, -v205
+	v_fma_f32 v31, v31, s27, -v205
+	v_fma_f32 v32, v32, s27, -v205
+	v_fma_f32 v33, v33, s27, -v205
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v66, 0x3fb8aa3b, v66
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v75, v68, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v76
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v63, v38, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v64
+	v_mul_f32_e32 v18, 0x3fb8aa3b, v18
+	v_mul_f32_e32 v19, 0x3fb8aa3b, v19
+	v_mul_f32_e32 v20, 0x3fb8aa3b, v20
+	v_mul_f32_e32 v21, 0x3fb8aa3b, v21
+	v_mul_f32_e32 v26, 0x3fb8aa3b, v26
+	v_mul_f32_e32 v27, 0x3fb8aa3b, v27
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v66, v66, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v67, 0x3fb8aa3b, v67
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v76, v68, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v77
+	v_mul_f32_e32 v34, 0x3fb8aa3b, v34
+	v_mul_f32_e32 v35, 0x3fb8aa3b, v35
+	v_mul_f32_e32 v36, 0x3fb8aa3b, v36
+	v_mul_f32_e32 v37, 0x3fb8aa3b, v37
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v64, v38, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v38, 0x3fb8aa3b, v65
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v18, v18, v204, s[0:1]
+	v_cndmask_b32_e64 v19, v19, v204, s[0:1]
+	v_cndmask_b32_e64 v20, v20, v204, s[0:1]
+	v_cndmask_b32_e64 v21, v21, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v22, 0x3fb8aa3b, v22
+	v_mul_f32_e32 v23, 0x3fb8aa3b, v23
+	v_mul_f32_e32 v24, 0x3fb8aa3b, v24
+	v_mul_f32_e32 v25, 0x3fb8aa3b, v25
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v26, v26, v204, s[0:1]
+	v_cndmask_b32_e64 v27, v27, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v28, 0x3fb8aa3b, v28
+	v_mul_f32_e32 v29, 0x3fb8aa3b, v29
+	v_mul_f32_e32 v30, 0x3fb8aa3b, v30
+	v_mul_f32_e32 v31, 0x3fb8aa3b, v31
+	v_mul_f32_e32 v32, 0x3fb8aa3b, v32
+	v_mul_f32_e32 v33, 0x3fb8aa3b, v33
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v67, v67, v204, s[0:1]
+	v_cndmask_b32_e64 v77, v68, v204, s[0:1]
+	v_cndmask_b32_e64 v34, v34, v204, s[0:1]
+	v_cndmask_b32_e64 v35, v35, v204, s[0:1]
+	v_cndmask_b32_e64 v36, v36, v204, s[0:1]
+	v_cndmask_b32_e64 v37, v37, v204, s[0:1]
+	v_cndmask_b32_e64 v65, v38, v204, s[0:1]
+	v_cndmask_b32_e64 v22, v22, v204, s[0:1]
+	v_cndmask_b32_e64 v23, v23, v204, s[0:1]
+	v_cndmask_b32_e64 v24, v24, v204, s[0:1]
+	v_cndmask_b32_e64 v25, v25, v204, s[0:1]
+	v_cndmask_b32_e64 v28, v28, v204, s[0:1]
+	v_cndmask_b32_e64 v29, v29, v204, s[0:1]
+	v_cndmask_b32_e64 v30, v30, v204, s[0:1]
+	v_cndmask_b32_e64 v31, v31, v204, s[0:1]
+	v_cndmask_b32_e64 v32, v32, v204, s[0:1]
+	v_cndmask_b32_e64 v33, v33, v204, s[0:1]
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v39, v66
+	v_exp_f32_e32 v56, v213
+	v_exp_f32_e32 v57, v215
+	v_exp_f32_e32 v213, v59
+	v_exp_f32_e32 v59, v60
+	v_exp_f32_e32 v60, v62
+	v_exp_f32_e32 v215, v63
+	v_exp_f32_e32 v62, v18
+	v_exp_f32_e32 v217, v19
+	v_exp_f32_e32 v63, v20
+	v_exp_f32_e32 v218, v21
+	v_exp_f32_e32 v66, v26
+	v_exp_f32_e32 v221, v27
+	.loc	1 349 28                        ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	v_lshl_add_u64 v[18:19], s[4:5], 0, v[170:171]
+	v_lshl_add_u64 v[20:21], s[4:5], 0, v[172:173]
+	v_lshl_add_u64 v[26:27], s[4:5], 0, v[174:175]
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v69, v67
+	v_exp_f32_e32 v43, v74
+	v_exp_f32_e32 v44, v76
+	v_exp_f32_e32 v74, v77
+	v_exp_f32_e32 v46, v34
+	v_exp_f32_e32 v76, v35
+	v_exp_f32_e32 v47, v36
+	v_exp_f32_e32 v77, v37
+	v_exp_f32_e32 v54, v209
+	v_exp_f32_e32 v209, v210
+	v_exp_f32_e32 v55, v211
+	v_exp_f32_e32 v210, v212
+	v_exp_f32_e32 v211, v214
+	v_exp_f32_e32 v212, v216
+	v_exp_f32_e32 v214, v61
+	v_exp_f32_e32 v61, v64
+	v_exp_f32_e32 v216, v65
+	v_exp_f32_e32 v64, v22
+	v_exp_f32_e32 v219, v23
+	v_exp_f32_e32 v65, v24
+	v_exp_f32_e32 v220, v25
+	v_exp_f32_e32 v67, v28
+	v_exp_f32_e32 v222, v29
+	v_exp_f32_e32 v34, v30
+	v_exp_f32_e32 v35, v31
+	v_exp_f32_e32 v36, v32
+	v_exp_f32_e32 v37, v33
+	.loc	1 349 28                        ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	v_lshl_add_u64 v[224:225], s[4:5], 0, v[176:177]
+	global_load_dwordx4 v[30:33], v[18:19], off
+	global_load_dwordx4 v[22:25], v[20:21], off
+	s_nop 0
+	global_load_dwordx4 v[26:29], v[26:27], off
+	s_nop 0
+	global_load_dwordx4 v[18:21], v[224:225], off
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v0, 0x3fb8aa3b, v0
+	v_mul_f32_e32 v1, 0x3fb8aa3b, v1
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v78
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v0, v0, v204, s[0:1]
+	v_cndmask_b32_e64 v1, v1, v204, s[0:1]
+	v_cndmask_b32_e64 v78, v68, v204, s[0:1]
+	.loc	1 283 41                        ; fwd_prefill.py:283:41 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v79
+	.loc	1 278 59                        ; fwd_prefill.py:278:59 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v79, v68, v204, s[0:1]
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v38, v0
+	v_exp_f32_e32 v68, v1
+	v_exp_f32_e32 v40, v80
+	v_exp_f32_e32 v70, v81
+	v_exp_f32_e32 v41, v179
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v38, v68
+	v_add_f32_e32 v0, v39, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v71, v71
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v69, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v42, v72
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v40, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v72, v73
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v70, v0
+	v_add_f32_e32 v0, v41, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v73, v75
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v71, v0
+	v_add_f32_e32 v0, v42, v0
+	v_add_f32_e32 v0, v72, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v45, v78
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v43, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v75, v79
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v73, v0
+	v_add_f32_e32 v0, v44, v0
+	v_add_f32_e32 v0, v74, v0
+	v_add_f32_e32 v0, v45, v0
+	v_add_f32_e32 v0, v75, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v48, v180
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v46, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v78, v188
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v76, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v49, v189
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v47, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v79, v190
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v77, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v50, v191
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v48, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v80, v192
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v78, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v51, v193
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v49, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v81, v194
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v79, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v52, v195
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v50, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v207, v196
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v80, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v53, v197
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v51, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v208, v206
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v81, v0
+	v_add_f32_e32 v0, v52, v0
+	v_add_f32_e32 v0, v207, v0
+	v_add_f32_e32 v0, v53, v0
+	v_add_f32_e32 v0, v208, v0
+	v_add_f32_e32 v0, v54, v0
+	v_add_f32_e32 v0, v209, v0
+	v_add_f32_e32 v0, v55, v0
+	v_add_f32_e32 v0, v210, v0
+	.loc	1 283 29                        ; fwd_prefill.py:283:29 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v58, v58
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v0, v56, v0
+	v_add_f32_e32 v0, v211, v0
+	v_add_f32_e32 v0, v57, v0
+	v_add_f32_e32 v0, v212, v0
+	v_add_f32_e32 v0, v58, v0
+	v_add_f32_e32 v0, v213, v0
+	v_add_f32_e32 v0, v59, v0
+	v_add_f32_e32 v0, v214, v0
+	v_add_f32_e32 v0, v60, v0
+	v_add_f32_e32 v0, v215, v0
+	v_add_f32_e32 v0, v61, v0
+	v_add_f32_e32 v0, v216, v0
+	v_add_f32_e32 v0, v62, v0
+	v_add_f32_e32 v0, v217, v0
+	v_add_f32_e32 v0, v63, v0
+	v_add_f32_e32 v0, v218, v0
+	v_add_f32_e32 v0, v64, v0
+	v_add_f32_e32 v0, v219, v0
+	v_add_f32_e32 v0, v65, v0
+	v_add_f32_e32 v0, v220, v0
+	v_add_f32_e32 v0, v66, v0
+	v_add_f32_e32 v0, v221, v0
+	v_add_f32_e32 v0, v67, v0
+	v_add_f32_e32 v0, v222, v0
+	v_add_f32_e32 v0, v34, v0
+	v_add_f32_e32 v0, v35, v0
+	v_add_f32_e32 v0, v36, v0
+	v_add_f32_e32 v0, v37, v0
+	.loc	2 291 36                        ; standard.py:291:36 @[ fwd_prefill.py:1430:12 ]
+	v_mov_b32_e32 v1, v0
+	s_nop 1
+	v_permlane32_swap_b32_e32 v0, v1
+	.loc	2 261 15                        ; standard.py:261:15 @[ fwd_prefill.py:1430:12 ]
+	v_add_f32_e32 v206, v0, v1
+	.loc	1 338 70                        ; fwd_prefill.py:338:70 @[ fwd_prefill.py:1430:12 ]
+	v_sub_f32_e32 v0, v178, v205
+	.loc	1 340 42                        ; fwd_prefill.py:340:42 @[ fwd_prefill.py:1430:12 ]
+	v_mul_f32_e32 v0, 0x3fb8aa3b, v0
+	.loc	1 338 64                        ; fwd_prefill.py:338:64 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e64 v0, v0, v204, s[0:1]
+	.loc	1 340 33                        ; fwd_prefill.py:340:33 @[ fwd_prefill.py:1430:12 ]
+	v_exp_f32_e32 v178, v0
+	.loc	1 352 28                        ; fwd_prefill.py:352:28 @[ fwd_prefill.py:1430:12 ]
+	s_nop 0
+	v_fmac_f32_e32 v206, v223, v178
+	.loc	1 364 35                        ; fwd_prefill.py:364:35 @[ fwd_prefill.py:1430:12 ]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v0, v38, v68, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v0, v39, v69, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v1, v40, v70, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v1, v41, v71, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v38, v42, v72, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v38, v43, v73, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v39, v44, v74, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v39, v45, v75, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v40, v46, v76, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v40, v47, v77, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v41, v48, v78, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v41, v49, v79, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v42, v50, v80, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v42, v51, v81, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v43, v52, v207, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v43, v53, v208, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v46, v54, v209, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v46, v55, v210, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v47, v56, v211, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v47, v57, v212, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v48, v58, v213, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v48, v59, v214, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v49, v60, v215, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v49, v61, v216, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v179, v62, v217, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v179, v63, v218, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v180, v64, v219, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v180, v65, v220, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	v_cvt_scalef32_pk_fp8_f32 v188, v66, v221, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v188, v67, v222, 1.0 op_sel:[0,0,0,1]
+	s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1
+	.loc	1 349 28                        ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	s_barrier
+	s_waitcnt vmcnt(3)
+	ds_write_b128 v181, v[30:33]
+	.loc	1 364 35                        ; fwd_prefill.py:364:35 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e32 v30, v0, v38, vcc
+	v_cndmask_b32_e32 v31, v1, v39, vcc
+	ds_bpermute_b32 v30, v183, v30
+	ds_bpermute_b32 v31, v183, v31
+	.loc	1 349 28                        ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt vmcnt(2)
+	ds_write_b128 v181, v[22:25] offset:4096
+	s_waitcnt vmcnt(1)
+	ds_write_b128 v181, v[26:29] offset:8192
+	s_waitcnt vmcnt(0)
+	ds_write_b128 v181, v[18:21] offset:12288
+	s_waitcnt lgkmcnt(0)
+	.loc	1 364 35                        ; fwd_prefill.py:364:35 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e32 v208, v30, v0, vcc
+	v_cndmask_b32_e32 v210, v31, v1, vcc
+	v_cndmask_b32_e32 v0, v40, v42, vcc
+	v_cndmask_b32_e32 v1, v41, v43, vcc
+	ds_bpermute_b32 v0, v183, v0
+	ds_bpermute_b32 v1, v183, v1
+	v_cndmask_b32_e32 v209, v38, v30, vcc
+	v_cndmask_b32_e32 v211, v39, v31, vcc
+	.loc	1 349 28                        ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	s_barrier
+	s_waitcnt lgkmcnt(0)
+	ds_read_b64_tr_b8 v[22:23], v184 offset:4096
+	ds_read_b64_tr_b8 v[24:25], v184 offset:5184
+	ds_read_b64_tr_b8 v[18:19], v184
+	ds_read_b64_tr_b8 v[20:21], v184 offset:1088
+	.loc	1 364 35                        ; fwd_prefill.py:364:35 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e32 v212, v0, v40, vcc
+	v_cndmask_b32_e32 v213, v42, v0, vcc
+	v_cndmask_b32_e32 v214, v1, v41, vcc
+	v_cndmask_b32_e32 v215, v43, v1, vcc
+	.loc	1 349 28                        ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	ds_read_b64_tr_b8 v[38:39], v184 offset:64
+	ds_read_b64_tr_b8 v[40:41], v184 offset:1024
+	ds_read_b64_tr_b8 v[42:43], v184 offset:4160
+	ds_read_b64_tr_b8 v[44:45], v184 offset:5120
+	scratch_load_dword v0, off, off         ; 4-byte Folded Reload
+	.loc	1 364 55                        ; fwd_prefill.py:364:55 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt lgkmcnt(4)
+	v_mfma_f32_32x32x64_f8f6f4 v[66:81], v[18:25], v[208:215], v[2:17]
+	.loc	1 364 35 is_stmt 0              ; fwd_prefill.py:364:35 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e32 v1, v47, v49, vcc
+	ds_bpermute_b32 v1, v183, v1
+	v_cvt_scalef32_pk_fp8_f32 v189, v34, v35, 1.0
+	v_cvt_scalef32_pk_fp8_f32 v189, v36, v37, 1.0 op_sel:[0,0,0,1]
+	.loc	1 225 47 is_stmt 1              ; fwd_prefill.py:225:47 @[ fwd_prefill.py:1430:12 ]
+	s_addk_i32 s26, 0x80
+	s_add_i32 s30, s30, s15
+	.loc	1 364 35                        ; fwd_prefill.py:364:35 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt lgkmcnt(0)
+	v_cndmask_b32_e32 v226, v1, v47, vcc
+	v_cndmask_b32_e32 v227, v49, v1, vcc
+	v_cndmask_b32_e32 v1, v180, v189, vcc
+	ds_bpermute_b32 v1, v183, v1
+	.loc	1 225 47                        ; fwd_prefill.py:225:47 @[ fwd_prefill.py:1430:12 ]
+	s_add_i32 s29, s29, s14
+	s_cmpk_lt_u32 s26, 0x380
+	.loc	1 364 35                        ; fwd_prefill.py:364:35 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt lgkmcnt(0)
+	v_cndmask_b32_e32 v230, v1, v180, vcc
+	v_cndmask_b32_e32 v231, v189, v1, vcc
+	.loc	1 349 28                        ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt vmcnt(0)
+	ds_read_b64_tr_b8 v[18:19], v0
+	scratch_load_dword v0, off, off offset:4 ; 4-byte Folded Reload
+	s_waitcnt vmcnt(0)
+	ds_read_b64_tr_b8 v[20:21], v0
+	scratch_load_dword v0, off, off offset:8 ; 4-byte Folded Reload
+	s_waitcnt vmcnt(0)
+	ds_read_b64_tr_b8 v[22:23], v0
+	scratch_load_dword v0, off, off offset:12 ; 4-byte Folded Reload
+	s_waitcnt vmcnt(0)
+	ds_read_b64_tr_b8 v[24:25], v0
+	scratch_load_dword v0, off, off offset:32 ; 4-byte Folded Reload
+	.loc	1 364 55                        ; fwd_prefill.py:364:55 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt lgkmcnt(0)
+	v_mfma_f32_32x32x64_f8f6f4 v[50:65], v[18:25], v[208:215], v[2:17]
+	.loc	1 349 28                        ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt vmcnt(0)
+	ds_read_b64_tr_b8 v[216:217], v0
+	scratch_load_dword v0, off, off offset:36 ; 4-byte Folded Reload
+	.loc	1 364 55                        ; fwd_prefill.py:364:55 @[ fwd_prefill.py:1430:12 ]
+	v_mfma_f32_32x32x64_f8f6f4 v[18:33], v[38:45], v[208:215], v[2:17]
+	.loc	1 349 28                        ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt vmcnt(0)
+	ds_read_b64_tr_b8 v[218:219], v0
+	ds_read_b64_tr_b8 v[220:221], v198
+	ds_read_b64_tr_b8 v[222:223], v199
+	.loc	1 364 35                        ; fwd_prefill.py:364:35 @[ fwd_prefill.py:1430:12 ]
+	v_cndmask_b32_e32 v0, v46, v48, vcc
+	ds_bpermute_b32 v0, v183, v0
+	s_waitcnt lgkmcnt(0)
+	v_cndmask_b32_e32 v224, v0, v46, vcc
+	v_cndmask_b32_e32 v225, v48, v0, vcc
+	v_cndmask_b32_e32 v0, v179, v188, vcc
+	ds_bpermute_b32 v0, v183, v0
+	.loc	1 364 55 is_stmt 0              ; fwd_prefill.py:364:55 @[ fwd_prefill.py:1430:12 ]
+	v_mfma_f32_32x32x64_f8f6f4 v[34:49], v[216:223], v[208:215], v[2:17]
+	.loc	1 349 28 is_stmt 1              ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	s_nop 7
+	s_nop 6
+	ds_read_b64_tr_b8 v[6:7], v184 offset:12288
+	ds_read_b64_tr_b8 v[8:9], v184 offset:13376
+	ds_read_b64_tr_b8 v[2:3], v184 offset:8192
+	ds_read_b64_tr_b8 v[4:5], v184 offset:9280
+	ds_read_b64_tr_b8 v[10:11], v184 offset:8256
+	ds_read_b64_tr_b8 v[12:13], v184 offset:9216
+	ds_read_b64_tr_b8 v[14:15], v184 offset:12352
+	ds_read_b64_tr_b8 v[16:17], v184 offset:13312
+	.loc	1 364 35                        ; fwd_prefill.py:364:35 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt lgkmcnt(8)
+	v_cndmask_b32_e32 v228, v0, v179, vcc
+	v_cndmask_b32_e32 v229, v188, v0, vcc
+	.loc	1 349 28                        ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	scratch_load_dword v0, off, off offset:16 ; 4-byte Folded Reload
+	.loc	1 364 55                        ; fwd_prefill.py:364:55 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt lgkmcnt(4)
+	v_mfma_f32_32x32x64_f8f6f4 v[66:81], v[2:9], v[224:231], v[66:81]
+	.loc	1 349 28                        ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt vmcnt(0)
+	ds_read_b64_tr_b8 v[2:3], v0
+	scratch_load_dword v0, off, off offset:20 ; 4-byte Folded Reload
+	.loc	1 364 55                        ; fwd_prefill.py:364:55 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt lgkmcnt(1)
+	v_mfma_f32_32x32x64_f8f6f4 v[18:33], v[10:17], v[224:231], v[18:33]
+	.loc	1 364 60 is_stmt 0              ; fwd_prefill.py:364:60 @[ fwd_prefill.py:1430:12 ]
+	s_nop 7
+	s_nop 6
+	v_pk_mul_f32 v[66:67], s[2:3], v[66:67]
+	v_pk_mul_f32 v[68:69], s[2:3], v[68:69]
+	v_pk_mul_f32 v[70:71], s[2:3], v[70:71]
+	v_pk_mul_f32 v[72:73], s[2:3], v[72:73]
+	v_pk_mul_f32 v[74:75], s[2:3], v[74:75]
+	v_pk_mul_f32 v[76:77], s[2:3], v[76:77]
+	v_pk_mul_f32 v[78:79], s[2:3], v[78:79]
+	v_pk_mul_f32 v[80:81], s[2:3], v[80:81]
+	.loc	1 364 23                        ; fwd_prefill.py:364:23 @[ fwd_prefill.py:1430:12 ]
+	v_pk_fma_f32 v[156:157], v[156:157], v[178:179], v[66:67] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[160:161], v[160:161], v[178:179], v[68:69] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[152:153], v[152:153], v[178:179], v[70:71] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[158:159], v[158:159], v[178:179], v[72:73] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[148:149], v[148:149], v[178:179], v[74:75] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[154:155], v[154:155], v[178:179], v[76:77] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[144:145], v[144:145], v[178:179], v[78:79] op_sel_hi:[1,0,1]
+	.loc	1 364 60                        ; fwd_prefill.py:364:60 @[ fwd_prefill.py:1430:12 ]
+	v_pk_mul_f32 v[18:19], s[2:3], v[18:19]
+	v_pk_mul_f32 v[20:21], s[2:3], v[20:21]
+	v_pk_mul_f32 v[22:23], s[2:3], v[22:23]
+	v_pk_mul_f32 v[24:25], s[2:3], v[24:25]
+	v_pk_mul_f32 v[26:27], s[2:3], v[26:27]
+	v_pk_mul_f32 v[28:29], s[2:3], v[28:29]
+	v_pk_mul_f32 v[30:31], s[2:3], v[30:31]
+	v_pk_mul_f32 v[32:33], s[2:3], v[32:33]
+	.loc	1 364 23                        ; fwd_prefill.py:364:23 @[ fwd_prefill.py:1430:12 ]
+	v_pk_fma_f32 v[150:151], v[150:151], v[178:179], v[80:81] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[124:125], v[124:125], v[178:179], v[18:19] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[130:131], v[130:131], v[178:179], v[20:21] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[120:121], v[120:121], v[178:179], v[22:23] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[126:127], v[126:127], v[178:179], v[24:25] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[116:117], v[116:117], v[178:179], v[26:27] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[122:123], v[122:123], v[178:179], v[28:29] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[112:113], v[112:113], v[178:179], v[30:31] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[118:119], v[118:119], v[178:179], v[32:33] op_sel_hi:[1,0,1]
+	.loc	1 349 28 is_stmt 1              ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt vmcnt(0)
+	ds_read_b64_tr_b8 v[4:5], v0
+	scratch_load_dword v0, off, off offset:24 ; 4-byte Folded Reload
+	s_waitcnt vmcnt(0)
+	ds_read_b64_tr_b8 v[6:7], v0
+	scratch_load_dword v0, off, off offset:28 ; 4-byte Folded Reload
+	s_waitcnt vmcnt(0)
+	ds_read_b64_tr_b8 v[8:9], v0
+	.loc	1 364 55                        ; fwd_prefill.py:364:55 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt lgkmcnt(0)
+	v_mfma_f32_32x32x64_f8f6f4 v[50:65], v[2:9], v[224:231], v[50:65]
+	.loc	1 349 28                        ; fwd_prefill.py:349:28 @[ fwd_prefill.py:1430:12 ]
+	ds_read_b64_tr_b8 v[2:3], v200
+	ds_read_b64_tr_b8 v[4:5], v201
+	ds_read_b64_tr_b8 v[6:7], v202
+	ds_read_b64_tr_b8 v[8:9], v203
+	.loc	1 364 60                        ; fwd_prefill.py:364:60 @[ fwd_prefill.py:1430:12 ]
+	s_nop 7
+	s_nop 7
+	v_pk_mul_f32 v[50:51], s[2:3], v[50:51]
+	.loc	1 364 55 is_stmt 0              ; fwd_prefill.py:364:55 @[ fwd_prefill.py:1430:12 ]
+	s_waitcnt lgkmcnt(0)
+	v_mfma_f32_32x32x64_f8f6f4 v[34:49], v[2:9], v[224:231], v[34:49]
+	.loc	1 364 60                        ; fwd_prefill.py:364:60 @[ fwd_prefill.py:1430:12 ]
+	v_pk_mul_f32 v[10:11], s[2:3], v[52:53]
+	v_pk_mul_f32 v[12:13], s[2:3], v[54:55]
+	v_pk_mul_f32 v[14:15], s[2:3], v[56:57]
+	v_pk_mul_f32 v[16:17], s[2:3], v[58:59]
+	v_pk_mul_f32 v[52:53], s[2:3], v[60:61]
+	v_pk_mul_f32 v[54:55], s[2:3], v[62:63]
+	v_pk_mul_f32 v[56:57], s[2:3], v[64:65]
+	.loc	1 364 23                        ; fwd_prefill.py:364:23 @[ fwd_prefill.py:1430:12 ]
+	v_pk_fma_f32 v[140:141], v[140:141], v[178:179], v[50:51] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[146:147], v[146:147], v[178:179], v[10:11] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[136:137], v[136:137], v[178:179], v[12:13] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[142:143], v[142:143], v[178:179], v[14:15] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[132:133], v[132:133], v[178:179], v[16:17] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[138:139], v[138:139], v[178:179], v[52:53] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[128:129], v[128:129], v[178:179], v[54:55] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[134:135], v[134:135], v[178:179], v[56:57] op_sel_hi:[1,0,1]
+	.loc	1 364 60                        ; fwd_prefill.py:364:60 @[ fwd_prefill.py:1430:12 ]
+	s_nop 4
+	v_pk_mul_f32 v[2:3], s[2:3], v[34:35]
+	v_pk_mul_f32 v[4:5], s[2:3], v[36:37]
+	v_pk_mul_f32 v[6:7], s[2:3], v[38:39]
+	v_pk_mul_f32 v[8:9], s[2:3], v[40:41]
+	v_pk_mul_f32 v[34:35], s[2:3], v[42:43]
+	v_pk_mul_f32 v[36:37], s[2:3], v[44:45]
+	v_pk_mul_f32 v[38:39], s[2:3], v[46:47]
+	v_pk_mul_f32 v[40:41], s[2:3], v[48:49]
+	.loc	1 364 23                        ; fwd_prefill.py:364:23 @[ fwd_prefill.py:1430:12 ]
+	v_pk_fma_f32 v[108:109], v[108:109], v[178:179], v[2:3] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[114:115], v[114:115], v[178:179], v[4:5] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[104:105], v[104:105], v[178:179], v[6:7] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[110:111], v[110:111], v[178:179], v[8:9] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[100:101], v[100:101], v[178:179], v[34:35] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[106:107], v[106:107], v[178:179], v[36:37] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[98:99], v[98:99], v[178:179], v[38:39] op_sel_hi:[1,0,1]
+	v_pk_fma_f32 v[102:103], v[102:103], v[178:179], v[40:41] op_sel_hi:[1,0,1]
+	.loc	1 225 47 is_stmt 1              ; fwd_prefill.py:225:47 @[ fwd_prefill.py:1430:12 ]
+	s_cbranch_scc1 .LBB0_9
+.Ltmp3:
+; %bb.10:
+	.loc	1 0 47 is_stmt 0                ; fwd_prefill.py:0:47
+	scratch_load_dword v6, off, off offset:48 ; 4-byte Folded Reload
+	scratch_load_dword v4, off, off offset:44 ; 4-byte Folded Reload
+	scratch_load_dword v8, off, off offset:40 ; 4-byte Folded Reload
+	s_mov_b32 s0, 0x800000
+	.loc	1 1542 50 is_stmt 1             ; fwd_prefill.py:1542:50
+	v_cmp_gt_f32_e32 vcc, s0, v206
+	.loc	1 1598 18                       ; fwd_prefill.py:1598:18
+	s_mul_i32 s0, s24, s16
+	.loc	1 1598 10 is_stmt 0             ; fwd_prefill.py:1598:10
+	s_ashr_i32 s1, s0, 31
+	s_lshl_b64 s[0:1], s[0:1], 2
+	.loc	1 1542 50 is_stmt 1             ; fwd_prefill.py:1542:50
+	v_cndmask_b32_e64 v1, 0, 32, vcc
+	.loc	1 1598 10                       ; fwd_prefill.py:1598:10
+	s_add_u32 s2, s8, s0
+	.loc	1 1599 20                       ; fwd_prefill.py:1599:20
+	s_mul_i32 s0, s25, s20
+	.loc	1 1542 50                       ; fwd_prefill.py:1542:50
+	v_ldexp_f32 v1, v206, v1
+	.loc	1 1598 10                       ; fwd_prefill.py:1598:10
+	s_addc_u32 s3, s9, s1
+	.loc	1 1599 10                       ; fwd_prefill.py:1599:10
+	s_ashr_i32 s1, s0, 31
+	.loc	1 1542 50                       ; fwd_prefill.py:1542:50
+	v_log_f32_e32 v1, v1
+	.loc	1 1599 10                       ; fwd_prefill.py:1599:10
+	s_lshl_b64 s[0:1], s[0:1], 2
+	s_add_u32 s2, s2, s0
+	.loc	1 1542 50                       ; fwd_prefill.py:1542:50
+	v_mov_b32_e32 v0, 0x42000000
+	.loc	1 1599 10                       ; fwd_prefill.py:1599:10
+	s_addc_u32 s3, s3, s1
+	.loc	1 1602 24                       ; fwd_prefill.py:1602:24
+	s_ashr_i32 s19, s18, 31
+	.loc	1 1542 50                       ; fwd_prefill.py:1542:50
+	v_cndmask_b32_e32 v0, 0, v0, vcc
+	.loc	1 1602 24                       ; fwd_prefill.py:1602:24
+	s_lshl_b64 s[0:1], s[18:19], 2
+	.loc	1 1542 50                       ; fwd_prefill.py:1542:50
+	v_sub_f32_e32 v0, v1, v0
+	.loc	1 1602 24                       ; fwd_prefill.py:1602:24
+	s_add_u32 s4, s2, s0
+	.loc	1 1542 37                       ; fwd_prefill.py:1542:37
+	v_fmamk_f32 v0, v205, 0x3fb8aa3b, v0
+	.loc	1 1602 24                       ; fwd_prefill.py:1602:24
+	s_addc_u32 s8, s3, s1
+	.loc	1 1607 32                       ; fwd_prefill.py:1607:32
+	s_add_i32 s0, s18, 0xfffffc80
+	.loc	1 1544 23                       ; fwd_prefill.py:1544:23
+	v_mul_f32_e32 v3, 0x3f317218, v0
+	.loc	1 1608 23                       ; fwd_prefill.py:1608:23
+	s_cmp_lt_i32 s0, 1
+	.loc	1 1141 46                       ; fwd_prefill.py:1141:46
+	s_waitcnt vmcnt(2)
+	v_lshrrev_b32_e32 v2, 1, v6
+	s_waitcnt vmcnt(1)
+	v_or_b32_e32 v2, v2, v4
+	s_waitcnt vmcnt(0)
+	v_and_b32_e32 v7, 0x7f, v8
+	v_lshlrev_b32_e32 v5, 2, v4
+	v_lshlrev_b32_e32 v6, 1, v6
+	v_lshlrev_b32_e32 v4, 2, v7
+	.loc	1 1608 7                        ; fwd_prefill.py:1608:7
+	s_cbranch_scc1 .LBB0_12
+; %bb.11:
+	.loc	1 1141 33                       ; fwd_prefill.py:1141:33
+	v_or_b32_e32 v0, s18, v2
+	s_movk_i32 s0, 0x400
+	.loc	1 1306 36                       ; fwd_prefill.py:1306:36
+	v_cmp_gt_i32_e32 vcc, s0, v0
+	.loc	1 1611 25                       ; fwd_prefill.py:1611:25
+	v_add3_u32 v0, 0, v5, v6
+	s_barrier
+	ds_write_b32 v0, v3
+	v_add_u32_e32 v0, 0, v4
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_read_b32 v0, v0
+	.loc	1 1609 49                       ; fwd_prefill.py:1609:49
+	s_sub_i32 s0, 0x400, s18
+	.loc	1 1611 25                       ; fwd_prefill.py:1611:25
+	v_and_b32_e32 v1, 0x80, v8
+	.loc	1 1610 46                       ; fwd_prefill.py:1610:46
+	v_cmp_gt_i32_e64 s[0:1], s0, v7
+	.loc	1 1611 25                       ; fwd_prefill.py:1611:25
+	v_cmp_eq_u32_e64 s[2:3], 0, v1
+	v_bfrev_b32_e32 v1, 1
+	s_and_b64 s[0:1], s[2:3], s[0:1]
+	s_and_b32 s5, s8, 0xffff
+	s_mov_b32 s7, 0x27000
+	s_mov_b32 s6, 0x7ffffffe
+	v_cndmask_b32_e64 v1, v1, v4, s[0:1]
+	s_and_b64 s[0:1], vcc, exec
+	s_waitcnt lgkmcnt(0)
+	buffer_store_dword v0, v1, s[4:7], 0 offen
+	s_cbranch_execz .LBB0_13
+	s_branch .LBB0_14
+.LBB0_12:
+	.loc	1 0 25 is_stmt 0                ; fwd_prefill.py:0:25
+	s_mov_b64 s[0:1], 0
+.LBB0_13:                               ; %.critedge.critedge
+	.loc	1 1613 25 is_stmt 1             ; fwd_prefill.py:1613:25
+	v_add3_u32 v0, 0, v5, v6
+	s_barrier
+	ds_write_b32 v0, v3
+	v_add_u32_e32 v0, 0, v4
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_read_b32 v0, v0
+	s_movk_i32 s2, 0x80
+	v_bfrev_b32_e32 v1, 1
+	v_cmp_gt_u32_e32 vcc, s2, v8
+	s_and_b32 s5, s8, 0xffff
+	s_mov_b32 s7, 0x27000
+	s_mov_b32 s6, 0x7ffffffe
+	v_cndmask_b32_e32 v1, v1, v4, vcc
+	s_or_b64 s[0:1], s[0:1], exec
+	s_waitcnt lgkmcnt(0)
+	buffer_store_dword v0, v1, s[4:7], 0 offen
+.LBB0_14:                               ; %Flow268
+	.loc	1 0 25 is_stmt 0                ; fwd_prefill.py:0:25
+	s_and_saveexec_b64 s[2:3], s[0:1]
+	s_cbranch_execnz .LBB0_16
+; %bb.15:                               ; %.critedge14
+	.loc	1 1626 4 is_stmt 1              ; fwd_prefill.py:1626:4
+	s_endpgm
+.LBB0_16:                               ; %.critedge
+	.loc	1 1522 22                       ; fwd_prefill.py:1522:22
+	v_div_scale_f32 v0, s[0:1], v206, v206, 1.0
+	v_rcp_f32_e32 v1, v0
+	v_div_scale_f32 v3, vcc, 1.0, v206, 1.0
+	.loc	1 1617 22                       ; fwd_prefill.py:1617:22
+	s_mul_i32 s0, s22, s16
+	.loc	1 1522 22                       ; fwd_prefill.py:1522:22
+	v_fma_f32 v4, -v0, v1, 1.0
+	v_fmac_f32_e32 v1, v4, v1
+	v_mul_f32_e32 v4, v3, v1
+	v_fma_f32 v5, -v0, v4, v3
+	v_fmac_f32_e32 v4, v5, v1
+	v_fma_f32 v0, -v0, v4, v3
+	v_div_fmas_f32 v0, v0, v1, v4
+	v_div_fixup_f32 v4, v0, v206, 1.0
+	.loc	1 1273 64                       ; fwd_prefill.py:1273:64
+	scratch_load_dword v0, off, off offset:52 ; 4-byte Folded Reload
+	.loc	1 1617 14                       ; fwd_prefill.py:1617:14
+	s_ashr_i32 s1, s0, 31
+	s_lshl_b64 s[0:1], s[0:1], 2
+	s_add_u32 s2, s10, s0
+	.loc	1 1617 44 is_stmt 0             ; fwd_prefill.py:1617:44
+	s_mul_i32 s0, s23, s20
+	.loc	1 1617 14                       ; fwd_prefill.py:1617:14
+	s_addc_u32 s3, s11, s1
+	.loc	1 1617 34                       ; fwd_prefill.py:1617:34
+	s_ashr_i32 s1, s0, 31
+	s_lshl_b64 s[0:1], s[0:1], 2
+	s_add_u32 s2, s2, s0
+	.loc	1 1619 24 is_stmt 1             ; fwd_prefill.py:1619:24
+	s_mul_i32 s0, s17, s18
+	.loc	1 1617 34                       ; fwd_prefill.py:1617:34
+	s_addc_u32 s3, s3, s1
+	.loc	1 1619 24                       ; fwd_prefill.py:1619:24
+	s_ashr_i32 s1, s0, 31
+	s_lshl_b64 s[0:1], s[0:1], 2
+	s_add_u32 s0, s2, s0
+	s_addc_u32 s1, s3, s1
+	.loc	1 1273 64                       ; fwd_prefill.py:1273:64
+	s_waitcnt vmcnt(0)
+	v_lshrrev_b32_e32 v0, 3, v0
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_mad_u64_u32 v[6:7], s[2:3], s17, v2, v[0:1]
+	v_add_u32_e32 v0, 0x78, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[8:9], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 0x70, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[10:11], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 0x68, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[12:13], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 0x60, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[14:15], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 0x58, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[16:17], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 0x50, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[18:19], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 0x48, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[20:21], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 64, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[22:23], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 56, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[24:25], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 48, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[26:27], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 40, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[28:29], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 32, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[30:31], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 24, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[32:33], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 16, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[34:35], v[0:1], 2, s[0:1]
+	.loc	1 1619 54                       ; fwd_prefill.py:1619:54
+	v_add_u32_e32 v0, 8, v6
+	.loc	1 1626 21                       ; fwd_prefill.py:1626:21
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_ashrrev_i32_e32 v7, 31, v6
+	v_lshl_add_u64 v[36:37], v[0:1], 2, s[0:1]
+	v_pk_mul_f32 v[2:3], v[160:161], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[156:157], v[4:5] op_sel_hi:[1,0]
+	v_lshl_add_u64 v[6:7], v[6:7], 2, s[0:1]
+	global_store_dwordx4 v[6:7], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[158:159], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[152:153], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[36:37], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[154:155], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[148:149], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[34:35], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[150:151], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[144:145], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[32:33], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[146:147], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[140:141], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[30:31], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[142:143], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[136:137], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[28:29], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[138:139], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[132:133], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[26:27], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[134:135], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[128:129], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[24:25], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[130:131], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[124:125], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[22:23], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[126:127], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[120:121], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[20:21], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[122:123], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[116:117], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[18:19], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[118:119], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[112:113], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[16:17], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[114:115], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[108:109], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[14:15], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[110:111], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[104:105], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[12:13], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[106:107], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[100:101], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[10:11], v[0:3], off
+	s_nop 1
+	v_pk_mul_f32 v[2:3], v[102:103], v[4:5] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[98:99], v[4:5] op_sel_hi:[1,0]
+	global_store_dwordx4 v[8:9], v[0:3], off
+	.loc	1 1626 4 is_stmt 0              ; fwd_prefill.py:1626:4
+	s_endpgm
+.Ltmp4:
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel attn_fwd
+		.amdhsa_group_segment_fixed_size 0
+		.amdhsa_private_segment_fixed_size 60
+		.amdhsa_kernarg_size 208
+		.amdhsa_user_sgpr_count 16
+		.amdhsa_user_sgpr_dispatch_ptr 0
+		.amdhsa_user_sgpr_queue_ptr 0
+		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_user_sgpr_dispatch_id 0
+		.amdhsa_user_sgpr_kernarg_preload_length 14
+		.amdhsa_user_sgpr_kernarg_preload_offset 0
+		.amdhsa_user_sgpr_private_segment_size 0
+		.amdhsa_uses_dynamic_stack 0
+		.amdhsa_enable_private_segment 1
+		.amdhsa_system_sgpr_workgroup_id_x 1
+		.amdhsa_system_sgpr_workgroup_id_y 1
+		.amdhsa_system_sgpr_workgroup_id_z 1
+		.amdhsa_system_sgpr_workgroup_info 0
+		.amdhsa_system_vgpr_workitem_id 0
+		.amdhsa_next_free_vgpr 256
+		.amdhsa_next_free_sgpr 52
+		.amdhsa_accum_offset 256
+		.amdhsa_reserve_vcc 1
+		.amdhsa_reserve_xnack_mask 1
+		.amdhsa_float_round_mode_32 0
+		.amdhsa_float_round_mode_16_64 0
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_float_denorm_mode_16_64 3
+		.amdhsa_dx10_clamp 1
+		.amdhsa_ieee_mode 1
+		.amdhsa_fp16_overflow 0
+		.amdhsa_tg_split 0
+		.amdhsa_exception_fp_ieee_invalid_op 0
+		.amdhsa_exception_fp_denorm_src 0
+		.amdhsa_exception_fp_ieee_div_zero 0
+		.amdhsa_exception_fp_ieee_overflow 0
+		.amdhsa_exception_fp_ieee_underflow 0
+		.amdhsa_exception_fp_ieee_inexact 0
+		.amdhsa_exception_int_div_zero 0
+	.end_amdhsa_kernel
+	.text
+.Lfunc_end0:
+	.size	attn_fwd, .Lfunc_end0-attn_fwd
+	.cfi_endproc
+                                        ; -- End function
+	.set attn_fwd.num_vgpr, 256
+	.set attn_fwd.num_agpr, 0
+	.set attn_fwd.numbered_sgpr, 52
+	.set attn_fwd.private_seg_size, 60
+	.set attn_fwd.uses_vcc, 1
+	.set attn_fwd.uses_flat_scratch, 0
+	.set attn_fwd.has_dyn_sized_stack, 0
+	.set attn_fwd.has_recursion, 0
+	.set attn_fwd.has_indirect_call, 0
+	.section	.AMDGPU.csdata,"",@progbits
+; Kernel info:
+; codeLenInByte = 9072
+; TotalNumSgprs: 58
+; NumVgprs: 256
+; NumAgprs: 0
+; TotalNumVgprs: 256
+; ScratchSize: 60
+; MemoryBound: 0
+; FloatMode: 240
+; IeeeMode: 1
+; LDSByteSize: 0 bytes/workgroup (compile time only)
+; SGPRBlocks: 7
+; VGPRBlocks: 31
+; NumSGPRsForWavesPerEU: 58
+; NumVGPRsForWavesPerEU: 256
+; AccumOffset: 256
+; Occupancy: 2
+; WaveLimiterHint : 0
+; COMPUTE_PGM_RSRC2:SCRATCH_EN: 1
+; COMPUTE_PGM_RSRC2:USER_SGPR: 16
+; COMPUTE_PGM_RSRC2:TRAP_HANDLER: 0
+; COMPUTE_PGM_RSRC2:TGID_X_EN: 1
+; COMPUTE_PGM_RSRC2:TGID_Y_EN: 1
+; COMPUTE_PGM_RSRC2:TGID_Z_EN: 1
+; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 0
+; COMPUTE_PGM_RSRC3_GFX90A:ACCUM_OFFSET: 63
+; COMPUTE_PGM_RSRC3_GFX90A:TG_SPLIT: 0
+	.text
+	.p2alignl 6, 3212836864
+	.fill 256, 4, 3212836864
+	.section	.AMDGPU.gpr_maximums,"",@progbits
+	.set amdgpu.max_num_vgpr, 0
+	.set amdgpu.max_num_agpr, 0
+	.set amdgpu.max_num_sgpr, 0
+	.text
+	.section	.debug_abbrev,"",@progbits
+	.byte	1                               ; Abbreviation Code
+	.byte	17                              ; DW_TAG_compile_unit
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	37                              ; DW_AT_producer
+	.byte	14                              ; DW_FORM_strp
+	.byte	19                              ; DW_AT_language
+	.byte	5                               ; DW_FORM_data2
+	.byte	3                               ; DW_AT_name
+	.byte	14                              ; DW_FORM_strp
+	.byte	16                              ; DW_AT_stmt_list
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	27                              ; DW_AT_comp_dir
+	.byte	14                              ; DW_FORM_strp
+	.byte	17                              ; DW_AT_low_pc
+	.byte	1                               ; DW_FORM_addr
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	2                               ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	3                               ; DW_AT_name
+	.byte	14                              ; DW_FORM_strp
+	.byte	32                              ; DW_AT_inline
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	3                               ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	17                              ; DW_AT_low_pc
+	.byte	1                               ; DW_FORM_addr
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	4                               ; Abbreviation Code
+	.byte	29                              ; DW_TAG_inlined_subroutine
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	17                              ; DW_AT_low_pc
+	.byte	1                               ; DW_FORM_addr
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	88                              ; DW_AT_call_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	89                              ; DW_AT_call_line
+	.byte	5                               ; DW_FORM_data2
+	.byte	87                              ; DW_AT_call_column
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	0                               ; EOM(3)
+	.section	.debug_info,"",@progbits
+.Lcu_begin0:
+	.long	.Ldebug_info_end0-.Ldebug_info_start0 ; Length of Unit
+.Ldebug_info_start0:
+	.short	4                               ; DWARF version number
+	.long	.debug_abbrev                   ; Offset Into Abbrev. Section
+	.byte	8                               ; Address Size (in bytes)
+	.byte	1                               ; Abbrev [1] 0xb:0x4d DW_TAG_compile_unit
+	.long	.Linfo_string0                  ; DW_AT_producer
+	.short	2                               ; DW_AT_language
+	.long	.Linfo_string1                  ; DW_AT_name
+	.long	.Lline_table_start0             ; DW_AT_stmt_list
+	.long	.Linfo_string2                  ; DW_AT_comp_dir
+	.quad	.Lfunc_begin0                   ; DW_AT_low_pc
+	.long	.Lfunc_end0-.Lfunc_begin0       ; DW_AT_high_pc
+	.byte	2                               ; Abbrev [2] 0x2a:0x6 DW_TAG_subprogram
+	.long	.Linfo_string3                  ; DW_AT_name
+	.byte	1                               ; DW_AT_inline
+	.byte	3                               ; Abbrev [3] 0x30:0x27 DW_TAG_subprogram
+	.quad	.Lfunc_begin0                   ; DW_AT_low_pc
+	.long	.Lfunc_end0-.Lfunc_begin0       ; DW_AT_high_pc
+	.long	42                              ; DW_AT_abstract_origin
+	.byte	4                               ; Abbrev [4] 0x41:0x15 DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.quad	.Ltmp2                          ; DW_AT_low_pc
+	.long	.Ltmp3-.Ltmp2                   ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_call_file
+	.short	1430                            ; DW_AT_call_line
+	.byte	12                              ; DW_AT_call_column
+	.byte	0                               ; End Of Children Mark
+	.byte	0                               ; End Of Children Mark
+.Ldebug_info_end0:
+	.section	.debug_str,"MS",@progbits,1
+.Linfo_string0:
+	.asciz	"triton"                        ; string offset=0
+.Linfo_string1:
+	.asciz	"fwd_prefill.py"                ; string offset=7
+.Linfo_string2:
+	.asciz	"/sgl-workspace/aiter/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd" ; string offset=22
+.Linfo_string3:
+	.asciz	"attn_fwd"                      ; string offset=98
+	.section	".note.GNU-stack","",@progbits
+	.amdgpu_metadata
+---
+amdhsa.kernels:
+  - .agpr_count:     0
+    .args:
+      - .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         24
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         40
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         48
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         52
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         56
+        .size:           4
+        .value_kind:     by_value
+      - .address_space:  global
+        .offset:         64
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         72
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         80
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         84
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         88
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         92
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         96
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         100
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         104
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         108
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         112
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         116
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         120
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         124
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         128
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         132
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         136
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         140
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         144
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         148
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         152
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         156
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         160
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         164
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         168
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         172
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         176
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         180
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         184
+        .size:           4
+        .value_kind:     by_value
+      - .address_space:  global
+        .offset:         192
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         200
+        .size:           8
+        .value_kind:     global_buffer
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 208
+    .max_flat_workgroup_size: 256
+    .name:           attn_fwd
+    .private_segment_fixed_size: 60
+    .sgpr_count:     58
+    .sgpr_spill_count: 0
+    .symbol:         attn_fwd.kd
+    .uses_dynamic_stack: false
+    .vgpr_count:     256
+    .vgpr_spill_count: 14
+    .wavefront_size: 64
+amdhsa.target:   amdgcn-amd-amdhsa--gfx950
+amdhsa.version:
+  - 1
+  - 2
+...
+
+	.end_amdgpu_metadata
+	.section	.debug_line,"",@progbits
+.Lline_table_start0:

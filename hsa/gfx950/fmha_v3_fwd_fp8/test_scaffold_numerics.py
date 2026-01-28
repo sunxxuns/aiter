@@ -137,6 +137,21 @@ def main():
         Q = (torch.randn(B, H, s_q, D, device="cuda") * 0.1).to(fp8_dtype)
         K = (torch.randn(B, H, s_k, D, device="cuda") * 0.1).to(fp8_dtype)
         V = (torch.randn(B, H, s_k, D, device="cuda") * 0.1).to(fp8_dtype)
+
+    # ---------------------------------------------------------------------
+    # Operand-isolation overrides (apply after initial init path)
+    # ---------------------------------------------------------------------
+    if os.environ.get("NUMERICS_Q_ONES", "0") == "1":
+        Q = torch.ones(B, H, s_q, D, device="cuda", dtype=torch.float32).to(fp8_dtype)
+    if os.environ.get("NUMERICS_K_ONES", "0") == "1":
+        K = torch.ones(B, H, s_k, D, device="cuda", dtype=torch.float32).to(fp8_dtype)
+    if os.environ.get("NUMERICS_V_ONES", "0") == "1":
+        V = torch.ones(B, H, s_k, D, device="cuda", dtype=torch.float32).to(fp8_dtype)
+    if os.environ.get("NUMERICS_V_ROWID", "0") == "1":
+        Vf32 = torch.empty(B, H, s_k, D, device="cuda", dtype=torch.float32)
+        for r in range(s_k):
+            Vf32[0, 0, r, :] = float(r)
+        V = Vf32.to(fp8_dtype)
     if os.environ.get("NUMERICS_ZERO_Q", "0") == "1":
         Q.zero_()
     if os.environ.get("NUMERICS_ZERO_K", "0") == "1":
@@ -152,6 +167,7 @@ def main():
     stride_kh = s_k * D
     stride_vh = s_k * D
     stride_oh = s_q * D * 4    # bytes for FP32
+    debug_flags = int(os.environ.get("NUMERICS_DEBUG_FLAGS", "0"), 0)
 
     args = [
         ctypes.c_void_p(O.data_ptr()),
@@ -163,6 +179,7 @@ def main():
         ctypes.c_int32(stride_kh),
         ctypes.c_int32(stride_vh),
         ctypes.c_int32(stride_oh),
+        ctypes.c_int32(debug_flags),
     ]
     args_ptrs = (ctypes.c_void_p * len(args))(
         *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]

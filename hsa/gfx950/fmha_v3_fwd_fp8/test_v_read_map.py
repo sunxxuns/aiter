@@ -18,6 +18,15 @@ CO = f"{BASE_DIR}/fwd_fp8_v_read_dump.co"
 
 def build_kernel():
     obj = f"{BASE_DIR}/fwd_fp8_v_read_dump.o"
+    # Cache build: only rebuild if missing or source is newer than .co
+    try:
+        src_mtime = os.path.getmtime(SRC)
+        co_mtime = os.path.getmtime(CO)
+        if co_mtime >= src_mtime:
+            return CO
+    except FileNotFoundError:
+        pass
+
     cmd = (
         f"/opt/rocm/llvm/bin/clang -x assembler -target amdgcn-amd-amdhsa "
         f"-mcpu=gfx950 -mno-xnack -c {SRC} -o {obj} && "
@@ -66,6 +75,8 @@ def decode_fp8_bytes(byte_tensor):
 
 
 def main():
+    quiet = os.environ.get("V_READ_QUIET", "0") == "1"
+    save_packed_only = os.environ.get("V_READ_SAVE_PACKED_ONLY", "0") == "1"
     # Build V with per-row or per-col code values
     codes = build_codebook(32)
     codes_f = codes.to(device="cuda", dtype=torch.float32)
@@ -97,6 +108,18 @@ def main():
                 k_id = r & 31
                 byte_ids = ((col_blocks << 5) | k_id).to(torch.long)
                 V[0, 0, r, :] = byte_lut[byte_ids].float()
+    elif v_map == "rowbyte":
+        # Raw byte pattern: every element in row r is byte=r (unique per row).
+        if use_v_raw:
+            v_bytes = torch.empty((S_k, 128), dtype=torch.uint8, device="cuda")
+            for r in range(S_k):
+                v_bytes[r, :] = (r & 0xFF)
+            V_raw = v_bytes.view(torch.float8_e4m3fn)
+            V[0, 0, :, :] = V_raw.float()
+        else:
+            byte_lut = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(device="cuda")
+            for r in range(S_k):
+                V[0, 0, r, :] = byte_lut[(r & 0xFF)].float()
     elif v_map == "colbyte":
         byte_lut = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(device="cuda")
         col_bytes = torch.arange(128, dtype=torch.long, device="cuda")
@@ -169,54 +192,59 @@ def main():
     raw = out.detach().cpu().view(256, 40)
     bytes_flat = raw[:, :32].contiguous().view(torch.uint8).view(256, 32, 4)
     decoded = decode_fp8_bytes(bytes_flat).reshape(256, 128)
-    if v_map in ("colbyte", "blockk"):
+    if v_map in ("colbyte", "blockk", "rowbyte"):
         row_idx = bytes_flat.reshape(256, 128).to(torch.int32)
     else:
         row_idx = map_to_codes(decoded, codes) + tile * 32
 
     packed_bytes = raw[:, 32:40].contiguous().view(torch.uint8).view(256, 8, 4)
     packed_decoded = decode_fp8_bytes(packed_bytes).reshape(256, 32)
-    if v_map in ("colbyte", "blockk"):
+    if v_map in ("colbyte", "blockk", "rowbyte"):
         packed_row_idx = packed_bytes.reshape(256, 32).to(torch.int32)
     else:
         packed_row_idx = map_to_codes(packed_decoded, codes) + tile * 32
 
-    # Report mapping for first wave (lanes 0..31)
-    lane_rows = [int(row_idx[lane, 0].item()) for lane in range(32)]
-    print(f"tile={tile} lane->row (pos0) 0..31:", lane_rows)
-    for lane in range(8):
-        print("lane", lane, "row ids set0:", row_idx[lane, :8].tolist())
+    if not quiet:
+        # Report mapping for first wave (lanes 0..31)
+        lane_rows = [int(row_idx[lane, 0].item()) for lane in range(32)]
+        print(f"tile={tile} lane->row (pos0) 0..31:", lane_rows)
+        for lane in range(8):
+            print("lane", lane, "row ids set0:", row_idx[lane, :8].tolist())
 
-    # Show k indices per lane/reg byte for lane 0
-    print("lane0 k_idx set0 pos0..15:", row_idx[0, :16].tolist())
-    print("lane0 k_idx set1 pos32..47:", row_idx[0, 32:48].tolist())
-    print("lane0 k_idx set2 pos64..79:", row_idx[0, 64:80].tolist())
-    print("lane0 k_idx set3 pos96..111:", row_idx[0, 96:112].tolist())
+        # Show k indices per lane/reg byte for lane 0
+        print("lane0 k_idx set0 pos0..15:", row_idx[0, :16].tolist())
+        print("lane0 k_idx set1 pos32..47:", row_idx[0, 32:48].tolist())
+        print("lane0 k_idx set2 pos64..79:", row_idx[0, 64:80].tolist())
+        print("lane0 k_idx set3 pos96..111:", row_idx[0, 96:112].tolist())
 
     if os_env.get("V_READ_DEBUG", "0") == "1":
         print("lane0 decoded pos28..40:", decoded[0, 28:41].tolist())
         print("lane0 decoded pos48..56:", decoded[0, 48:57].tolist())
 
-    # Dump mapping CSV (raw TR8 read sets)
-    out_path = f"{BASE_DIR}/v_read_mapping.csv"
-    with open(out_path, "w") as f:
-        f.write("lane,pos,k\n")
-        for lane in range(64):
-            for pos in range(128):
-                f.write(f"{lane},{pos},{int(row_idx[lane, pos].item())}\n")
-    print(f"wrote {out_path}")
-
-    # Dump packed A-reg mapping (k order)
+    # Dump packed A-reg mapping (k order) (always; used by solvers)
     packed_path = f"{BASE_DIR}/v_read_packed.csv"
     with open(packed_path, "w") as f:
         f.write("lane,k,row\n")
         for lane in range(64):
             for k in range(32):
                 f.write(f"{lane},{k},{int(packed_row_idx[lane, k].item())}\n")
-    print(f"wrote {packed_path}")
+    if not quiet:
+        print(f"wrote {packed_path}")
 
-    print("lane0 packed k->row:", packed_row_idx[0, :16].tolist(), packed_row_idx[0, 16:32].tolist())
-    print("lane32 packed k->row:", packed_row_idx[32, :16].tolist(), packed_row_idx[32, 16:32].tolist())
+    if not save_packed_only:
+        # Dump full mapping CSV (raw TR8 read sets)
+        out_path = f"{BASE_DIR}/v_read_mapping.csv"
+        with open(out_path, "w") as f:
+            f.write("lane,pos,k\n")
+            for lane in range(64):
+                for pos in range(128):
+                    f.write(f"{lane},{pos},{int(row_idx[lane, pos].item())}\n")
+        if not quiet:
+            print(f"wrote {out_path}")
+
+    if not quiet:
+        print("lane0 packed k->row:", packed_row_idx[0, :16].tolist(), packed_row_idx[0, 16:32].tolist())
+        print("lane32 packed k->row:", packed_row_idx[32, :16].tolist(), packed_row_idx[32, 16:32].tolist())
 
 
 if __name__ == "__main__":

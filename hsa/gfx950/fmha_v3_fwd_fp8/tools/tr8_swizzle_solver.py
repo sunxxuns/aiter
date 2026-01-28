@@ -114,7 +114,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", type=lambda x: int(x, 0), default=0xA400)
     parser.add_argument("--s25", type=lambda x: int(x, 0), default=0xB80)
-    parser.add_argument("--lanes", type=int, default=64)
+    parser.add_argument("--lanes", type=int, default=64,
+                        help="Legacy: used for both reads and writes")
+    parser.add_argument("--lanes-read", type=int, default=0,
+                        help="If set, lanes for TR8 reads (overrides --lanes)")
+    parser.add_argument("--lanes-write", type=int, default=0,
+                        help="If set, lanes for V writes (overrides --lanes)")
     parser.add_argument("--offsets", type=str, default="0,256,512,768,1024,1152,1280,1408,2048,2176,2304,2432,4096")
     parser.add_argument("--offset-count", type=int, default=2, choices=[2, 4, 6, 8])
     parser.add_argument("--max-offset-combos", type=int, default=0,
@@ -126,20 +131,25 @@ def main() -> None:
                         help="Limit total evaluations (0 = unlimited)")
     parser.add_argument("--time-limit", type=int, default=60,
                         help="Stop after N seconds (0 = unlimited)")
+    parser.add_argument("--require-16b-align", action="store_true",
+                        help="Require write base to be 16B-aligned for all write lanes")
+    parser.add_argument("--require-permutation-4k", action="store_true",
+                        help="Require write bases to be a 4KB 16B-block permutation (lanes_write must be 256)")
     args = parser.parse_args()
 
     base = args.base
     s25 = args.s25
-    lanes = args.lanes
+    lanes_read = args.lanes_read or args.lanes
+    lanes_write = args.lanes_write or args.lanes
     offsets = [int(x, 0) for x in args.offsets.split(",") if x.strip()]
 
     # Precompute read addresses per lane
     read_addrs_all: List[Set[int]] = []
-    for tid in range(lanes):
+    for tid in range(lanes_read):
         read_addrs_all.append(tr8_read_addrs(tid, s25, base))
     total_reads = sum(len(r) for r in read_addrs_all)
-    tr8_base_cache = [tr8_base(tid, s25) for tid in range(lanes)]
-    write_base_cache = [write_base(tid) for tid in range(lanes)]
+    tr8_base_cache = [tr8_base(tid, s25) for tid in range(lanes_write)]
+    write_base_cache = [write_base(tid) for tid in range(lanes_write)]
 
     # Search space
     base_kinds = ["write", "tr8", "tr8lin", "linear"]
@@ -189,7 +199,36 @@ def main() -> None:
                                 if args.time_limit and (time.time() - start) > args.time_limit:
                                     break
                                 write_addrs: Set[int] = set()
-                                for tid in range(lanes):
+                                bases_seen = set()
+                                for tid in range(lanes_write):
+                                    b = apply_swizzle(
+                                        tid,
+                                        base_kind,
+                                        base_xor,
+                                        tid_mask,
+                                        tid_shift,
+                                        mod_mask,
+                                        mod_shift,
+                                        xor_shift,
+                                        s25,
+                                        linear_shifts,
+                                        tr8_base_cache,
+                                        write_base_cache,
+                                    )
+                                    if args.require_16b_align and (b & 0xF) != 0:
+                                        # invalidate candidate quickly
+                                        write_addrs = set()
+                                        break
+                                    if args.require_permutation_4k:
+                                        if lanes_write != 256:
+                                            raise RuntimeError("--require-permutation-4k requires --lanes-write 256")
+                                        if b < 0 or b >= 4096 or (b & 0xF) != 0:
+                                            write_addrs = set()
+                                            break
+                                        if b in bases_seen:
+                                            write_addrs = set()
+                                            break
+                                        bases_seen.add(b)
                                     write_addrs |= write_addrs_for_lane(
                                         tid,
                                         base_kind,
@@ -206,6 +245,10 @@ def main() -> None:
                                         tr8_base_cache,
                                         write_base_cache,
                                     )
+                                if args.require_16b_align and not write_addrs:
+                                    continue
+                                if args.require_permutation_4k and not write_addrs:
+                                    continue
                                 covered = 0
                                 for reads in read_addrs_all:
                                     covered += sum(1 for a in reads if a in write_addrs)
