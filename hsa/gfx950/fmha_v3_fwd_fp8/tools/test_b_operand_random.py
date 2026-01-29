@@ -69,6 +69,15 @@ def _launch_dump(
     stride_oh: int,
     debug_flags: int,
     v_read_cb: int = 0,
+    v_read_lane_add: int = 0,
+    v_read_v3_xor: int = 0,
+    v_read_v3_add: int = 0,
+    v_read_v4_add: int = 0,
+    v_read_v2_add: int = 0,
+    v_read_base_add: int = 0,
+    v_read_base_xor: int = 0,
+    v_read_base_extra_add: int = 0,
+    v_read_s25_override: int = 0,
 ):
     # out_u32 is used as O_ptr for debug dumps (raw u32 stores)
     args = [

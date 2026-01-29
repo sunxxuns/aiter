@@ -10182,6 +10182,16 @@ SKIP_DUMP_PV_ACC0:
     s_waitcnt vmcnt(0)
     s_endpgm
 SKIP_B1_DEBUG:
+    // Restore PV B operand (P) before each MFMA. v0..v7 are reused as scratch
+    // between MFMA calls, but PV always uses the same B operand.
+    v_mov_b32_e32 v0, v232
+    v_mov_b32_e32 v1, v233
+    v_mov_b32_e32 v2, v234
+    v_mov_b32_e32 v3, v235
+    v_mov_b32_e32 v4, v236
+    v_mov_b32_e32 v5, v237
+    v_mov_b32_e32 v6, v238
+    v_mov_b32_e32 v7, v239
     v_mfma_f32_32x32x64_f8f6f4 v[80:95], v[48:55], v[0:7], v[80:95]
     // Pack B regs for col block 2 (blockk+kbyte mapping)
     v_mov_b32_e32 v0, 0
@@ -10313,6 +10323,14 @@ SKIP_B1_DEBUG:
     s_waitcnt vmcnt(0)
     s_endpgm
 SKIP_B2_DEBUG:
+    v_mov_b32_e32 v0, v232
+    v_mov_b32_e32 v1, v233
+    v_mov_b32_e32 v2, v234
+    v_mov_b32_e32 v3, v235
+    v_mov_b32_e32 v4, v236
+    v_mov_b32_e32 v5, v237
+    v_mov_b32_e32 v6, v238
+    v_mov_b32_e32 v7, v239
     v_mfma_f32_32x32x64_f8f6f4 v[96:111], v[48:55], v[0:7], v[96:111]
     // Pack B regs for col block 3 (blockk+kbyte mapping)
     v_mov_b32_e32 v0, 0
@@ -10403,6 +10421,14 @@ SKIP_B2_DEBUG:
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 24, v180
     v_or_b32_e32 v2, v2, v180
+    v_mov_b32_e32 v0, v232
+    v_mov_b32_e32 v1, v233
+    v_mov_b32_e32 v2, v234
+    v_mov_b32_e32 v3, v235
+    v_mov_b32_e32 v4, v236
+    v_mov_b32_e32 v5, v237
+    v_mov_b32_e32 v6, v238
+    v_mov_b32_e32 v7, v239
     v_mfma_f32_32x32x64_f8f6f4 v[112:127], v[48:55], v[0:7], v[112:127]
 
     // Prefetch next tile pair (if any)
