@@ -20,8 +20,13 @@ These flags are intended for **surgical, reproducible** debugging (dump-and-exit
 - **`0x00400000`**: Select solver-derived V-write swizzle (`bitop3:0x7a, C=0`) instead of baseline (`bitop3:0x78`).
 - **`0x01000000`**: Dump raw TR8 read regs (`v200..v231`) and exit (used to prove A-isolation failures).
 - **`0x02000000`**: Dump selected packed **V→A** regs (`v48..v55`, 32 bytes) and exit.
-- **`0x04000000`**: Dump **all four lane-group** packed V→A groups and the selected one, then exit.
+- **`0x00200000`**: Dump selected packed **V→A** regs (`v48..v55`, 32 bytes) **immediately after V-pack selection** and exit (recommended).
+- **`0x04000000`**: Clamp PV TR8 base offsets to a 4KB window (debug helper; can hide true aliasing).
+- **`0x00800000`**: Dump **all four lane-group** packed V→A groups and the selected one, then exit.
 - **`0x20000000`**: Enable the **legacy P→A remap** path (debug-only; must be OFF for real PV correctness).
+- **`0x10000000`**: Debug-only: **recompute TR8 reads and repack V** into MFMA A regs immediately before PV MFMA (very slow; correctness harness).
+- **`0x00008000`**: Debug-only: use the **solver V-write layout** (TR8-coverage booster) instead of the normal V LDS write.
+- **`0x00002000`**: Debug-only: dump **V LDS base + pre-add swizzle addr** for the *prefetch* V write path.
 - **`0x80000000`**: Dump **MFMA operands** and exit (older combined debug path).
 
 ### ISA notes (TR8)
