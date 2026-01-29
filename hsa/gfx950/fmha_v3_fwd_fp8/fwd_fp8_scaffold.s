@@ -22,6 +22,16 @@
 _fwd_fp8_scaffold:
     s_mov_b64 exec, -1
 
+    // ISA requirement for correct BF8/FP8 math:
+    // SH_MEM_CONFIG.bit[8] must be set to 1 (CDNA4 ISA §7.3).
+    //
+    // The assembler does not provide a named HW_REG_SH_MEM_CONFIG on this target,
+    // so we use the numeric HWREG id for MEM_BASES (id=15) as a proxy that maps
+    // to SH_MEM_CONFIG/SH_MEM_BASES on CDNA-family hardware.
+    s_getreg_b32 s36, hwreg(15, 0, 32)
+    s_or_b32 s36, s36, 0x00000100
+    s_setreg_b32 hwreg(15, 0, 32), s36
+
     // ------------------------------------------------------------------------
     // Load kernel arguments
     // ------------------------------------------------------------------------
@@ -212,6 +222,9 @@ SKIP_LDS_BASE_DEBUG:
     // ------------------------------------------------------------------------
     // Initialize O accumulators (v[64:127])
     // ------------------------------------------------------------------------
+    // Make sure all lanes execute the zeroing. Some earlier sections use
+    // s_and_saveexec for tid<256 LDS writes; we must not inherit a masked EXEC.
+    s_mov_b64 exec, -1
     .irp i, 64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79
         v_mov_b32_e32 v\i, 0
     .endr
@@ -526,6 +539,10 @@ SKIP_V_TR8_WRITES:
 K_LOOP:
     s_waitcnt vmcnt(0)
     s_barrier
+    // MFMA and LDS reads are not predicated by EXEC (MFMA ignores EXEC),
+    // but many setup steps (ds_read, packing) are. Ensure we're not inheriting
+    // a masked EXEC from earlier tid<256 load/store sections.
+    s_mov_b64 exec, -1
 
     s_cmp_ge_u32 s30, s20
     s_cbranch_scc1 K_LOOP_END
@@ -4952,6 +4969,18 @@ SKIP_DUMP_B:
 
 PV_MFMA_START:
     // PV MFMA using TR8 V reads (K=64, tiles 0+1)
+    // PV MFMA expects B operand in v0..v7, but the base-address synthesis below clobbers v2..v10.
+    // Preserve mixed/packed P (currently in v48..v55) into a stable temp range (v232..v239),
+    // and restore into v0..v7 immediately before the PV MFMA.
+    v_mov_b32_e32 v232, v48
+    v_mov_b32_e32 v233, v49
+    v_mov_b32_e32 v234, v50
+    v_mov_b32_e32 v235, v51
+    v_mov_b32_e32 v236, v52
+    v_mov_b32_e32 v237, v53
+    v_mov_b32_e32 v238, v54
+    v_mov_b32_e32 v239, v55
+
     // TR8 base for PV A operand reads.
     // Default: historical "+1 lane" tweak.
     // Option (debug_flags 0x00000040): oracle-guided candidate
@@ -5222,6 +5251,47 @@ PV_TR8_BASE_READY:
     s_endpgm
 SKIP_TR8_ADDR_DEBUG:
 
+    // Debug (solver knob): per-base tweak for v23/v24 only.
+    // Motivation: our raw TR8 dump shows missing ks clustered around the v23/v24-based reads:
+    //   ds_read_b64_tr_b8 v[212:213], v23 offset:1280
+    //   ds_read_b64_tr_b8 v[214:215], v24 offset:1408
+    //
+    // Encoding:
+    //   t23 = (v_read_cb >> 12) & 0xF, apply v23 ^= (t23 << 5)
+    //   t24 = (v_read_cb >> 16) & 0xF, apply v24 ^= (t24 << 5)
+    // Active only when debug_flags 0x00000004 (v_read_cb base path) is enabled.
+    s_and_b32 s36, s35, 0x00000004
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_V24_TWEAK
+    v_mov_b32_e32 v180, s37
+    v_lshrrev_b32_e32 v180, 12, v180
+    v_and_b32_e32 v180, 0xF, v180
+    v_lshlrev_b32_e32 v180, 5, v180
+    v_xor_b32_e32 v23, v23, v180
+    v_mov_b32_e32 v180, s37
+    v_lshrrev_b32_e32 v180, 16, v180
+    v_and_b32_e32 v180, 0xF, v180
+    v_lshlrev_b32_e32 v180, 5, v180
+    v_xor_b32_e32 v24, v24, v180
+SKIP_V24_TWEAK:
+
+    // Debug: sanity-check identity V LDS content at a fixed row.
+    // Flag: debug_flags 0x40000000
+    // Reads LDS at: V_LDS0 + 57 * 128 bytes = 41984 + 7296 = 49280
+    // If identity V write is correct for rowbyte V[k,*]=k, this should read 0x39393939 (byte 57).
+    s_and_b32 s36, s35, 0x40000000
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_V_LDS_ROW57_CHECK
+    s_mov_b64 exec, -1
+    v_mov_b32_e32 v180, 49280
+    ds_read_b32 v240, v180 offset:0
+    s_waitcnt lgkmcnt(0)
+    v_lshlrev_b32_e32 v181, 2, v60        // tid * 4 bytes
+    buffer_store_dword v240, v181, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_V_LDS_ROW57_CHECK:
+
     // ISA requirement for MFMA transpose LDS loads:
     // EXEC must be all-ones prior to DS_READ_*_TR_* instructions.
     s_mov_b64 exec, -1
@@ -5245,7 +5315,9 @@ SKIP_TR8_ADDR_DEBUG:
     ds_read_b64_tr_b8 v[208:209], v21 offset:1024
     ds_read_b64_tr_b8 v[210:211], v22 offset:1152
     ds_read_b64_tr_b8 v[212:213], v23 offset:1280
-    ds_read_b64_tr_b8 v[214:215], v24 offset:1408
+
+    // v24-based read: use offset:0 (the historical offset:1408 can go out-of-range for K=64 tiles).
+    ds_read_b64_tr_b8 v[214:215], v24 offset:0
     ds_read_b64_tr_b8 v[216:217], v20 offset:2048
     ds_read_b64_tr_b8 v[218:219], v20 offset:2176
     ds_read_b64_tr_b8 v[220:221], v20 offset:2304
@@ -5254,6 +5326,48 @@ SKIP_TR8_ADDR_DEBUG:
     ds_read_b64_tr_b8 v[226:227], v26 offset:3200
     ds_read_b64_tr_b8 v[228:229], v27 offset:3328
     ds_read_b64_tr_b8 v[230:231], v28 offset:3456
+
+    // Debug (solver harness): optional extra TR8 read from selectable base + delta.
+    // Enable with debug_flags 0x00800000. delta is encoded in v_read_cb bits [27:20]:
+    //   delta_bytes = ((v_read_cb >> 20) & 0xFF) << 7   (128-byte granularity; one FP8 row for D=128B)
+    // base_sel is encoded in v_read_cb bits [31:28]:
+    //   0..8 select v20..v28 as the base address
+    // Destination: v[232:233]. If enabled, raw-dump path will also store v232..v235.
+    s_and_b32 s36, s35, 0x00800000
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_TR8_EXTRA_READ
+    // Extract base_sel into v190.
+    v_mov_b32_e32 v190, s37
+    v_lshrrev_b32_e32 v190, 28, v190
+    v_and_b32_e32 v190, 0xF, v190
+
+    // Select base v191 = v20..v28 based on base_sel (default v20).
+    v_mov_b32_e32 v191, v20
+    v_cmp_eq_u32_e32 vcc, 1, v190
+    v_cndmask_b32_e32 v191, v191, v21, vcc
+    v_cmp_eq_u32_e32 vcc, 2, v190
+    v_cndmask_b32_e32 v191, v191, v22, vcc
+    v_cmp_eq_u32_e32 vcc, 3, v190
+    v_cndmask_b32_e32 v191, v191, v23, vcc
+    v_cmp_eq_u32_e32 vcc, 4, v190
+    v_cndmask_b32_e32 v191, v191, v24, vcc
+    v_cmp_eq_u32_e32 vcc, 5, v190
+    v_cndmask_b32_e32 v191, v191, v25, vcc
+    v_cmp_eq_u32_e32 vcc, 6, v190
+    v_cndmask_b32_e32 v191, v191, v26, vcc
+    v_cmp_eq_u32_e32 vcc, 7, v190
+    v_cndmask_b32_e32 v191, v191, v27, vcc
+    v_cmp_eq_u32_e32 vcc, 8, v190
+    v_cndmask_b32_e32 v191, v191, v28, vcc
+
+    v_mov_b32_e32 v180, s37
+    v_lshrrev_b32_e32 v180, 20, v180
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 7, v180
+    v_add_u32_e32 v191, v191, v180
+    v_and_b32_e32 v191, 0xFFFFFFF8, v191
+    ds_read_b64_tr_b8 v[232:233], v191 offset:0
+SKIP_TR8_EXTRA_READ:
     s_waitcnt lgkmcnt(0)
 
     // Debug: dump raw TR8 read regs v200..v231
@@ -5276,19 +5390,145 @@ SKIP_TR8_ADDR_DEBUG:
     buffer_store_dwordx4 v[224:227], v181, s[4:7], 0 offen
     v_add_u32_e32 v181, 112, v180
     buffer_store_dwordx4 v[228:231], v181, s[4:7], 0 offen
+
+    // If extra read is enabled, append 16 bytes at +128B:
+    //   [v232, v233, v190 (addr used), v_read_cb]
+    s_and_b32 s36, s35, 0x00800000
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_TR8_EXTRA_DUMP
+    v_mov_b32_e32 v234, v191
+    v_mov_b32_e32 v235, s37
+    v_add_u32_e32 v181, 128, v180
+    buffer_store_dwordx4 v[232:235], v181, s[4:7], 0 offen
+SKIP_TR8_EXTRA_DUMP:
     s_waitcnt vmcnt(0)
     s_endpgm
 SKIP_TR8_DEBUG:
 
-    // Build A regs for group0 (lane0)
-    v_mov_b32_e32 v0, 0
-    v_mov_b32_e32 v1, 0
-    v_mov_b32_e32 v2, 0
-    v_mov_b32_e32 v3, 0
-    v_mov_b32_e32 v4, 0
-    v_mov_b32_e32 v5, 0
-    v_mov_b32_e32 v6, 0
-    v_mov_b32_e32 v7, 0
+    // Directly pack selected V->A regs into v48..v55 from raw TR8 read regs v200..v231.
+    // This mapping was solved deterministically with rowbyte V[k,*]=k across all 512 threads
+    // for the FP8 32x32x64 dense layout (CDNA4 ISA 7.1.5.1):
+    //   lanes 0..31: [0..15, 32..47]
+    //   lanes 32..63: [16..31, 48..63]
+    //
+    // Packed byte positions p0..p31 map to raw byte indices r (within the 128B raw dump):
+    //   p0..p3   -> r0..r3   (v200 byte0..3)
+    //   p4..p7   -> r4..r7   (v201 byte0..3)
+    //   p8..p11  -> r14,r15,r22,r23  (v203 b2,b3; v205 b2,b3)
+    //   p12..p15 -> r30,r31,r38,r39  (v207 b2,b3; v209 b2,b3)
+    //   p16..p19 -> r103,r104,r105,r106 (v225 b3; v226 b0..2)
+    //   p20..p23 -> r107,r108,r109,r110 (v226 b3; v227 b0..2)
+    //   p24..p27 -> r111,r56,r48,r49 (v227 b3; v214 b0; v212 b0..1)
+    //   p28..p31 -> r50,r51,r52,r53 (v212 b2..3; v213 b0..1)
+    //
+    // Note: this bypasses the older 4-group pack+select logic entirely.
+    v_mov_b32_e32 v48, v200
+    v_mov_b32_e32 v49, v201
+
+    v_mov_b32_e32 v50, 0
+    v_lshrrev_b32_e32 v180, 16, v203
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v50, v50, v180
+    v_lshrrev_b32_e32 v180, 24, v203
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v50, v50, v180
+    v_lshrrev_b32_e32 v180, 16, v205
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v50, v50, v180
+    v_lshrrev_b32_e32 v180, 24, v205
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v50, v50, v180
+
+    v_mov_b32_e32 v51, 0
+    v_lshrrev_b32_e32 v180, 16, v207
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v51, v51, v180
+    v_lshrrev_b32_e32 v180, 24, v207
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v51, v51, v180
+    v_lshrrev_b32_e32 v180, 16, v209
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v51, v51, v180
+    v_lshrrev_b32_e32 v180, 24, v209
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v51, v51, v180
+
+    v_mov_b32_e32 v52, 0
+    v_lshrrev_b32_e32 v180, 24, v225
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v52, v52, v180
+    v_lshrrev_b32_e32 v180, 0, v226
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v52, v52, v180
+    v_lshrrev_b32_e32 v180, 8, v226
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v52, v52, v180
+    v_lshrrev_b32_e32 v180, 16, v226
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v52, v52, v180
+
+    v_mov_b32_e32 v53, 0
+    v_lshrrev_b32_e32 v180, 24, v226
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v53, v53, v180
+    v_lshrrev_b32_e32 v180, 0, v227
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v53, v53, v180
+    v_lshrrev_b32_e32 v180, 8, v227
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v53, v53, v180
+    v_lshrrev_b32_e32 v180, 16, v227
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v53, v53, v180
+
+    v_mov_b32_e32 v54, 0
+    v_lshrrev_b32_e32 v180, 24, v227
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v54, v54, v180
+    v_lshrrev_b32_e32 v180, 0, v214
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v54, v54, v180
+    v_lshrrev_b32_e32 v180, 0, v212
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v54, v54, v180
+    v_lshrrev_b32_e32 v180, 8, v212
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v54, v54, v180
+
+    v_mov_b32_e32 v55, 0
+    v_lshrrev_b32_e32 v180, 16, v212
+    v_and_b32_e32 v180, 0xFF, v180
+    v_or_b32_e32 v55, v55, v180
+    v_lshrrev_b32_e32 v180, 24, v212
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 8, v180
+    v_or_b32_e32 v55, v55, v180
+    v_lshrrev_b32_e32 v180, 0, v213
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 16, v180
+    v_or_b32_e32 v55, v55, v180
+    v_lshrrev_b32_e32 v180, 8, v213
+    v_and_b32_e32 v180, 0xFF, v180
+    v_lshlrev_b32_e32 v180, 24, v180
+    v_or_b32_e32 v55, v55, v180
+
+    // Skip the older group0..3 pack and selection, but keep the early V->A dump point alive.
+    s_branch VA_PACK_READY
     v_lshrrev_b32_e32 v180, 16, v203
     v_and_b32_e32 v180, 0xFF, v180
     v_or_b32_e32 v0, v0, v180
@@ -5846,6 +6086,7 @@ SKIP_TR8_DEBUG:
     v_cndmask_b32_e32 v54, v54, v238, vcc
     v_cndmask_b32_e32 v55, v55, v239, vcc
 
+VA_PACK_READY:
     // Debug: dump selected packed V->A regs (v48..v55) immediately after V-pack selection.
     // This is the *correct* place to dump V->A: later parts of the kernel reuse v0..v7
     // and the selection above would otherwise pick up non-V data (e.g. addresses).
@@ -9807,6 +10048,32 @@ SKIP_DUMP_V48_BEFORE_PV_MFMA:
     s_waitcnt vmcnt(0)
     s_endpgm
 SKIP_DUMP_V0_BEFORE_PV_MFMA:
+    // Restore PV B operand into v0..v7 right before MFMA/dumps.
+    v_mov_b32_e32 v0, v232
+    v_mov_b32_e32 v1, v233
+    v_mov_b32_e32 v2, v234
+    v_mov_b32_e32 v3, v235
+    v_mov_b32_e32 v4, v236
+    v_mov_b32_e32 v5, v237
+    v_mov_b32_e32 v6, v238
+    v_mov_b32_e32 v7, v239
+
+    // Debug: dump PV operands (B=v0..v7, A=v48..v55) per tid and exit.
+    // Flag: debug_flags 0x00000001
+    s_and_b32 s36, s35, 0x00000001
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_DUMP_PV_AB
+    v_lshlrev_b32_e32 v180, 6, v60        // tid * 64 bytes
+    buffer_store_dwordx4 v[0:3], v180, s[4:7], 0 offen
+    v_add_u32_e32 v181, 16, v180
+    buffer_store_dwordx4 v[4:7], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 32, v180
+    buffer_store_dwordx4 v[48:51], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 48, v180
+    buffer_store_dwordx4 v[52:55], v181, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_DUMP_PV_AB:
     v_mfma_f32_32x32x64_f8f6f4 v[64:79], v[48:55], v[0:7], v[64:79]
 
     // Debug: dump PV accumulators after first MFMA (v64..v67) and exit.

@@ -9,12 +9,10 @@ What it does:
   - Initializes V as `rowbyte`: each row r stores byte=r in all columns
   - Runs the scaffold kernel in a dump-and-exit mode that dumps the selected packed
     V->A regs (v48..v55) which should represent the 32 FP8 bytes feeding MFMA A.
-  - Scores lanes 0 and 32 against expected row-id *order* derived from CDNA4 ISA
-    MFMA dense layout (FP8 32x32x64):
-      - lane0 (thr 0..15 group) consumes k = 0..15 then 32..47
-      - lane32 (thr 32..47 group) consumes k = 16..31 then 48..63
-    With V initialized to rowbyte (V[k,*]=k), the packed A bytes should match these k
-    sequences (positional matches), not just set overlap.
+  - Scores *every thread (all 8 waves, all 64 lanes)* against the expected row-id order
+    from CDNA4 ISA §7.1.5.1 (Dense Matrix Layouts: 8-bit and Smaller), FP8 32x32x64:
+      - lanes 0..31: k = [0..15, 32..47]
+      - lanes 32..63: k = [16..31, 48..63]
 
 Notes:
   - We typically force identity V LDS write (debug_flags 0x00080000) and identity
@@ -67,8 +65,6 @@ class Cand:
     # A small “spot check” summary for readability
     lane0_pos: int
     lane32_pos: int
-    # Which expected ordering variant matched best (see _expected_variants()).
-    variant_id: int
     perm_id: int
     write_mode: int
     s25: int
@@ -171,89 +167,39 @@ def run_once(
             bs.extend(_unpack_u32_bytes(int(u)))
         return bs
 
-    def _expected_variants() -> list[tuple[list[int], list[int]]]:
-        """
-        Return plausible ISA-consistent expected byte orderings.
-
-        For FP8 32x32x64 (Dense Matrix Layouts) we need, per lane-group:
-          lanes 0..31  expect k-set {0..15, 32..47}
-          lanes 32..63 expect k-set {16..31, 48..63}
-
-        TR8 notes (DS_READ_B64_TR_B8):
-          - one TR8 half brings (0..7,16..23,32..39,48..55)
-          - the other half brings the complement
-
-        We don't know the exact packing order in v48..v55 yet, so we score a small
-        family of orderings that preserve the correct *k sets* and respect the TR8
-        half-split structure. The goal is to find a configuration that is correct
-        for every lane under one consistent ordering.
-        """
-        # group0 (lanes < 32): ks are {0..15,32..47}
-        g0_h0 = list(range(0, 8)) + list(range(32, 40))      # TR8 half0 subset
-        g0_h1 = list(range(8, 16)) + list(range(40, 48))     # TR8 half1 subset
-        # group2 (lanes >= 32): ks are {16..31,48..63}
-        g2_h0 = list(range(16, 24)) + list(range(48, 56))
-        g2_h1 = list(range(24, 32)) + list(range(56, 64))
-
-        variants: list[tuple[list[int], list[int]]] = []
-
-        # Variant 0: natural k order inside each 16B block
-        variants.append((
-            list(range(0, 16)) + list(range(32, 48)),
-            list(range(16, 32)) + list(range(48, 64)),
-        ))
-
-        # Variant 1: TR8 half0 then half1 (each is 16 bytes)
-        variants.append((g0_h0 + g0_h1, g2_h0 + g2_h1))
-
-        # Variant 2: swap halves (half1 then half0)
-        variants.append((g0_h1 + g0_h0, g2_h1 + g2_h0))
-
-        # Variant 3: interleave in 8B chunks: (half0 first 8B) + (half1 first 8B) + ...
-        variants.append((
-            list(range(0, 8)) + list(range(8, 16)) + list(range(32, 40)) + list(range(40, 48)),
-            list(range(16, 24)) + list(range(24, 32)) + list(range(48, 56)) + list(range(56, 64)),
-        ))
-
-        return variants
-
-    variants = _expected_variants()
+    # ISA-derived expected byte order for FP8 32x32x64 MFMA A input layout:
+    # (CDNA4 ISA 7.1.5.1 Dense Matrix Layouts: 8-bit and Smaller, FP8 32x32x64)
+    # - lanes 0..31: k = [0..15, 32..47]
+    # - lanes 32..63: k = [16..31, 48..63]
+    exp0 = list(range(0, 16)) + list(range(32, 48))
+    exp32 = list(range(16, 32)) + list(range(48, 64))
 
     # Deterministic “must be correct everywhere” scoring across the whole workgroup:
     # - PV reads of V should not depend on wave id, only lane-group.
-    best_tuple = (-1, -1, -1, -1, -1, -1)  # (min_pos, perfect, sum_pos, lane0_pos, lane32_pos, -variant_id)
-    best_stats = (0, 0, 0, 0, 0, 0)        # same shape but stores variant_id positively
-    for vid, (exp0, exp32) in enumerate(variants):
-        min_pos = 32
-        perfect = 0
-        sum_pos = 0
-        for tid in range(512):
-            lane = tid & 63
-            exp = exp0 if lane < 32 else exp32
-            got = a_bytes_for_tid(tid)
-            pos = _score_positional(got, exp)
-            sum_pos += pos
-            if pos < min_pos:
-                min_pos = pos
-            if pos == 32:
-                perfect += 1
-        lane0 = a_bytes_for_tid(0)
-        lane32b = a_bytes_for_tid(32)
-        lane0_pos = _score_positional(lane0, exp0)
-        lane32_pos = _score_positional(lane32b, exp32)
-        tup = (min_pos, perfect, sum_pos, lane0_pos, lane32_pos, -vid)
-        if tup > best_tuple:
-            best_tuple = tup
-            best_stats = (min_pos, perfect, sum_pos, lane0_pos, lane32_pos, vid)
+    min_pos = 32
+    perfect = 0
+    sum_pos = 0
+    for tid in range(512):
+        lane = tid & 63
+        exp = exp0 if lane < 32 else exp32
+        got = a_bytes_for_tid(tid)
+        pos = _score_positional(got, exp)
+        sum_pos += pos
+        if pos < min_pos:
+            min_pos = pos
+        if pos == 32:
+            perfect += 1
 
-    min_pos, perfect, sum_pos, lane0_pos, lane32_pos, variant_id = best_stats
+    lane0 = a_bytes_for_tid(0)
+    lane32b = a_bytes_for_tid(32)
+    lane0_pos = _score_positional(lane0, exp0)
+    lane32_pos = _score_positional(lane32b, exp32)
     return Cand(
         min_pos=min_pos,
         perfect_threads=perfect,
         sum_pos=sum_pos,
         lane0_pos=lane0_pos,
         lane32_pos=lane32_pos,
-        variant_id=variant_id,
         perm_id=perm_id,
         write_mode=write_mode,
         s25=s25_override,
@@ -337,7 +283,6 @@ def main():
                 x.sum_pos,
                 x.lane0_pos,
                 x.lane32_pos,
-                -x.variant_id,
             ),
             reverse=True,
         )
@@ -347,7 +292,6 @@ def main():
             print(
                 f"[{i:05d}/{num_samples}] min_pos={top.min_pos} perfect={top.perfect_threads}/512 "
                 f"lane0_pos={top.lane0_pos} lane32_pos={top.lane32_pos} "
-                f"variant={top.variant_id} "
                 f"perm={top.perm_id} wm={top.write_mode} s25=0x{top.s25:x} v4_add={top.v4_add} "
                 f"v2_add={top.v2_add} v3_xor={top.v3_xor} v3_add={top.v3_add} "
                 f"base_add=0x{top.base_add:x} base_xor=0x{top.base_xor:x} base_extra=0x{top.base_extra_add:x} "
@@ -359,7 +303,6 @@ def main():
         print(
             f"[{i}] min_pos={c.min_pos} perfect={c.perfect_threads}/512 sum_pos={c.sum_pos} "
             f"(lane0_pos={c.lane0_pos}/32 lane32_pos={c.lane32_pos}/32) "
-            f"variant={c.variant_id} "
             f"perm={c.perm_id} write_mode={c.write_mode} s25=0x{c.s25:x} "
             f"v4_add={c.v4_add} v2_add={c.v2_add} v3_xor={c.v3_xor} v3_add={c.v3_add} "
             f"base_add=0x{c.base_add:x} base_xor=0x{c.base_xor:x} base_extra=0x{c.base_extra_add:x} "

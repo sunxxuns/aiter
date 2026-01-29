@@ -27,6 +27,9 @@ These flags are intended for **surgical, reproducible** debugging (dump-and-exit
 - **`0x10000000`**: Debug-only: **recompute TR8 reads and repack V** into MFMA A regs immediately before PV MFMA (very slow; correctness harness).
 - **`0x00008000`**: Debug-only: use the **solver V-write layout** (TR8-coverage booster) instead of the normal V LDS write.
 - **`0x00002000`**: Debug-only: dump **V LDS base + pre-add swizzle addr** for the *prefetch* V write path.
+- **`0x00000001`**: Debug-only: dump **PV operands** just before PV MFMA and exit:
+  - `v0..v7` (B operand) and `v48..v55` (A operand)
+- **`0x40000000`**: Debug-only: sanity-check identity V LDS content at row 57 and exit (expects `0x39393939` when using rowbyte V).
 - **`0x80000000`**: Dump **MFMA operands** and exit (older combined debug path).
 
 ### ISA notes (TR8)
@@ -37,6 +40,12 @@ From `amd-instinct-cdna4-instruction-set-architecture.txt` §11.4 (“MFMA Trans
 - **LDS address must be aligned** to the data size (`DS_READ_B64_TR_B8` requires 8-byte alignment).
 - `DS_READ_B64_TR_B8` is designed to be used in **pairs** to load a complete matrix; the “first” instruction returns K
   buckets like `(0..7, 16..23, 32..39, 48..55)` and the “second” returns the complementary K values.
+
+### Deterministic mapping dumps
+
+- **Raw TR8 regs dump** (`0x01000000`): stores `v200..v231` (32 dwords = 128B) per thread at offset `tid * 128`.
+- **Packed A dump (early)** (`0x00200000`): stores `v48..v55` (8 dwords = 32B) per thread at offset `tid * 32`.
+- **Helper script**: `tools/dump_scaffold_tr8_raw_and_packed.py` runs both dumps for the same knobs/inputs and prints per-thread checks.
 
 ### Rigorous random-B validation
 
