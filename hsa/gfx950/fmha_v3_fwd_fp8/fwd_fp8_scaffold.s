@@ -69,6 +69,18 @@ _fwd_fp8_scaffold:
     s_mov_b32 s18, -1
     s_mov_b32 s19, 0x20000
 
+    // Debug: dump raw debug_flags (s34) to O[0] and exit.
+    // Flag: debug_flags 0x40000000
+    s_and_b32 s36, s35, 0x40000000
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_DUMP_DEBUG_FLAGS
+    v_mov_b32_e32 v0, 0
+    v_mov_b32_e32 v1, s34
+    buffer_store_dword v1, v0, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_DUMP_DEBUG_FLAGS:
+
     // ------------------------------------------------------------------------
     // Compute block offsets
     // ------------------------------------------------------------------------
@@ -547,6 +559,15 @@ K_LOOP:
     s_cmp_ge_u32 s30, s20
     s_cbranch_scc1 K_LOOP_END
 
+    // Perf diagnosis knob: if debug_flags bit4 (0x00000010) is set, skip the entire
+    // compute body (QK + pack + PV) and execute only the prefetch/advance path.
+    // This isolates global->LDS prefetch + barriers/loop overhead.
+    s_and_b32 s36, s35, 0x00000010
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_PREFETCH_ONLY
+    s_branch PV_PREFETCH_START
+SKIP_PREFETCH_ONLY:
+
     // Tile pair bases (V_LDS0 holds swizzled K=64 rows)
     v_mov_b32_e32 v29, s40                      // K tile0 base
     v_mov_b32_e32 v31, s41                      // K tile1 base
@@ -577,6 +598,16 @@ K_LOOP:
 
     // Debug: dump QK accumulators (v32..v47) after tile0 MFMA and exit.
     // Flag: debug_flags 0x00040000
+    // Also: debug_flags 0x00000002 will dump s35 (debug_flags) and exit here.
+    s_and_b32 s36, s35, 0x00000002
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_DUMP_S35_MID
+    v_mov_b32_e32 v0, 0
+    v_mov_b32_e32 v1, s35
+    buffer_store_dword v1, v0, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_DUMP_S35_MID:
     s_and_b32 s36, s35, 0x00040000
     s_cmp_eq_u32 s36, 0
     s_cbranch_scc1 SKIP_DUMP_QK_ACC
@@ -814,7 +845,8 @@ SKIP_DUMP_B_POSTMIX:
 
     s_nop 0
     // Mixed P is ready for use as MFMA B operand.
-    s_branch P_A_TRANSPOSE
+    // Perf: skip the old (debug) P->A transpose path and go straight to PV.
+    s_branch PV_MFMA_START
 
 P_A_TRANSPOSE:
     // Build A operand from packed P (byte-level transpose) [disabled]
@@ -4970,16 +5002,23 @@ SKIP_DUMP_B:
 PV_MFMA_START:
     // PV MFMA using TR8 V reads (K=64, tiles 0+1)
     // PV MFMA expects B operand in v0..v7, but the base-address synthesis below clobbers v2..v10.
-    // Preserve mixed/packed P (currently in v48..v55) into a stable temp range (v232..v239),
+    // Preserve mixed/packed P (currently in v48..v55) into a stable temp range (v176..v183),
     // and restore into v0..v7 immediately before the PV MFMA.
-    v_mov_b32_e32 v232, v48
-    v_mov_b32_e32 v233, v49
-    v_mov_b32_e32 v234, v50
-    v_mov_b32_e32 v235, v51
-    v_mov_b32_e32 v236, v52
-    v_mov_b32_e32 v237, v53
-    v_mov_b32_e32 v238, v54
-    v_mov_b32_e32 v239, v55
+    //
+    // Perf diagnosis knob: if debug_flags bit3 (0x00000008) is set, skip the entire PV path
+    // (TR8 reads + packing + PV MFMAs) and go straight to the prefetch for the next tile pair.
+    // This is only for isolating performance hotspots.
+    s_and_b32 s36, s35, 0x00000008
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc0 PV_PREFETCH_START
+    v_mov_b32_e32 v176, v48
+    v_mov_b32_e32 v177, v49
+    v_mov_b32_e32 v178, v50
+    v_mov_b32_e32 v179, v51
+    v_mov_b32_e32 v180, v52
+    v_mov_b32_e32 v181, v53
+    v_mov_b32_e32 v182, v54
+    v_mov_b32_e32 v183, v55
 
     // TR8 base for PV A operand reads.
     // Default: historical "+1 lane" tweak.
@@ -5284,10 +5323,10 @@ SKIP_V24_TWEAK:
     s_cbranch_scc1 SKIP_V_LDS_ROW57_CHECK
     s_mov_b64 exec, -1
     v_mov_b32_e32 v180, 49280
-    ds_read_b32 v240, v180 offset:0
+    ds_read_b32 v180, v180 offset:0
     s_waitcnt lgkmcnt(0)
     v_lshlrev_b32_e32 v181, 2, v60        // tid * 4 bytes
-    buffer_store_dword v240, v181, s[4:7], 0 offen
+    buffer_store_dword v180, v181, s[4:7], 0 offen
     s_waitcnt vmcnt(0)
     s_endpgm
 SKIP_V_LDS_ROW57_CHECK:
@@ -5366,7 +5405,7 @@ SKIP_V_LDS_ROW57_CHECK:
     v_lshlrev_b32_e32 v180, 7, v180
     v_add_u32_e32 v191, v191, v180
     v_and_b32_e32 v191, 0xFFFFFFF8, v191
-    ds_read_b64_tr_b8 v[232:233], v191 offset:0
+    ds_read_b64_tr_b8 v[192:193], v191 offset:0
 SKIP_TR8_EXTRA_READ:
     s_waitcnt lgkmcnt(0)
 
@@ -5392,14 +5431,16 @@ SKIP_TR8_EXTRA_READ:
     buffer_store_dwordx4 v[228:231], v181, s[4:7], 0 offen
 
     // If extra read is enabled, append 16 bytes at +128B:
-    //   [v232, v233, v190 (addr used), v_read_cb]
+    //   [v191 (addr used), v_read_cb, 0, 0]
     s_and_b32 s36, s35, 0x00800000
     s_cmp_eq_u32 s36, 0
     s_cbranch_scc1 SKIP_TR8_EXTRA_DUMP
-    v_mov_b32_e32 v234, v191
-    v_mov_b32_e32 v235, s37
+    v_mov_b32_e32 v0, v191
+    v_mov_b32_e32 v1, s37
+    v_mov_b32_e32 v2, 0
+    v_mov_b32_e32 v3, 0
     v_add_u32_e32 v181, 128, v180
-    buffer_store_dwordx4 v[232:235], v181, s[4:7], 0 offen
+    buffer_store_dwordx4 v[0:3], v181, s[4:7], 0 offen
 SKIP_TR8_EXTRA_DUMP:
     s_waitcnt vmcnt(0)
     s_endpgm
@@ -5527,564 +5568,9 @@ SKIP_TR8_DEBUG:
     v_lshlrev_b32_e32 v180, 24, v180
     v_or_b32_e32 v55, v55, v180
 
-    // Skip the older group0..3 pack and selection, but keep the early V->A dump point alive.
+    // NOTE: the older group0..3 remap construction lived here, but we now compute the
+    // correct selected V->A directly above and jump straight to the early dump point.
     s_branch VA_PACK_READY
-    v_lshrrev_b32_e32 v180, 16, v203
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v0, v0, v180
-    v_lshrrev_b32_e32 v180, 24, v203
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v0, v0, v180
-    v_lshrrev_b32_e32 v180, 16, v205
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v0, v0, v180
-    v_lshrrev_b32_e32 v180, 24, v205
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v0, v0, v180
-    v_lshrrev_b32_e32 v180, 24, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v1, v1, v180
-    v_lshrrev_b32_e32 v180, 16, v215
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v1, v1, v180
-    v_lshrrev_b32_e32 v180, 24, v215
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v1, v1, v180
-    v_lshrrev_b32_e32 v180, 24, v224
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v1, v1, v180
-    v_lshrrev_b32_e32 v180, 16, v207
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v2, v2, v180
-    v_lshrrev_b32_e32 v180, 24, v207
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v2, v2, v180
-    v_lshrrev_b32_e32 v180, 16, v209
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v2, v2, v180
-    v_lshrrev_b32_e32 v180, 24, v209
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v2, v2, v180
-    v_lshrrev_b32_e32 v180, 0, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v3, v3, v180
-    v_lshrrev_b32_e32 v180, 8, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v3, v3, v180
-    v_lshrrev_b32_e32 v180, 16, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v3, v3, v180
-    v_lshrrev_b32_e32 v180, 24, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v3, v3, v180
-    v_lshrrev_b32_e32 v180, 0, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v4, v4, v180
-    v_lshrrev_b32_e32 v180, 8, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v4, v4, v180
-    v_lshrrev_b32_e32 v180, 16, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v4, v4, v180
-    v_lshrrev_b32_e32 v180, 24, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v4, v4, v180
-    v_lshrrev_b32_e32 v180, 16, v213
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v5, v5, v180
-    v_lshrrev_b32_e32 v180, 0, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v5, v5, v180
-    v_lshrrev_b32_e32 v180, 8, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v5, v5, v180
-    v_lshrrev_b32_e32 v180, 16, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v5, v5, v180
-    v_lshrrev_b32_e32 v180, 0, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v6, v6, v180
-    v_lshrrev_b32_e32 v180, 8, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v6, v6, v180
-    v_lshrrev_b32_e32 v180, 16, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v6, v6, v180
-    v_lshrrev_b32_e32 v180, 24, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v6, v6, v180
-    v_lshrrev_b32_e32 v180, 24, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v7, v7, v180
-    v_lshrrev_b32_e32 v180, 0, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v7, v7, v180
-    v_lshrrev_b32_e32 v180, 8, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v7, v7, v180
-    v_lshrrev_b32_e32 v180, 16, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v7, v7, v180
-
-    // Build A regs for group1 (lane16)
-    v_mov_b32_e32 v240, 0
-    v_mov_b32_e32 v241, 0
-    v_mov_b32_e32 v242, 0
-    v_mov_b32_e32 v243, 0
-    v_mov_b32_e32 v244, 0
-    v_mov_b32_e32 v245, 0
-    v_mov_b32_e32 v246, 0
-    v_mov_b32_e32 v247, 0
-    v_lshrrev_b32_e32 v180, 16, v203
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v240, v240, v180
-    v_lshrrev_b32_e32 v180, 24, v203
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v240, v240, v180
-    v_lshrrev_b32_e32 v180, 16, v205
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v240, v240, v180
-    v_lshrrev_b32_e32 v180, 24, v205
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v240, v240, v180
-    v_lshrrev_b32_e32 v180, 24, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v241, v241, v180
-    v_lshrrev_b32_e32 v180, 16, v215
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v241, v241, v180
-    v_lshrrev_b32_e32 v180, 24, v215
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v241, v241, v180
-    v_lshrrev_b32_e32 v180, 24, v224
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v241, v241, v180
-    v_lshrrev_b32_e32 v180, 16, v207
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v242, v242, v180
-    v_lshrrev_b32_e32 v180, 24, v207
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v242, v242, v180
-    v_lshrrev_b32_e32 v180, 16, v209
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v242, v242, v180
-    v_lshrrev_b32_e32 v180, 24, v209
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v242, v242, v180
-    v_lshrrev_b32_e32 v180, 0, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v243, v243, v180
-    v_lshrrev_b32_e32 v180, 8, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v243, v243, v180
-    v_lshrrev_b32_e32 v180, 16, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v243, v243, v180
-    v_lshrrev_b32_e32 v180, 24, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v243, v243, v180
-    v_lshrrev_b32_e32 v180, 0, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v244, v244, v180
-    v_lshrrev_b32_e32 v180, 8, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v244, v244, v180
-    v_lshrrev_b32_e32 v180, 16, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v244, v244, v180
-    v_lshrrev_b32_e32 v180, 24, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v244, v244, v180
-    v_lshrrev_b32_e32 v180, 16, v213
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v245, v245, v180
-    v_lshrrev_b32_e32 v180, 0, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v245, v245, v180
-    v_lshrrev_b32_e32 v180, 8, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v245, v245, v180
-    v_lshrrev_b32_e32 v180, 16, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v245, v245, v180
-    v_lshrrev_b32_e32 v180, 0, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v246, v246, v180
-    v_lshrrev_b32_e32 v180, 8, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v246, v246, v180
-    v_lshrrev_b32_e32 v180, 16, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v246, v246, v180
-    v_lshrrev_b32_e32 v180, 24, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v246, v246, v180
-    v_lshrrev_b32_e32 v180, 24, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v247, v247, v180
-    v_lshrrev_b32_e32 v180, 0, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v247, v247, v180
-    v_lshrrev_b32_e32 v180, 8, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v247, v247, v180
-    v_lshrrev_b32_e32 v180, 16, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v247, v247, v180
-    // Build A regs for group2 (lane32)
-    v_mov_b32_e32 v248, 0
-    v_mov_b32_e32 v249, 0
-    v_mov_b32_e32 v250, 0
-    v_mov_b32_e32 v251, 0
-    v_mov_b32_e32 v252, 0
-    v_mov_b32_e32 v253, 0
-    v_mov_b32_e32 v254, 0
-    v_mov_b32_e32 v255, 0
-    v_lshrrev_b32_e32 v180, 24, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v248, v248, v180
-    v_lshrrev_b32_e32 v180, 16, v215
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v248, v248, v180
-    v_lshrrev_b32_e32 v180, 24, v215
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v248, v248, v180
-    v_lshrrev_b32_e32 v180, 24, v224
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v248, v248, v180
-    v_lshrrev_b32_e32 v180, 16, v203
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v249, v249, v180
-    v_lshrrev_b32_e32 v180, 24, v203
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v249, v249, v180
-    v_lshrrev_b32_e32 v180, 16, v205
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v249, v249, v180
-    v_lshrrev_b32_e32 v180, 24, v205
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v249, v249, v180
-    v_lshrrev_b32_e32 v180, 0, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v250, v250, v180
-    v_lshrrev_b32_e32 v180, 8, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v250, v250, v180
-    v_lshrrev_b32_e32 v180, 16, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v250, v250, v180
-    v_lshrrev_b32_e32 v180, 24, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v250, v250, v180
-    v_lshrrev_b32_e32 v180, 16, v207
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v251, v251, v180
-    v_lshrrev_b32_e32 v180, 24, v207
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v251, v251, v180
-    v_lshrrev_b32_e32 v180, 16, v209
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v251, v251, v180
-    v_lshrrev_b32_e32 v180, 24, v209
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v251, v251, v180
-    v_lshrrev_b32_e32 v180, 16, v213
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v252, v252, v180
-    v_lshrrev_b32_e32 v180, 0, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v252, v252, v180
-    v_lshrrev_b32_e32 v180, 8, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v252, v252, v180
-    v_lshrrev_b32_e32 v180, 16, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v252, v252, v180
-    v_lshrrev_b32_e32 v180, 0, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v253, v253, v180
-    v_lshrrev_b32_e32 v180, 8, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v253, v253, v180
-    v_lshrrev_b32_e32 v180, 16, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v253, v253, v180
-    v_lshrrev_b32_e32 v180, 24, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v253, v253, v180
-    v_lshrrev_b32_e32 v180, 24, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v254, v254, v180
-    v_lshrrev_b32_e32 v180, 0, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v254, v254, v180
-    v_lshrrev_b32_e32 v180, 8, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v254, v254, v180
-    v_lshrrev_b32_e32 v180, 16, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v254, v254, v180
-    v_lshrrev_b32_e32 v180, 0, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v255, v255, v180
-    v_lshrrev_b32_e32 v180, 8, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v255, v255, v180
-    v_lshrrev_b32_e32 v180, 16, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v255, v255, v180
-    v_lshrrev_b32_e32 v180, 24, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v255, v255, v180
-    // Build A regs for group3 (lane48)
-    v_mov_b32_e32 v232, 0
-    v_mov_b32_e32 v233, 0
-    v_mov_b32_e32 v234, 0
-    v_mov_b32_e32 v235, 0
-    v_mov_b32_e32 v236, 0
-    v_mov_b32_e32 v237, 0
-    v_mov_b32_e32 v238, 0
-    v_mov_b32_e32 v239, 0
-    v_lshrrev_b32_e32 v180, 24, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v232, v232, v180
-    v_lshrrev_b32_e32 v180, 16, v215
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v232, v232, v180
-    v_lshrrev_b32_e32 v180, 24, v215
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v232, v232, v180
-    v_lshrrev_b32_e32 v180, 24, v224
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v232, v232, v180
-    v_lshrrev_b32_e32 v180, 16, v203
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v233, v233, v180
-    v_lshrrev_b32_e32 v180, 24, v203
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v233, v233, v180
-    v_lshrrev_b32_e32 v180, 16, v205
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v233, v233, v180
-    v_lshrrev_b32_e32 v180, 24, v205
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v233, v233, v180
-    v_lshrrev_b32_e32 v180, 0, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v234, v234, v180
-    v_lshrrev_b32_e32 v180, 8, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v234, v234, v180
-    v_lshrrev_b32_e32 v180, 16, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v234, v234, v180
-    v_lshrrev_b32_e32 v180, 24, v225
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v234, v234, v180
-    v_lshrrev_b32_e32 v180, 16, v207
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v235, v235, v180
-    v_lshrrev_b32_e32 v180, 24, v207
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v235, v235, v180
-    v_lshrrev_b32_e32 v180, 16, v209
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v235, v235, v180
-    v_lshrrev_b32_e32 v180, 24, v209
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v235, v235, v180
-    v_lshrrev_b32_e32 v180, 16, v213
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v236, v236, v180
-    v_lshrrev_b32_e32 v180, 0, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v236, v236, v180
-    v_lshrrev_b32_e32 v180, 8, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v236, v236, v180
-    v_lshrrev_b32_e32 v180, 16, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v236, v236, v180
-    v_lshrrev_b32_e32 v180, 0, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v237, v237, v180
-    v_lshrrev_b32_e32 v180, 8, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v237, v237, v180
-    v_lshrrev_b32_e32 v180, 16, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v237, v237, v180
-    v_lshrrev_b32_e32 v180, 24, v200
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v237, v237, v180
-    v_lshrrev_b32_e32 v180, 24, v210
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v238, v238, v180
-    v_lshrrev_b32_e32 v180, 0, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v238, v238, v180
-    v_lshrrev_b32_e32 v180, 8, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v238, v238, v180
-    v_lshrrev_b32_e32 v180, 16, v211
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v238, v238, v180
-    v_lshrrev_b32_e32 v180, 0, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v239, v239, v180
-    v_lshrrev_b32_e32 v180, 8, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v239, v239, v180
-    v_lshrrev_b32_e32 v180, 16, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v239, v239, v180
-    v_lshrrev_b32_e32 v180, 24, v201
-    v_and_b32_e32 v180, 0xFF, v180
-    v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v239, v239, v180
-
-    // Select mapping by lane >= 32 (match v_read_dump)
-    // Select lane-group-specific packed V->A regs and place in v48..v55 for PV MFMA:
-    // - lanes  0..15  -> group0: v0..v7
-    // - lanes 16..31  -> group1: v240..v247
-    // - lanes 32..47  -> group2: v248..v255
-    // - lanes 48..63  -> group3: v232..v239
-    v_mov_b32_e32 v48, v0
-    v_mov_b32_e32 v49, v1
-    v_mov_b32_e32 v50, v2
-    v_mov_b32_e32 v51, v3
-    v_mov_b32_e32 v52, v4
-    v_mov_b32_e32 v53, v5
-    v_mov_b32_e32 v54, v6
-    v_mov_b32_e32 v55, v7
-
-    v_mov_b32_e32 v182, 16
-    v_cmp_ge_u32_e32 vcc, v10, v182
-    v_cndmask_b32_e32 v48, v48, v240, vcc
-    v_cndmask_b32_e32 v49, v49, v241, vcc
-    v_cndmask_b32_e32 v50, v50, v242, vcc
-    v_cndmask_b32_e32 v51, v51, v243, vcc
-    v_cndmask_b32_e32 v52, v52, v244, vcc
-    v_cndmask_b32_e32 v53, v53, v245, vcc
-    v_cndmask_b32_e32 v54, v54, v246, vcc
-    v_cndmask_b32_e32 v55, v55, v247, vcc
-
-    v_mov_b32_e32 v182, 32
-    v_cmp_ge_u32_e32 vcc, v10, v182
-    v_cndmask_b32_e32 v48, v48, v248, vcc
-    v_cndmask_b32_e32 v49, v49, v249, vcc
-    v_cndmask_b32_e32 v50, v50, v250, vcc
-    v_cndmask_b32_e32 v51, v51, v251, vcc
-    v_cndmask_b32_e32 v52, v52, v252, vcc
-    v_cndmask_b32_e32 v53, v53, v253, vcc
-    v_cndmask_b32_e32 v54, v54, v254, vcc
-    v_cndmask_b32_e32 v55, v55, v255, vcc
-
-    v_mov_b32_e32 v182, 48
-    v_cmp_ge_u32_e32 vcc, v10, v182
-    v_cndmask_b32_e32 v48, v48, v232, vcc
-    v_cndmask_b32_e32 v49, v49, v233, vcc
-    v_cndmask_b32_e32 v50, v50, v234, vcc
-    v_cndmask_b32_e32 v51, v51, v235, vcc
-    v_cndmask_b32_e32 v52, v52, v236, vcc
-    v_cndmask_b32_e32 v53, v53, v237, vcc
-    v_cndmask_b32_e32 v54, v54, v238, vcc
-    v_cndmask_b32_e32 v55, v55, v239, vcc
 
 VA_PACK_READY:
     // Debug: dump selected packed V->A regs (v48..v55) immediately after V-pack selection.
@@ -6102,43 +5588,10 @@ VA_PACK_READY:
     s_endpgm
 SKIP_DUMP_V_A_SELECTED_EARLY:
 
-    // Debug: dump all 4 packed V->A groups (and selected) then exit.
-    // Layout per tid: 40 dwords (160B):
-    //   0..7   : group0 v0..v7
-    //   8..15  : group1 v240..v247
-    //   16..23 : group2 v248..v255
-    //   24..31 : group3 v232..v239
-    //   32..39 : selected v48..v55
+    // Debug flag 0x00800000 previously dumped all intermediate V->A groups, but those
+    // groups were removed (we now compute selected V->A directly). Keep the flag as a no-op.
     // Flag: debug_flags 0x00800000
-    s_and_b32 s36, s35, 0x00800000
-    s_cmp_eq_u32 s36, 0
-    s_cbranch_scc1 SKIP_DUMP_V_A_GROUPS
-    // tid * 160 bytes = tid*128 + tid*32
-    v_lshlrev_b32_e32 v180, 7, v60        // tid * 128 bytes
-    v_lshlrev_b32_e32 v181, 5, v60        // tid * 32 bytes
-    v_add_u32_e32 v180, v180, v181
-    buffer_store_dwordx4 v[0:3], v180, s[4:7], 0 offen
-    v_add_u32_e32 v181, 16, v180
-    buffer_store_dwordx4 v[4:7], v181, s[4:7], 0 offen
-    v_add_u32_e32 v181, 32, v180
-    buffer_store_dwordx4 v[240:243], v181, s[4:7], 0 offen
-    v_add_u32_e32 v181, 48, v180
-    buffer_store_dwordx4 v[244:247], v181, s[4:7], 0 offen
-    v_add_u32_e32 v181, 64, v180
-    buffer_store_dwordx4 v[248:251], v181, s[4:7], 0 offen
-    v_add_u32_e32 v181, 80, v180
-    buffer_store_dwordx4 v[252:255], v181, s[4:7], 0 offen
-    v_add_u32_e32 v181, 96, v180
-    buffer_store_dwordx4 v[232:235], v181, s[4:7], 0 offen
-    v_add_u32_e32 v181, 112, v180
-    buffer_store_dwordx4 v[236:239], v181, s[4:7], 0 offen
-    // selected
-    v_add_u32_e32 v181, 128, v180
-    buffer_store_dwordx4 v[48:51], v181, s[4:7], 0 offen
-    v_add_u32_e32 v181, 144, v180
-    buffer_store_dwordx4 v[52:55], v181, s[4:7], 0 offen
-    s_waitcnt vmcnt(0)
-    s_endpgm
+    // (fall through)
 SKIP_DUMP_V_A_GROUPS:
 
     // Debug: dump selected packed V->A regs (v48..v55) and exit.
@@ -10049,14 +9502,14 @@ SKIP_DUMP_V48_BEFORE_PV_MFMA:
     s_endpgm
 SKIP_DUMP_V0_BEFORE_PV_MFMA:
     // Restore PV B operand into v0..v7 right before MFMA/dumps.
-    v_mov_b32_e32 v0, v232
-    v_mov_b32_e32 v1, v233
-    v_mov_b32_e32 v2, v234
-    v_mov_b32_e32 v3, v235
-    v_mov_b32_e32 v4, v236
-    v_mov_b32_e32 v5, v237
-    v_mov_b32_e32 v6, v238
-    v_mov_b32_e32 v7, v239
+    v_mov_b32_e32 v0, v176
+    v_mov_b32_e32 v1, v177
+    v_mov_b32_e32 v2, v178
+    v_mov_b32_e32 v3, v179
+    v_mov_b32_e32 v4, v180
+    v_mov_b32_e32 v5, v181
+    v_mov_b32_e32 v6, v182
+    v_mov_b32_e32 v7, v183
 
     // Debug: dump PV operands (B=v0..v7, A=v48..v55) per tid and exit.
     // Flag: debug_flags 0x00000001
@@ -10184,14 +9637,14 @@ SKIP_DUMP_PV_ACC0:
 SKIP_B1_DEBUG:
     // Restore PV B operand (P) before each MFMA. v0..v7 are reused as scratch
     // between MFMA calls, but PV always uses the same B operand.
-    v_mov_b32_e32 v0, v232
-    v_mov_b32_e32 v1, v233
-    v_mov_b32_e32 v2, v234
-    v_mov_b32_e32 v3, v235
-    v_mov_b32_e32 v4, v236
-    v_mov_b32_e32 v5, v237
-    v_mov_b32_e32 v6, v238
-    v_mov_b32_e32 v7, v239
+    v_mov_b32_e32 v0, v176
+    v_mov_b32_e32 v1, v177
+    v_mov_b32_e32 v2, v178
+    v_mov_b32_e32 v3, v179
+    v_mov_b32_e32 v4, v180
+    v_mov_b32_e32 v5, v181
+    v_mov_b32_e32 v6, v182
+    v_mov_b32_e32 v7, v183
     v_mfma_f32_32x32x64_f8f6f4 v[80:95], v[48:55], v[0:7], v[80:95]
     // Pack B regs for col block 2 (blockk+kbyte mapping)
     v_mov_b32_e32 v0, 0
@@ -10323,14 +9776,14 @@ SKIP_B1_DEBUG:
     s_waitcnt vmcnt(0)
     s_endpgm
 SKIP_B2_DEBUG:
-    v_mov_b32_e32 v0, v232
-    v_mov_b32_e32 v1, v233
-    v_mov_b32_e32 v2, v234
-    v_mov_b32_e32 v3, v235
-    v_mov_b32_e32 v4, v236
-    v_mov_b32_e32 v5, v237
-    v_mov_b32_e32 v6, v238
-    v_mov_b32_e32 v7, v239
+    v_mov_b32_e32 v0, v176
+    v_mov_b32_e32 v1, v177
+    v_mov_b32_e32 v2, v178
+    v_mov_b32_e32 v3, v179
+    v_mov_b32_e32 v4, v180
+    v_mov_b32_e32 v5, v181
+    v_mov_b32_e32 v6, v182
+    v_mov_b32_e32 v7, v183
     v_mfma_f32_32x32x64_f8f6f4 v[96:111], v[48:55], v[0:7], v[96:111]
     // Pack B regs for col block 3 (blockk+kbyte mapping)
     v_mov_b32_e32 v0, 0
@@ -10421,16 +9874,17 @@ SKIP_B2_DEBUG:
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 24, v180
     v_or_b32_e32 v2, v2, v180
-    v_mov_b32_e32 v0, v232
-    v_mov_b32_e32 v1, v233
-    v_mov_b32_e32 v2, v234
-    v_mov_b32_e32 v3, v235
-    v_mov_b32_e32 v4, v236
-    v_mov_b32_e32 v5, v237
-    v_mov_b32_e32 v6, v238
-    v_mov_b32_e32 v7, v239
+    v_mov_b32_e32 v0, v176
+    v_mov_b32_e32 v1, v177
+    v_mov_b32_e32 v2, v178
+    v_mov_b32_e32 v3, v179
+    v_mov_b32_e32 v4, v180
+    v_mov_b32_e32 v5, v181
+    v_mov_b32_e32 v6, v182
+    v_mov_b32_e32 v7, v183
     v_mfma_f32_32x32x64_f8f6f4 v[112:127], v[48:55], v[0:7], v[112:127]
 
+PV_PREFETCH_START:
     // Prefetch next tile pair (if any)
     s_add_u32 s34, s30, 2
     s_cmp_ge_u32 s34, s20
@@ -10439,23 +9893,31 @@ SKIP_B2_DEBUG:
     s_add_u32 s38, s31, 8192
     s_add_u32 s39, s31, 12288
 
+    // Perf diagnosis knob: if debug_flags bit6 (0x00000040) is set, skip K prefetch.
+    s_and_b32 s36, s35, 0x00000040
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc0 SKIP_K_PREFETCH
+
     v_mov_b32_e32 v2, 256
     v_cmp_lt_u32_e32 vcc, v60, v2
     s_and_saveexec_b64 s[22:23], vcc
     v_add_u32_e32 v13, s38, v61          // K global offset (next tile0)
     buffer_load_dwordx4 v[20:23], v13, s[12:15], 0 offen
+    v_add_u32_e32 v13, s39, v61          // K global offset (next tile1)
+    buffer_load_dwordx4 v[28:31], v13, s[12:15], 0 offen
     s_waitcnt vmcnt(0)
     v_add_u32_e32 v14, s40, v61          // K_LDS0 + (tid&255)*16
     ds_write_b128 v14, v[20:23]
-
-    v_add_u32_e32 v13, s39, v61          // K global offset (next tile1)
-    buffer_load_dwordx4 v[20:23], v13, s[12:15], 0 offen
-    s_waitcnt vmcnt(0)
     v_add_u32_e32 v14, s41, v61          // K_LDS1 + (tid&255)*16
-    ds_write_b128 v14, v[20:23]
+    ds_write_b128 v14, v[28:31]
     s_mov_b64 exec, s[22:23]
 
+SKIP_K_PREFETCH:
     // Swizzled V load for next pair into V_LDS0
+    // Perf diagnosis knob: if debug_flags bit5 (0x00000020) is set, skip V prefetch.
+    s_and_b32 s36, s35, 0x00000020
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc0 SKIP_V_PREFETCH
     v_mov_b32_e32 v2, 256
     v_cmp_lt_u32_e32 vcc, v60, v2
     s_and_saveexec_b64 s[22:23], vcc
@@ -10554,7 +10016,10 @@ SKIP_V_DATA2_DEBUG:
     ds_write_b128 v188, v[40:43] offset:8192
     ds_write_b128 v188, v[40:43] offset:12288
 SKIP_V_DUP1_EX:
-    s_mov_b64 exec, s[22:23]
+SKIP_V_PREFETCH:
+    // Ensure we leave this block with full EXEC.
+    // (In the normal path, the saved EXEC should already be -1 here.)
+    s_mov_b64 exec, -1
     s_waitcnt lgkmcnt(0)
 
 PREFETCH_DONE:
@@ -10619,9 +10084,11 @@ K_LOOP_END:
     .amdhsa_system_sgpr_workgroup_id_x 1
     .amdhsa_system_sgpr_workgroup_id_y 1
     .amdhsa_system_vgpr_workitem_id 0
-    .amdhsa_next_free_vgpr 256
+    // Reduced after removing dead/debug high-VGPR paths.
+    .amdhsa_next_free_vgpr 240
     .amdhsa_next_free_sgpr 56
-    .amdhsa_accum_offset 256
+    // Keep accum VGPRs after the allocated arch VGPRs.
+    .amdhsa_accum_offset 240
 .end_amdhsa_kernel
 
 .amdgpu_metadata
@@ -10636,7 +10103,7 @@ amdhsa.kernels:
     .kernarg_segment_align: 8
     .wavefront_size: 64
     .sgpr_count: 56
-    .vgpr_count: 256
+    .vgpr_count: 240
     .max_flat_workgroup_size: 512
     .args:
       - {.name: O_ptr, .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global}

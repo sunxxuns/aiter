@@ -6,7 +6,8 @@ against a PyTorch reference that matches the kernel math:
 O = (Q @ K^T) quantized to FP8, then O = P_fp8 @ V.
 """
 import os
-os.environ["HIP_VISIBLE_DEVICES"] = "0"
+# Default to GPU2 unless the user already set it.
+os.environ.setdefault("HIP_VISIBLE_DEVICES", "2")
 
 import ctypes
 import math
@@ -205,14 +206,18 @@ def main():
         *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]
     )
 
-    _, func = load_kernel(
+    co_path = os.environ.get(
+        "SCAFFOLD_CO_PATH",
         "/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8/fwd_fp8_scaffold.co",
-        "_fwd_fp8_scaffold",
     )
+    kernel_name = os.environ.get("SCAFFOLD_KERNEL_NAME", "_fwd_fp8_scaffold")
+    _, func = load_kernel(co_path, kernel_name)
 
     grid = (num_q_blocks // 2, B * H, 1)
     block = (512, 1, 1)
-    lds_bytes = 50176
+    # IMPORTANT: `fwd_fp8_scaffold.s` declares `.amdhsa_group_segment_fixed_size 50176`.
+    # Passing 50176 again as dynamic LDS would double-allocate LDS per workgroup.
+    lds_bytes = 0
 
     hip.hipModuleLaunchKernel(
         func,

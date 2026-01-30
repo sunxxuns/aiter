@@ -75,3 +75,13 @@ hsa/gfx950/fmha_v3_fwd_fp8/v_read_*.csv
 
 # Specific local dump artifacts
 hsa/gfx950/fmha_v3_fwd_fp8/scaffold_tr8_addrs.csv
+
+# Local profiling artifacts (rocprof/rocprofv2)
+rocprof_*/
+rocprofv2_*/
+rocprof*.db
+rocprof*.json
+rocprof*.sysinfo.txt
+
+# Local counter lists / scratch
+pmc_*.txt

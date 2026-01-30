@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Perf scaffold for QK+PV kernel (no softmax)."""
 import os
-os.environ["HIP_VISIBLE_DEVICES"] = "0"
+# Default to GPU2 unless the user already set it.
+os.environ.setdefault("HIP_VISIBLE_DEVICES", "2")
 
 import time
 import ctypes
@@ -25,8 +26,11 @@ def load_kernel(co_path, kernel_name):
 
 
 def main():
-    # Benchmark shape
-    B, H, S, D = 1, 40, 32130, 128
+    # Benchmark shape (overrideable via env for profiling/debug)
+    B = int(os.environ.get("SCAFFOLD_B", "1"))
+    H = int(os.environ.get("SCAFFOLD_H", "40"))
+    S = int(os.environ.get("SCAFFOLD_S", "32130"))
+    D = int(os.environ.get("SCAFFOLD_D", "128"))
     num_q_blocks = (S + 127) // 128
     if num_q_blocks % 2 != 0:
         num_q_blocks += 1
@@ -55,6 +59,7 @@ def main():
     stride_vh = S_k * D
     stride_oh = S_q * D * 4    # bytes for FP32
     debug_flags = int(os.environ.get("SCAFFOLD_DEBUG_FLAGS", "0"), 0)
+    print(f"debug_flags={debug_flags:#x}")
     v_read_cb = int(os.environ.get("SCAFFOLD_V_READ_CB", "0"), 0)
     v_read_lane_add = int(os.environ.get("SCAFFOLD_V_READ_LANE_ADD", "0"), 0)
     v_read_v3_xor = int(os.environ.get("SCAFFOLD_V_READ_V3_XOR", "0"), 0)
@@ -92,33 +97,39 @@ def main():
         *[ctypes.cast(ctypes.pointer(a), ctypes.c_void_p) for a in args]
     )
 
-    module, func = load_kernel(
+    co_path = os.environ.get(
+        "SCAFFOLD_CO_PATH",
         "/sgl-workspace/aiter/hsa/gfx950/fmha_v3_fwd_fp8/fwd_fp8_scaffold.co",
-        "_fwd_fp8_scaffold",
     )
+    kernel_name = os.environ.get("SCAFFOLD_KERNEL_NAME", "_fwd_fp8_scaffold")
+    module, func = load_kernel(co_path, kernel_name)
 
     grid = (num_q_blocks // 2, B * H, 1)
     block = (512, 1, 1)
-    lds_bytes = 50176
+    # IMPORTANT: `fwd_fp8_scaffold.s` declares `.amdhsa_group_segment_fixed_size 50176`.
+    # Passing 50176 again as dynamic LDS would double-allocate LDS per workgroup
+    # (shows up as ~100352B in profiler traces) and crush occupancy.
+    lds_bytes = 0
     waves_per_block = block[0] // 64
     blocks = grid[0] * grid[1] * grid[2]
     print(f"grid={grid}, block={block}, waves_per_block={waves_per_block}, blocks={blocks}")
 
-    # Warmup
-    for _ in range(3):
-        hip.hipModuleLaunchKernel(
-            func,
-            grid[0], grid[1], grid[2],
-            block[0], block[1], block[2],
-            lds_bytes,
-            None,
-            args_ptrs,
-            None,
-        )
-    hip.hipDeviceSynchronize()
+    # Default to *one* kernel dispatch (debug-friendly).
+    warmup = int(os.environ.get("SCAFFOLD_WARMUP_ITERS", "0"))
+    iters = int(os.environ.get("SCAFFOLD_ITERS", "1"))
+    if warmup > 0:
+        for _ in range(warmup):
+            hip.hipModuleLaunchKernel(
+                func,
+                grid[0], grid[1], grid[2],
+                block[0], block[1], block[2],
+                lds_bytes,
+                None,
+                args_ptrs,
+                None,
+            )
+        hip.hipDeviceSynchronize()
 
-    # Timed runs
-    iters = 5
     t0 = time.time()
     for _ in range(iters):
         hip.hipModuleLaunchKernel(
@@ -133,7 +144,7 @@ def main():
     hip.hipDeviceSynchronize()
     t1 = time.time()
 
-    avg_ms = (t1 - t0) * 1000.0 / iters
+    avg_ms = (t1 - t0) * 1000.0 / max(1, iters)
 
     # FLOPs (equivalent full attention, for comparison to target)
     eq_flops = 4.0 * B * H * S * S * D
