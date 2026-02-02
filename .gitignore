@@ -83,5 +83,14 @@ rocprof*.db
 rocprof*.json
 rocprof*.sysinfo.txt
 
+# Local profiling artifacts (rocprofv3)
+.rocprofv3/
+hsa/gfx950/fmha_v3_fwd_fp8/.rocprofv3/
+rocprofv3_*/
+hsa/gfx950/fmha_v3_fwd_fp8/rocprofv3_*/
+
+# Local scaffold repro outputs
+hsa/gfx950/fmha_v3_fwd_fp8/out/
+
 # Local counter lists / scratch
 pmc_*.txt

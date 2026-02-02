@@ -31,6 +31,7 @@ def load_kernel(co_path, kernel_name):
 
 def decode_scaffold_output(raw, s_q, d, waves_per_block=8):
     """Decode thread-major MFMA outputs to row-major O (S_q x D)."""
+    use_f = os.environ.get("NUMERICS_DECODE_F", "0") == "1"
     mapping = []
     for col_off in (0, 32, 64, 96):
         for row_8 in range(4):
@@ -45,7 +46,7 @@ def decode_scaffold_output(raw, s_q, d, waves_per_block=8):
     for tid in range(waves_per_block * 64):
         lane = tid & 63
         wave = tid >> 6
-        col = lane & 31
+        col = ((lane | (lane >> 1)) & 31) if use_f else (lane & 31)
         row_base = ((lane >> 5) & 1) * 4
         wave_row = wave * 32
         base = tid * 64
@@ -264,6 +265,11 @@ def main():
     mean_err = diff.mean().item()
     rel_err = (diff / (O_ref_cpu.abs() + 1e-6)).max().item()
     finite_rows = torch.isfinite(decoded).all(dim=1).sum().item()
+    if os.environ.get("NUMERICS_SHOW_ARGMAX", "0") == "1":
+        flat_idx = int(diff.view(-1).argmax().item())
+        r = flat_idx // D
+        c = flat_idx % D
+        print(f"argmax_err at (r={r}, c={c}): kernel={decoded[r, c].item():.6f} ref={O_ref_cpu[r, c].item():.6f} abs_err={diff[r, c].item():.6f}")
 
     print(f"ref output finite: {torch.isfinite(O_ref).all().item()}")
     print(f"max_err: {max_err:.6f}")
@@ -275,6 +281,13 @@ def main():
         print(decoded[:8, :8])
         print("ref[0:8,0:8]:")
         print(O_ref_cpu[:8, :8])
+        if os.environ.get("NUMERICS_DUMP_ROWID_SLICE", "0") == "1":
+            # Useful for spotting row-permutation/row-mapping issues in the decode.
+            rs = list(range(24, 40))
+            print("decoded[row,0] for rows 24..39:")
+            print([float(decoded[r, 0].item()) for r in rs])
+            print("ref[row,0] for rows 24..39:")
+            print([float(O_ref_cpu[r, 0].item()) for r in rs])
     print(f"finite rows: {finite_rows}/{decoded.shape[0]}")
     print(f"threads all-NaN: {threads_all_nan}, no-NaN: {threads_no_nan}")
     waves_per_block = 8

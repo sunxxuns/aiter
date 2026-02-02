@@ -16,33 +16,33 @@ echo "Target: ${TARGET_ARCH}"
 echo ""
 
 # Compile assembly to object
-echo "[1/2] Assembling fwd_hd128_fp8.s..."
+echo "[1/2] Assembling fwd_fp8_scaffold.s..."
 ${CLANG} -x assembler \
     -target amdgcn-amd-amdhsa \
     -mcpu=${TARGET_ARCH} \
     -mno-xnack \
-    -c "${SCRIPT_DIR}/fwd_hd128_fp8.s" \
-    -o "${SCRIPT_DIR}/fwd_hd128_fp8.o"
+    -c "${SCRIPT_DIR}/fwd_fp8_scaffold.s" \
+    -o "${SCRIPT_DIR}/fwd_fp8_scaffold.o"
 
 # Link to code object
-echo "[2/2] Linking to fwd_hd128_fp8.co..."
+echo "[2/2] Linking to fwd_fp8_scaffold.co..."
 ${LLD} -shared \
-    "${SCRIPT_DIR}/fwd_hd128_fp8.o" \
-    -o "${SCRIPT_DIR}/fwd_hd128_fp8.co"
+    "${SCRIPT_DIR}/fwd_fp8_scaffold.o" \
+    -o "${SCRIPT_DIR}/fwd_fp8_scaffold.co"
 
 # Cleanup
-rm -f "${SCRIPT_DIR}/fwd_hd128_fp8.o"
+rm -f "${SCRIPT_DIR}/fwd_fp8_scaffold.o"
 
 echo ""
 echo "=== Build complete ==="
-echo "Output: ${SCRIPT_DIR}/fwd_hd128_fp8.co"
+echo "Output: ${SCRIPT_DIR}/fwd_fp8_scaffold.co"
 
 # Verify
-if [ -f "${SCRIPT_DIR}/fwd_hd128_fp8.co" ]; then
+if [ -f "${SCRIPT_DIR}/fwd_fp8_scaffold.co" ]; then
     echo ""
     echo "Kernel info:"
-    ${ROCM_PATH}/llvm/bin/llvm-readelf -h "${SCRIPT_DIR}/fwd_hd128_fp8.co" 2>/dev/null | grep -E "Machine|Flags" || true
+    ${ROCM_PATH}/llvm/bin/llvm-readelf -h "${SCRIPT_DIR}/fwd_fp8_scaffold.co" 2>/dev/null | grep -E "Machine|Flags" || true
     echo ""
     echo "Symbols:"
-    ${ROCM_PATH}/llvm/bin/llvm-nm "${SCRIPT_DIR}/fwd_hd128_fp8.co" 2>/dev/null || true
+    ${ROCM_PATH}/llvm/bin/llvm-nm "${SCRIPT_DIR}/fwd_fp8_scaffold.co" 2>/dev/null || true
 fi

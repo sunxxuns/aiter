@@ -150,6 +150,9 @@ SKIP_LDS_BASE_DEBUG:
     // Thread indexing
     // ------------------------------------------------------------------------
     v_mov_b32_e32 v60, v0                // tid (0-511), keep for stores
+    // v239 is unused by the kernel; use it as a per-lane cache sentinel for PV TR8 base seed.
+    // Sentinel = 0xFFFFFFFF (uninitialized); once set, PV can skip expensive base synthesis per K-iter.
+    v_mov_b32_e32 v239, -1
     v_lshrrev_b32_e32 v9, 6, v60         // wave_id = tid / 64 (0-7)
     v_and_b32_e32 v10, 63, v60           // lane_id = tid % 64
     v_and_b32_e32 v61, 0xFF, v60
@@ -549,12 +552,17 @@ SKIP_V_TR8_WRITES:
     s_waitcnt vmcnt(0)
 
 K_LOOP:
-    s_waitcnt vmcnt(0)
     s_barrier
     // MFMA and LDS reads are not predicated by EXEC (MFMA ignores EXEC),
     // but many setup steps (ds_read, packing) are. Ensure we're not inheriting
     // a masked EXEC from earlier tid<256 load/store sections.
     s_mov_b64 exec, -1
+    // Recompute per-thread ids each iteration. The PV/TR8 path uses v2..v10 as scratch
+    // and can clobber v9/v10/v61, but the next iteration's QK address math depends on them.
+    v_lshrrev_b32_e32 v9, 6, v60          // wave_id = tid / 64 (0-7)
+    v_and_b32_e32 v10, 63, v60            // lane_id = tid % 64
+    v_and_b32_e32 v61, 0xFF, v60
+    v_lshlrev_b32_e32 v61, 4, v61         // (tid & 255) * 16 (prefetch vaddr)
 
     s_cmp_ge_u32 s30, s20
     s_cbranch_scc1 K_LOOP_END
@@ -568,10 +576,83 @@ K_LOOP:
     s_branch PV_PREFETCH_START
 SKIP_PREFETCH_ONLY:
 
+    // ---------------------------------------------------------------------
+    // Early (overlapped) K prefetch:
+    // Issue next-tile K VMEM loads here (tid<256) so they can overlap the
+    // compute body. The LDS writes for these loads still happen later in
+    // PV_PREFETCH_START, after a vmcnt drain.
+    // ---------------------------------------------------------------------
+    s_add_u32 s34, s30, 2
+    s_cmp_ge_u32 s34, s20
+    s_cbranch_scc1 EARLY_K_PREFETCH_DONE
+
+    // Skip if debug_flags bit6 (0x00000040) says "skip K prefetch"
+    s_and_b32 s36, s35, 0x00000040
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc0 EARLY_K_PREFETCH_DONE
+
+    s_add_u32 s38, s31, 8192
+    s_add_u32 s39, s31, 12288
+
+    // tid < 256 predicate
+    v_mov_b32_e32 v156, 256
+    v_cmp_lt_u32_e32 vcc, v60, v156
+    s_and_saveexec_b64 s[22:23], vcc
+
+    // K global loads for next tile pair into dedicated regs (v192..v199).
+    // No waits here: we want these VMEM loads overlapped with MFMA compute.
+    v_add_u32_e32 v157, s38, v61          // K global offset (next tile0)
+    buffer_load_dwordx4 v[192:195], v157, s[12:15], 0 offen
+    v_add_u32_e32 v157, s39, v61          // K global offset (next tile1)
+    buffer_load_dwordx4 v[196:199], v157, s[12:15], 0 offen
+
+    s_mov_b64 exec, s[22:23]
+EARLY_K_PREFETCH_DONE:
+    s_mov_b64 exec, -1
+
     // Tile pair bases (V_LDS0 holds swizzled K=64 rows)
     v_mov_b32_e32 v29, s40                      // K tile0 base
     v_mov_b32_e32 v31, s41                      // K tile1 base
     v_mov_b32_e32 v56, s42                      // V base (tile0)
+
+    // ---------------------------------------------------------------------
+    // Recompute Q LDS read addresses each K-loop iteration.
+    //
+    // The PV/TR8 path freely uses v2..v28 as scratch (including v24/v25),
+    // so we must not rely on the prologue-computed v24/v25 across iterations.
+    // ---------------------------------------------------------------------
+    // mfma_row = (lane & 15) + 16 * ((lane >> 4) & 1)
+    v_and_b32_e32 v11, 15, v10
+    v_lshrrev_b32_e32 v12, 4, v10
+    v_and_b32_e32 v12, 1, v12
+    v_lshlrev_b32_e32 v12, 4, v12
+    v_add_u32_e32 v13, v11, v12
+    // Q row offset (pitch=132): row*128 + row*4
+    v_lshlrev_b32_e32 v14, 7, v13
+    v_lshlrev_b32_e32 v15, 2, v13
+    v_add_u32_e32 v14, v14, v15
+    // Also keep K/V row offset (pitch=128): row*128
+    v_lshlrev_b32_e32 v18, 7, v13
+    // k_off1/k_off2 for Q reads (lane<32 vs lane>=32)
+    v_cmp_ge_u32_e64 vcc, v10, 32
+    v_cndmask_b32_e64 v11, 0, 16, vcc
+    v_cndmask_b32_e64 v12, 32, 48, vcc
+    // wave_in_tile = wave_id & 3, tile_id = wave_id >> 2
+    v_and_b32_e32 v15, 3, v9
+    v_lshrrev_b32_e32 v16, 2, v9
+    // wave_in_tile * 4224 = (wave*4096 + wave*128)
+    v_lshlrev_b32_e32 v17, 12, v15
+    v_lshlrev_b32_e32 v19, 7, v15
+    v_add_u32_e32 v17, v17, v19
+    // tile_id * 16896 = (tile<<14) + (tile<<9)
+    v_lshlrev_b32_e32 v19, 14, v16
+    v_lshlrev_b32_e32 v20, 9, v16
+    v_add_u32_e32 v19, v19, v20
+    v_add_u32_e32 v17, v17, v19          // Q base
+    // Q base + row + lane-dependent column offset
+    v_add_u32_e32 v58, v17, v14
+    v_add_u32_e32 v24, v58, v11          // Q addr1 base
+    v_add_u32_e32 v25, v58, v12          // Q addr2 base
 
     // Compute Q/K read addresses for tile 0
     v_add_u32_e32 v26, v29, v18                 // K base + row
@@ -695,6 +776,26 @@ SKIP_DUMP_TILE0_QK_AND_PACK:
     s_waitcnt lgkmcnt(0)
     v_mfma_f32_32x32x64_f8f6f4 v[32:47], v[0:7], v[16:23], v[32:47]
 
+    // Debug: dump QK accumulators (v32..v47) for the 2nd K-tile-pair iteration (s30==2) and exit.
+    // Flag: debug_flags 0x20000000
+    s_and_b32 s36, s35, 0x20000000
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 SKIP_DUMP_QK_ACC_S30_2
+    s_cmp_eq_u32 s30, 2
+    s_cbranch_scc0 SKIP_DUMP_QK_ACC_S30_2
+    // Layout per thread: 16 dwords (64B) = v32..v47
+    v_lshlrev_b32_e32 v180, 6, v60        // tid * 64 bytes
+    buffer_store_dwordx4 v[32:35], v180, s[4:7], 0 offen
+    v_add_u32_e32 v181, 16, v180
+    buffer_store_dwordx4 v[36:39], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 32, v180
+    buffer_store_dwordx4 v[40:43], v181, s[4:7], 0 offen
+    v_add_u32_e32 v181, 48, v180
+    buffer_store_dwordx4 v[44:47], v181, s[4:7], 0 offen
+    s_waitcnt vmcnt(0)
+    s_endpgm
+SKIP_DUMP_QK_ACC_S30_2:
+
     // Debug: dump QK accumulators (v32..v47) after tile1 MFMA and exit.
     // Flag: debug_flags 0x00001000
     s_and_b32 s36, s35, 0x00001000
@@ -780,6 +881,10 @@ SKIP_DUMP_QK_AND_PACKEDP:
     s_endpgm
 SKIP_DUMP_PACKED_P:
 
+    // PV uses packed P as MFMA A operand; do NOT apply the B-operand lane-mix here.
+    // (The lane-mix below is for the alternate P-as-B experiment.)
+    s_branch PV_MFMA_START
+
     // Triton-style lane mix for P -> B operand layout (verbatim mapping with temps)
     v_lshlrev_b32_e32 v237, 2, v10
     v_xor_b32_e32 v237, 0x80, v237
@@ -845,7 +950,7 @@ SKIP_DUMP_B_POSTMIX:
 
     s_nop 0
     // Mixed P is ready for use as MFMA B operand.
-    // Perf: skip the old (debug) P->A transpose path and go straight to PV.
+    // (Not used on the P-as-A PV path; we branch earlier.)
     s_branch PV_MFMA_START
 
 P_A_TRANSPOSE:
@@ -4991,6 +5096,10 @@ P_A_TRANSPOSE:
     s_and_b32 s36, s35, 0x00020000
     s_cmp_eq_u32 s36, 0
     s_cbranch_scc1 SKIP_DUMP_B
+    // Dump only on the second tile-pair iteration (s30 == 2), so we can
+    // diagnose multi-iteration corruption without stopping at the first loop.
+    s_cmp_eq_u32 s30, 2
+    s_cbranch_scc0 SKIP_DUMP_B
     v_lshlrev_b32_e32 v180, 5, v60        // tid * 32 bytes
     buffer_store_dwordx4 v[48:51], v180, s[4:7], 0 offen
     v_add_u32_e32 v181, 16, v180
@@ -5000,25 +5109,117 @@ P_A_TRANSPOSE:
 SKIP_DUMP_B:
 
 PV_MFMA_START:
-    // PV MFMA using TR8 V reads (K=64, tiles 0+1)
-    // PV MFMA expects B operand in v0..v7, but the base-address synthesis below clobbers v2..v10.
-    // Preserve mixed/packed P (currently in v48..v55) into a stable temp range (v176..v183),
-    // and restore into v0..v7 immediately before the PV MFMA.
+    // PV MFMA (Triton-derived TR8 read scheme, scaffold math):
+    // - A operand: packed P in v48..v55
+    // - B operand: V fragment loaded via DS_READ_B64_TR_B8 directly into v0..v7
+    // Empirically, the TR8 output bytes match the expected dense-B packing for rowbyte tests.
+    // We apply Triton's exact TR8 offset sets to cover all 4 output blocks.
     //
     // Perf diagnosis knob: if debug_flags bit3 (0x00000008) is set, skip the entire PV path
-    // (TR8 reads + packing + PV MFMAs) and go straight to the prefetch for the next tile pair.
-    // This is only for isolating performance hotspots.
+    // and go straight to the prefetch for the next tile pair.
     s_and_b32 s36, s35, 0x00000008
     s_cmp_eq_u32 s36, 0
     s_cbranch_scc0 PV_PREFETCH_START
-    v_mov_b32_e32 v176, v48
-    v_mov_b32_e32 v177, v49
-    v_mov_b32_e32 v178, v50
-    v_mov_b32_e32 v179, v51
-    v_mov_b32_e32 v180, v52
-    v_mov_b32_e32 v181, v53
-    v_mov_b32_e32 v182, v54
-    v_mov_b32_e32 v183, v55
+
+    // ---------------------------------------------------------------------
+    // PV TR8 base seed cache:
+    // The TR8 base synthesis (v_read_cb/candidate/default) is invariant across
+    // K-loop iterations in this scaffold (V_LDS0 is a staging buffer reused each
+    // tile pair). Cache the *seed* (pre-xor) in v239 on first use, then rebuild
+    // v20..v28 from the cached seed on subsequent iterations.
+    // ---------------------------------------------------------------------
+    v_cmp_eq_u32_e32 vcc, 0xFFFFFFFF, v239
+    s_cbranch_vccnz PV_TR8_BASE_COMPUTE
+
+PV_TR8_BASE_FROM_CACHE:
+    // Rebuild derived TR8 bases from cached seed v239 (same XOR pattern as the base code).
+    v_mov_b32_e32 v2, v239
+    v_xor_b32_e32 v3, 0x20, v2
+    v_xor_b32_e32 v4, 0x460, v2
+    v_xor_b32_e32 v5, 0x1020, v2
+    v_xor_b32_e32 v6, 0x1460, v2
+    v_xor_b32_e32 v7, 0x60, v2
+    v_xor_b32_e32 v8, 0x420, v2
+    v_xor_b32_e32 v9, 0x1060, v2
+    v_xor_b32_e32 v10, 0x1420, v2
+
+    // Optional clamp (debug_flags 0x04000000) must match the compute path.
+    s_and_b32 s36, s35, 0x04000000
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 PV_TR8_CACHE_SKIP_CLAMP
+    v_and_b32_e32 v2, 0xFFF, v2
+    v_and_b32_e32 v3, 0xFFF, v3
+    v_and_b32_e32 v4, 0xFFF, v4
+    v_and_b32_e32 v5, 0xFFF, v5
+    v_and_b32_e32 v6, 0xFFF, v6
+    v_and_b32_e32 v7, 0xFFF, v7
+    v_and_b32_e32 v8, 0xFFF, v8
+    v_and_b32_e32 v9, 0xFFF, v9
+    v_and_b32_e32 v10, 0xFFF, v10
+PV_TR8_CACHE_SKIP_CLAMP:
+
+    // Add V_LDS0 base (same as compute path).
+    v_add_u32_e32 v2, 41984, v2
+    v_add_u32_e32 v3, 41984, v3
+    v_add_u32_e32 v4, 41984, v4
+    v_add_u32_e32 v5, 41984, v5
+    v_add_u32_e32 v6, 41984, v6
+    v_add_u32_e32 v7, 41984, v7
+    v_add_u32_e32 v8, 41984, v8
+    v_add_u32_e32 v9, 41984, v9
+    v_add_u32_e32 v10, 41984, v10
+
+    // Preserve TR8 base addresses into v20..v28.
+    v_mov_b32_e32 v20, v2
+    v_mov_b32_e32 v21, v3
+    v_mov_b32_e32 v22, v4
+    v_mov_b32_e32 v23, v5
+    v_mov_b32_e32 v24, v6
+    v_mov_b32_e32 v25, v7
+    v_mov_b32_e32 v26, v8
+    v_mov_b32_e32 v27, v9
+    v_mov_b32_e32 v28, v10
+
+    // If using v_read_cb base path (debug_flags 0x00000004), apply base_add/base_xor/base_extra_add.
+    // This matches the v_read_dump-compatible knob behavior.
+    s_and_b32 s36, s35, 0x00000004
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc1 PV_TR8_CACHE_DONE
+    v_mov_b32_e32 v180, s49
+    v_add_u32_e32 v20, v180, v20
+    v_add_u32_e32 v21, v180, v21
+    v_add_u32_e32 v22, v180, v22
+    v_add_u32_e32 v23, v180, v23
+    v_add_u32_e32 v24, v180, v24
+    v_add_u32_e32 v25, v180, v25
+    v_add_u32_e32 v26, v180, v26
+    v_add_u32_e32 v27, v180, v27
+    v_add_u32_e32 v28, v180, v28
+    v_mov_b32_e32 v180, s50
+    v_xor_b32_e32 v20, v180, v20
+    v_xor_b32_e32 v21, v180, v21
+    v_xor_b32_e32 v22, v180, v22
+    v_xor_b32_e32 v23, v180, v23
+    v_xor_b32_e32 v24, v180, v24
+    v_xor_b32_e32 v25, v180, v25
+    v_xor_b32_e32 v26, v180, v26
+    v_xor_b32_e32 v27, v180, v27
+    v_xor_b32_e32 v28, v180, v28
+    v_mov_b32_e32 v180, s51
+    v_add_u32_e32 v20, v180, v20
+    v_add_u32_e32 v21, v180, v21
+    v_add_u32_e32 v22, v180, v22
+    v_add_u32_e32 v23, v180, v23
+    v_add_u32_e32 v24, v180, v24
+    v_add_u32_e32 v25, v180, v25
+    v_add_u32_e32 v26, v180, v26
+    v_add_u32_e32 v27, v180, v27
+    v_add_u32_e32 v28, v180, v28
+PV_TR8_CACHE_DONE:
+
+    s_branch PV_TR8_BASE_READY
+
+PV_TR8_BASE_COMPUTE:
 
     // TR8 base for PV A operand reads.
     // Default: historical "+1 lane" tweak.
@@ -5027,11 +5228,8 @@ PV_MFMA_START:
     //   - add +16 to v4 term
     //   - s25 = 0xff0
     //
-    // Option (debug_flags 0x00000004): v_read_dump-style PV base using v_read_dump-compatible knobs.
-    // This is the preferred path for solver/bruteforce.
-    s_and_b32 s36, s35, 0x00000004
-    s_cmp_eq_u32 s36, 0
-    s_cbranch_scc1 SKIP_VREADCB_BASE
+    // Use v_read_dump-style PV base unconditionally (bitop3:0x36 + XOR ladder),
+    // with knobs coming from kernel args (defaults are 0).
 
     // Optional s25 override (0 = keep current s25)
     s_cmp_eq_u32 s52, 0
@@ -5077,6 +5275,8 @@ SKIP_S25_OVERRIDE_SCAFFOLD:
     v_lshlrev_b32_e32 v6, 3, v60
     v_and_b32_e32 v6, 8, v6
     v_bitop3_b32 v2, v2, v5, v6 bitop3:0x36
+    // Cache the seed (pre-xor) for subsequent iterations.
+    v_mov_b32_e32 v239, v2
 
     // fixed XOR sequence and add V_LDS0
     v_xor_b32_e32 v3, 0x20, v2
@@ -5226,6 +5426,8 @@ TR8_WRITE_BASE_78:
     v_lshlrev_b32_e32 v2, 4, v60
     v_bitop3_b32 v2, v2, v60, s26 bitop3:0x78
 TR8_WRITE_BASE_DONE:
+    // Cache the seed (pre-xor) for subsequent iterations.
+    v_mov_b32_e32 v239, v2
 
     v_xor_b32_e32 v3, 0x20, v2
     v_xor_b32_e32 v4, 0x460, v2
@@ -5331,11 +5533,10 @@ SKIP_V24_TWEAK:
     s_endpgm
 SKIP_V_LDS_ROW57_CHECK:
 
-    // ISA requirement for MFMA transpose LDS loads:
-    // EXEC must be all-ones prior to DS_READ_*_TR_* instructions.
+    // ISA requirements for MFMA transpose LDS loads:
+    // - EXEC must be all-ones prior to DS_READ_*_TR_* instructions.
+    // - LDS addresses must be aligned (8B for DS_READ_B64_TR_B8).
     s_mov_b64 exec, -1
-    // ISA requirement: LDS address must be aligned to the data size.
-    // For DS_READ_B64_TR_B8, enforce 8-byte alignment.
     v_and_b32_e32 v20, 0xFFFFFFF8, v20
     v_and_b32_e32 v21, 0xFFFFFFF8, v21
     v_and_b32_e32 v22, 0xFFFFFFF8, v22
@@ -5346,25 +5547,46 @@ SKIP_V_LDS_ROW57_CHECK:
     v_and_b32_e32 v27, 0xFFFFFFF8, v27
     v_and_b32_e32 v28, 0xFFFFFFF8, v28
 
-    // TR8 A reads into v200..v231 (4 sets)
-    ds_read_b64_tr_b8 v[200:201], v20 offset:0
-    ds_read_b64_tr_b8 v[202:203], v20 offset:256
-    ds_read_b64_tr_b8 v[204:205], v20 offset:512
-    ds_read_b64_tr_b8 v[206:207], v20 offset:768
-    ds_read_b64_tr_b8 v[208:209], v21 offset:1024
-    ds_read_b64_tr_b8 v[210:211], v22 offset:1152
-    ds_read_b64_tr_b8 v[212:213], v23 offset:1280
+    // ---------------------------------------------------------------------
+    // Triton TR8 offset scheme (gfx950, FP8 32x32x64):
+    // Use V via TR8 directly as MFMA B operand in v0..v7, and use packed P as MFMA A in v48..v55.
+    // Offsets are copied from triton_fp8_fmha.s (see skill: triton-fp8-tr8-ground-truth).
+    // ---------------------------------------------------------------------
 
-    // v24-based read: use offset:0 (the historical offset:1408 can go out-of-range for K=64 tiles).
-    ds_read_b64_tr_b8 v[214:215], v24 offset:0
-    ds_read_b64_tr_b8 v[216:217], v20 offset:2048
-    ds_read_b64_tr_b8 v[218:219], v20 offset:2176
-    ds_read_b64_tr_b8 v[220:221], v20 offset:2304
-    ds_read_b64_tr_b8 v[222:223], v20 offset:2432
-    ds_read_b64_tr_b8 v[224:225], v25 offset:3072
-    ds_read_b64_tr_b8 v[226:227], v26 offset:3200
-    ds_read_b64_tr_b8 v[228:229], v27 offset:3328
-    ds_read_b64_tr_b8 v[230:231], v28 offset:3456
+    // block0 (v64..v79): group0 base=v20 offsets {0,1088,4096,5184}
+    ds_read_b64_tr_b8 v[0:1], v20 offset:0
+    ds_read_b64_tr_b8 v[2:3], v20 offset:1088
+    ds_read_b64_tr_b8 v[4:5], v20 offset:4096
+    ds_read_b64_tr_b8 v[6:7], v20 offset:5184
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[64:79], v[48:55], v[0:7], v[64:79]
+
+    // block1 (v80..v95): group1 bases {v21,v22,v23,v24} offsets {0,0,0,0}
+    ds_read_b64_tr_b8 v[0:1], v21 offset:0
+    ds_read_b64_tr_b8 v[2:3], v22 offset:0
+    ds_read_b64_tr_b8 v[4:5], v23 offset:0
+    ds_read_b64_tr_b8 v[6:7], v24 offset:0
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[80:95], v[48:55], v[0:7], v[80:95]
+
+    // block2 (v96..v111): group2 base=v20 offsets {64,1024,4160,5120}
+    ds_read_b64_tr_b8 v[0:1], v20 offset:64
+    ds_read_b64_tr_b8 v[2:3], v20 offset:1024
+    ds_read_b64_tr_b8 v[4:5], v20 offset:4160
+    ds_read_b64_tr_b8 v[6:7], v20 offset:5120
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[96:111], v[48:55], v[0:7], v[96:111]
+
+    // block3 (v112..v127): group3 bases {v25,v26,v27,v28} offsets {0,0,0,0}
+    ds_read_b64_tr_b8 v[0:1], v25 offset:0
+    ds_read_b64_tr_b8 v[2:3], v26 offset:0
+    ds_read_b64_tr_b8 v[4:5], v27 offset:0
+    ds_read_b64_tr_b8 v[6:7], v28 offset:0
+    s_waitcnt lgkmcnt(0)
+    v_mfma_f32_32x32x64_f8f6f4 v[112:127], v[48:55], v[0:7], v[112:127]
+
+    // Skip legacy "pack V into v0..v7" PV path and go to prefetch/advance.
+    s_branch PV_PREFETCH_START
 
     // Debug (solver harness): optional extra TR8 read from selectable base + delta.
     // Enable with debug_flags 0x00800000. delta is encoded in v_read_cb bits [27:20]:
@@ -5446,7 +5668,7 @@ SKIP_TR8_EXTRA_DUMP:
     s_endpgm
 SKIP_TR8_DEBUG:
 
-    // Directly pack selected V->A regs into v48..v55 from raw TR8 read regs v200..v231.
+    // Directly pack selected V->B regs into v0..v7 from raw TR8 read regs v200..v231.
     // This mapping was solved deterministically with rowbyte V[k,*]=k across all 512 threads
     // for the FP8 32x32x64 dense layout (CDNA4 ISA 7.1.5.1):
     //   lanes 0..31: [0..15, 32..47]
@@ -5463,110 +5685,111 @@ SKIP_TR8_DEBUG:
     //   p28..p31 -> r50,r51,r52,r53 (v212 b2..3; v213 b0..1)
     //
     // Note: this bypasses the older 4-group pack+select logic entirely.
-    v_mov_b32_e32 v48, v200
-    v_mov_b32_e32 v49, v201
+    v_mov_b32_e32 v0, v200
+    v_mov_b32_e32 v1, v201
 
-    v_mov_b32_e32 v50, 0
+    v_mov_b32_e32 v2, 0
     v_lshrrev_b32_e32 v180, 16, v203
     v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v50, v50, v180
+    v_or_b32_e32 v2, v2, v180
     v_lshrrev_b32_e32 v180, 24, v203
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v50, v50, v180
+    v_or_b32_e32 v2, v2, v180
     v_lshrrev_b32_e32 v180, 16, v205
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v50, v50, v180
+    v_or_b32_e32 v2, v2, v180
     v_lshrrev_b32_e32 v180, 24, v205
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v50, v50, v180
+    v_or_b32_e32 v2, v2, v180
 
-    v_mov_b32_e32 v51, 0
+    v_mov_b32_e32 v3, 0
     v_lshrrev_b32_e32 v180, 16, v207
     v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v51, v51, v180
+    v_or_b32_e32 v3, v3, v180
     v_lshrrev_b32_e32 v180, 24, v207
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v51, v51, v180
+    v_or_b32_e32 v3, v3, v180
     v_lshrrev_b32_e32 v180, 16, v209
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v51, v51, v180
+    v_or_b32_e32 v3, v3, v180
     v_lshrrev_b32_e32 v180, 24, v209
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v51, v51, v180
+    v_or_b32_e32 v3, v3, v180
 
-    v_mov_b32_e32 v52, 0
+    v_mov_b32_e32 v4, 0
     v_lshrrev_b32_e32 v180, 24, v225
     v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v52, v52, v180
+    v_or_b32_e32 v4, v4, v180
     v_lshrrev_b32_e32 v180, 0, v226
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v52, v52, v180
+    v_or_b32_e32 v4, v4, v180
     v_lshrrev_b32_e32 v180, 8, v226
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v52, v52, v180
+    v_or_b32_e32 v4, v4, v180
     v_lshrrev_b32_e32 v180, 16, v226
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v52, v52, v180
+    v_or_b32_e32 v4, v4, v180
 
-    v_mov_b32_e32 v53, 0
+    v_mov_b32_e32 v5, 0
     v_lshrrev_b32_e32 v180, 24, v226
     v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v53, v53, v180
+    v_or_b32_e32 v5, v5, v180
     v_lshrrev_b32_e32 v180, 0, v227
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v53, v53, v180
+    v_or_b32_e32 v5, v5, v180
     v_lshrrev_b32_e32 v180, 8, v227
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v53, v53, v180
+    v_or_b32_e32 v5, v5, v180
     v_lshrrev_b32_e32 v180, 16, v227
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v53, v53, v180
+    v_or_b32_e32 v5, v5, v180
 
-    v_mov_b32_e32 v54, 0
+    v_mov_b32_e32 v6, 0
     v_lshrrev_b32_e32 v180, 24, v227
     v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v54, v54, v180
-    v_lshrrev_b32_e32 v180, 0, v214
+    v_or_b32_e32 v6, v6, v180
+    // p25: use v214 byte1 (fixes 40/56 -> 41/57 under rowbyte)
+    v_lshrrev_b32_e32 v180, 8, v214
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v54, v54, v180
+    v_or_b32_e32 v6, v6, v180
     v_lshrrev_b32_e32 v180, 0, v212
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v54, v54, v180
+    v_or_b32_e32 v6, v6, v180
     v_lshrrev_b32_e32 v180, 8, v212
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v54, v54, v180
+    v_or_b32_e32 v6, v6, v180
 
-    v_mov_b32_e32 v55, 0
+    v_mov_b32_e32 v7, 0
     v_lshrrev_b32_e32 v180, 16, v212
     v_and_b32_e32 v180, 0xFF, v180
-    v_or_b32_e32 v55, v55, v180
+    v_or_b32_e32 v7, v7, v180
     v_lshrrev_b32_e32 v180, 24, v212
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 8, v180
-    v_or_b32_e32 v55, v55, v180
+    v_or_b32_e32 v7, v7, v180
     v_lshrrev_b32_e32 v180, 0, v213
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 16, v180
-    v_or_b32_e32 v55, v55, v180
+    v_or_b32_e32 v7, v7, v180
     v_lshrrev_b32_e32 v180, 8, v213
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 24, v180
-    v_or_b32_e32 v55, v55, v180
+    v_or_b32_e32 v7, v7, v180
 
     // NOTE: the older group0..3 remap construction lived here, but we now compute the
     // correct selected V->A directly above and jump straight to the early dump point.
@@ -9501,15 +9724,8 @@ SKIP_DUMP_V48_BEFORE_PV_MFMA:
     s_waitcnt vmcnt(0)
     s_endpgm
 SKIP_DUMP_V0_BEFORE_PV_MFMA:
-    // Restore PV B operand into v0..v7 right before MFMA/dumps.
-    v_mov_b32_e32 v0, v176
-    v_mov_b32_e32 v1, v177
-    v_mov_b32_e32 v2, v178
-    v_mov_b32_e32 v3, v179
-    v_mov_b32_e32 v4, v180
-    v_mov_b32_e32 v5, v181
-    v_mov_b32_e32 v6, v182
-    v_mov_b32_e32 v7, v183
+    // v48..v55 holds packed/mixed P (A operand).
+    // v0..v7 holds packed V for col block 0 (B operand).
 
     // Debug: dump PV operands (B=v0..v7, A=v48..v55) per tid and exit.
     // Flag: debug_flags 0x00000001
@@ -9529,15 +9745,7 @@ SKIP_DUMP_V0_BEFORE_PV_MFMA:
 SKIP_DUMP_PV_AB:
     v_mfma_f32_32x32x64_f8f6f4 v[64:79], v[48:55], v[0:7], v[64:79]
 
-    // Debug: dump PV accumulators after first MFMA (v64..v67) and exit.
-    // Flag: debug_flags 0x00004000
-    s_and_b32 s36, s35, 0x00004000
-    s_cmp_eq_u32 s36, 0
-    s_cbranch_scc1 SKIP_DUMP_PV_ACC0
-    v_lshlrev_b32_e32 v180, 4, v60        // tid * 16 bytes
-    buffer_store_dwordx4 v[64:67], v180, s[4:7], 0 offen
-    s_waitcnt vmcnt(0)
-    s_endpgm
+    // (PV-acc debug removed; 0x00004000 is repurposed below for B1 dump.)
 SKIP_DUMP_PV_ACC0:
     // Pack B regs for col block 1 (blockk+kbyte mapping)
     v_mov_b32_e32 v0, 0
@@ -9624,8 +9832,9 @@ SKIP_DUMP_PV_ACC0:
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 24, v180
     v_or_b32_e32 v3, v3, v180
-    // Debug: dump B regs after block1 pack
-    s_and_b32 s36, s35, 0x40000000
+    // Debug: dump packed V B operand (v0..v7) after col block 1 pack and exit.
+    // Flag: debug_flags 0x00004000
+    s_and_b32 s36, s35, 0x00004000
     s_cmp_eq_u32 s36, 0
     s_cbranch_scc1 SKIP_B1_DEBUG
     v_lshlrev_b32_e32 v180, 6, v60        // tid * 64 bytes
@@ -9635,16 +9844,6 @@ SKIP_DUMP_PV_ACC0:
     s_waitcnt vmcnt(0)
     s_endpgm
 SKIP_B1_DEBUG:
-    // Restore PV B operand (P) before each MFMA. v0..v7 are reused as scratch
-    // between MFMA calls, but PV always uses the same B operand.
-    v_mov_b32_e32 v0, v176
-    v_mov_b32_e32 v1, v177
-    v_mov_b32_e32 v2, v178
-    v_mov_b32_e32 v3, v179
-    v_mov_b32_e32 v4, v180
-    v_mov_b32_e32 v5, v181
-    v_mov_b32_e32 v6, v182
-    v_mov_b32_e32 v7, v183
     v_mfma_f32_32x32x64_f8f6f4 v[80:95], v[48:55], v[0:7], v[80:95]
     // Pack B regs for col block 2 (blockk+kbyte mapping)
     v_mov_b32_e32 v0, 0
@@ -9776,14 +9975,6 @@ SKIP_B1_DEBUG:
     s_waitcnt vmcnt(0)
     s_endpgm
 SKIP_B2_DEBUG:
-    v_mov_b32_e32 v0, v176
-    v_mov_b32_e32 v1, v177
-    v_mov_b32_e32 v2, v178
-    v_mov_b32_e32 v3, v179
-    v_mov_b32_e32 v4, v180
-    v_mov_b32_e32 v5, v181
-    v_mov_b32_e32 v6, v182
-    v_mov_b32_e32 v7, v183
     v_mfma_f32_32x32x64_f8f6f4 v[96:111], v[48:55], v[0:7], v[96:111]
     // Pack B regs for col block 3 (blockk+kbyte mapping)
     v_mov_b32_e32 v0, 0
@@ -9874,18 +10065,14 @@ SKIP_B2_DEBUG:
     v_and_b32_e32 v180, 0xFF, v180
     v_lshlrev_b32_e32 v180, 24, v180
     v_or_b32_e32 v2, v2, v180
-    v_mov_b32_e32 v0, v176
-    v_mov_b32_e32 v1, v177
-    v_mov_b32_e32 v2, v178
-    v_mov_b32_e32 v3, v179
-    v_mov_b32_e32 v4, v180
-    v_mov_b32_e32 v5, v181
-    v_mov_b32_e32 v6, v182
-    v_mov_b32_e32 v7, v183
     v_mfma_f32_32x32x64_f8f6f4 v[112:127], v[48:55], v[0:7], v[112:127]
 
 PV_PREFETCH_START:
     // Prefetch next tile pair (if any)
+    // IMPORTANT: PV/TR8 path may clobber v61. Recompute it here before using it
+    // for global offsets and LDS write addresses.
+    v_and_b32_e32 v61, 0xFF, v60
+    v_lshlrev_b32_e32 v61, 4, v61         // (tid & 255) * 16
     s_add_u32 s34, s30, 2
     s_cmp_ge_u32 s34, s20
     s_cbranch_scc1 PREFETCH_DONE
@@ -9893,24 +10080,26 @@ PV_PREFETCH_START:
     s_add_u32 s38, s31, 8192
     s_add_u32 s39, s31, 12288
 
+    // Prefetch is only issued by tid < 256 (one half-wave worth of lanes per wave).
+    // IMPORTANT: issue K+V VMEM first, do address/swizzle math while VMEM is in flight,
+    // then a single vmcnt(0) right before LDS writes. This avoids serializing K then V.
+    v_mov_b32_e32 v2, 256
+    v_cmp_lt_u32_e32 vcc, v60, v2
+    s_and_saveexec_b64 s[22:23], vcc
+
     // Perf diagnosis knob: if debug_flags bit6 (0x00000040) is set, skip K prefetch.
     s_and_b32 s36, s35, 0x00000040
     s_cmp_eq_u32 s36, 0
     s_cbranch_scc0 SKIP_K_PREFETCH
 
-    v_mov_b32_e32 v2, 256
-    v_cmp_lt_u32_e32 vcc, v60, v2
-    s_and_saveexec_b64 s[22:23], vcc
+    // K global loads for next tile pair.
+    // NOTE: This is duplicated with the earlier "EARLY_K_PREFETCH" path, but is required
+    // for correctness because v[192:199] may be clobbered by the compute body before we
+    // reach PV_PREFETCH_START. Loading here guarantees the LDS writes below use valid data.
     v_add_u32_e32 v13, s38, v61          // K global offset (next tile0)
-    buffer_load_dwordx4 v[20:23], v13, s[12:15], 0 offen
+    buffer_load_dwordx4 v[192:195], v13, s[12:15], 0 offen
     v_add_u32_e32 v13, s39, v61          // K global offset (next tile1)
-    buffer_load_dwordx4 v[28:31], v13, s[12:15], 0 offen
-    s_waitcnt vmcnt(0)
-    v_add_u32_e32 v14, s40, v61          // K_LDS0 + (tid&255)*16
-    ds_write_b128 v14, v[20:23]
-    v_add_u32_e32 v14, s41, v61          // K_LDS1 + (tid&255)*16
-    ds_write_b128 v14, v[28:31]
-    s_mov_b64 exec, s[22:23]
+    buffer_load_dwordx4 v[196:199], v13, s[12:15], 0 offen
 
 SKIP_K_PREFETCH:
     // Swizzled V load for next pair into V_LDS0
@@ -9918,9 +10107,6 @@ SKIP_K_PREFETCH:
     s_and_b32 s36, s35, 0x00000020
     s_cmp_eq_u32 s36, 0
     s_cbranch_scc0 SKIP_V_PREFETCH
-    v_mov_b32_e32 v2, 256
-    v_cmp_lt_u32_e32 vcc, v60, v2
-    s_and_saveexec_b64 s[22:23], vcc
     v_lshrrev_b32_e32 v4, 3, v60          // row = tid >> 3 (0..31)
     v_and_b32_e32 v5, 7, v60              // col_block = tid & 7 (0..7)
     // permute row bits: (b4,b3,b2)->(b3,b2,b4)
@@ -9940,7 +10126,6 @@ SKIP_K_PREFETCH:
     buffer_load_dwordx4 v[40:43], v2, s[16:19], s38 offen
     v_add_u32_e32 v3, 4096, v2            // row + 32
     buffer_load_dwordx4 v[44:47], v3, s[16:19], s38 offen
-    s_waitcnt vmcnt(0)
 
     // Triton-style LDS write swizzle (bitop3:0x78)
     s_movk_i32 s26, 0x70
@@ -9976,6 +10161,7 @@ SKIP_VBASE_PREADD_DEBUG:
     s_waitcnt vmcnt(0)
     s_endpgm
 SKIP_VADDR_ADD_DEBUG:
+    // Wait for any outstanding K/V VMEM reads before consuming data for LDS writes.
     s_waitcnt vmcnt(0)
     // If only one K tile, duplicate row r into rows r+32/64/96
     s_cmp_eq_u32 s20, 1
@@ -10017,9 +10203,24 @@ SKIP_V_DATA2_DEBUG:
     ds_write_b128 v188, v[40:43] offset:12288
 SKIP_V_DUP1_EX:
 SKIP_V_PREFETCH:
-    // Ensure we leave this block with full EXEC.
-    // (In the normal path, the saved EXEC should already be -1 here.)
-    s_mov_b64 exec, -1
+    // If V prefetch was skipped, we still may have outstanding K VMEM reads.
+    // Ensure all K/V VMEM reads are complete before consuming for LDS writes.
+    s_waitcnt vmcnt(0)
+
+    // K LDS writes (consume prefetched v[192:199] after vmcnt drained above)
+    // Perf diagnosis knob: if debug_flags bit6 (0x00000040) is set, skip K prefetch.
+    s_and_b32 s36, s35, 0x00000040
+    s_cmp_eq_u32 s36, 0
+    s_cbranch_scc0 SKIP_K_LDS_WRITES
+    v_add_u32_e32 v14, s40, v61          // K_LDS0 + (tid&255)*16
+    ds_write_b128 v14, v[192:195]
+    v_add_u32_e32 v14, s41, v61          // K_LDS1 + (tid&255)*16
+    ds_write_b128 v14, v[196:199]
+SKIP_K_LDS_WRITES:
+
+    // Restore EXEC (tid<256 predicate) and leave this block with full EXEC.
+    s_mov_b64 exec, s[22:23]
+    // Ensure LDS writes are visible before the next iteration barrier/reads.
     s_waitcnt lgkmcnt(0)
 
 PREFETCH_DONE:

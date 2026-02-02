@@ -4,7 +4,9 @@ Dump scaffold PV TR8 reads and packed MFMA-A bytes deterministically.
 
 This runs the scaffold kernel twice with the same knobs:
   1) debug_flags=0x01000000: dumps raw TR8 regs v200..v231 (128B/tid)
-  2) debug_flags=0x00200000: dumps selected packed V->A regs v48..v55 (32B/tid)
+  2) debug_flags=0x00000001: dumps PV operands right before MFMA and exits:
+       - B operand (packed V) in v0..v7   (32B/tid)
+       - A operand (packed P) in v48..v55 (32B/tid)
 
 Both use:
   - debug_flags |= 0x00000004  (use v_read_cb-style PV base/knobs)
@@ -115,13 +117,24 @@ def main() -> None:
 
     # Fixed one-block shape
     B, H, D = 1, 1, 128
-    num_q_blocks = 2
-    num_k_tiles = 2
+    num_q_blocks = int(os.environ.get("DUMP_Q_BLOCKS", "2"))
+    num_k_tiles = int(os.environ.get("DUMP_K_TILES", "2"))
     s_q = num_q_blocks * 128
     s_k = num_k_tiles * 32
 
-    Q = torch.zeros((B, H, s_q, D), device="cuda", dtype=torch.float8_e4m3fn)
-    K = torch.zeros((B, H, s_k, D), device="cuda", dtype=torch.float8_e4m3fn)
+    # Default to identity-P (Q/K identity) so the repro matches numerics identity-P semantics.
+    qk_identity = os.environ.get("DUMP_IDENTITY_P", "1") == "1"
+    if qk_identity:
+        Qf32 = torch.zeros((B, H, s_q, D), device="cuda", dtype=torch.float32)
+        Kf32 = torch.zeros((B, H, s_k, D), device="cuda", dtype=torch.float32)
+        for r in range(min(s_k, D, s_q)):
+            Qf32[0, 0, r, r] = 1.0
+            Kf32[0, 0, r, r] = 1.0
+        Q = Qf32.to(torch.float8_e4m3fn)
+        K = Kf32.to(torch.float8_e4m3fn)
+    else:
+        Q = torch.zeros((B, H, s_q, D), device="cuda", dtype=torch.float8_e4m3fn)
+        K = torch.zeros((B, H, s_k, D), device="cuda", dtype=torch.float8_e4m3fn)
 
     v_bytes = torch.empty((s_k, D), device="cuda", dtype=torch.uint8)
     for r in range(s_k):
@@ -157,14 +170,53 @@ def main() -> None:
     stride_kh = s_k * D
     stride_vh = s_k * D
 
-    # --- raw TR8 regs dump (v200..v231): 32 dwords per tid
-    out_raw = torch.zeros(512 * 32, device="cuda", dtype=torch.uint32)
-    flags_raw = 0x01000000 | 0x00000004 | 0x00000080
+    disable_row_permute = os.environ.get("DUMP_DISABLE_ROW_PERMUTE", "1") == "1"
+    base_flags = 0x00000004
+    if disable_row_permute:
+        base_flags |= 0x00000080
+
+    # Optional: only dump PV AB (skip raw TR8 dump) for fast iteration.
+    only_pv_ab = os.environ.get("DUMP_ONLY_PV_AB", "0") == "1"
+    raw_u32: List[int] = []
+    if not only_pv_ab:
+        # --- raw TR8 regs dump (v200..v231): 32 dwords per tid
+        out_raw = torch.zeros(512 * 32, device="cuda", dtype=torch.uint32)
+        flags_raw = 0x01000000 | base_flags
+        if os.environ.get("DUMP_IDENTITY_WRITE", "1") == "1":
+            flags_raw |= 0x00080000
+        _launch(
+            hip,
+            out=out_raw,
+            Q=Q,
+            K=K,
+            V=V,
+            num_k_tiles=num_k_tiles,
+            stride_qh=stride_qh,
+            stride_kh=stride_kh,
+            stride_vh=stride_vh,
+            stride_oh_bytes=out_raw.numel() * 4,
+            debug_flags=flags_raw,
+            v_read_cb=v_read_cb,
+            v_read_lane_add=v_read_lane_add,
+            v_read_v3_xor=v_read_v3_xor,
+            v_read_v3_add=v_read_v3_add,
+            v_read_v4_add=v_read_v4_add,
+            v_read_v2_add=v_read_v2_add,
+            v_read_base_add=v_read_base_add,
+            v_read_base_xor=v_read_base_xor,
+            v_read_base_extra_add=v_read_base_extra_add,
+            v_read_s25_override=v_read_s25_override,
+        )
+        raw_u32 = out_raw.cpu().tolist()
+
+    # --- PV operand dump (B=v0..v7, A=v48..v55): 16 dwords per tid
+    out_ab = torch.zeros(512 * 16, device="cuda", dtype=torch.uint32)
+    flags_ab = 0x00000001 | base_flags
     if os.environ.get("DUMP_IDENTITY_WRITE", "1") == "1":
-        flags_raw |= 0x00080000
+        flags_ab |= 0x00080000
     _launch(
         hip,
-        out=out_raw,
+        out=out_ab,
         Q=Q,
         K=K,
         V=V,
@@ -172,8 +224,8 @@ def main() -> None:
         stride_qh=stride_qh,
         stride_kh=stride_kh,
         stride_vh=stride_vh,
-        stride_oh_bytes=out_raw.numel() * 4,
-        debug_flags=flags_raw,
+        stride_oh_bytes=out_ab.numel() * 4,
+        debug_flags=flags_ab,
         v_read_cb=v_read_cb,
         v_read_lane_add=v_read_lane_add,
         v_read_v3_xor=v_read_v3_xor,
@@ -186,49 +238,30 @@ def main() -> None:
         v_read_s25_override=v_read_s25_override,
     )
 
-    # --- packed A dump (v48..v55): 8 dwords per tid
-    out_a = torch.zeros(512 * 8, device="cuda", dtype=torch.uint32)
-    flags_a = 0x00200000 | 0x00000004 | 0x00000080
-    if os.environ.get("DUMP_IDENTITY_WRITE", "1") == "1":
-        flags_a |= 0x00080000
-    _launch(
-        hip,
-        out=out_a,
-        Q=Q,
-        K=K,
-        V=V,
-        num_k_tiles=num_k_tiles,
-        stride_qh=stride_qh,
-        stride_kh=stride_kh,
-        stride_vh=stride_vh,
-        stride_oh_bytes=out_a.numel() * 4,
-        debug_flags=flags_a,
-        v_read_cb=v_read_cb,
-        v_read_lane_add=v_read_lane_add,
-        v_read_v3_xor=v_read_v3_xor,
-        v_read_v3_add=v_read_v3_add,
-        v_read_v4_add=v_read_v4_add,
-        v_read_v2_add=v_read_v2_add,
-        v_read_base_add=v_read_base_add,
-        v_read_base_xor=v_read_base_xor,
-        v_read_base_extra_add=v_read_base_extra_add,
-        v_read_s25_override=v_read_s25_override,
-    )
-
-    raw_u32 = out_raw.cpu().tolist()
-    a_u32 = out_a.cpu().tolist()
+    ab_u32 = out_ab.cpu().tolist()
 
     def raw_bytes_for_tid(tid: int) -> List[int]:
+        if only_pv_ab:
+            return [0] * 128
         base = tid * 32
         bs: List[int] = []
         for u in raw_u32[base : base + 32]:
             bs += _unpack_u32_bytes(int(u))
         return bs
 
-    def a_bytes_for_tid(tid: int) -> List[int]:
-        base = tid * 8
+    def b_bytes_for_tid(tid: int) -> List[int]:
+        # v0..v7 (8 dwords)
+        base = tid * 16
         bs: List[int] = []
-        for u in a_u32[base : base + 8]:
+        for u in ab_u32[base : base + 8]:
+            bs += _unpack_u32_bytes(int(u))
+        return bs
+
+    def a_bytes_for_tid(tid: int) -> List[int]:
+        # v48..v55 (8 dwords), stored after v0..v7
+        base = tid * 16 + 8
+        bs: List[int] = []
+        for u in ab_u32[base : base + 8]:
             bs += _unpack_u32_bytes(int(u))
         return bs
 
@@ -239,11 +272,14 @@ def main() -> None:
         lane = tid & 63
         exp = exp0 if lane < 32 else exp32
         rbs = raw_bytes_for_tid(tid)
+        bbs = b_bytes_for_tid(tid)
         abs_ = a_bytes_for_tid(tid)
         print(f"tid={tid} lane={lane}")
         print(f"  raw unique={len(set(rbs))} contains_expected={len(set(rbs) & set(exp))}/32")
-        print(f"  packed A bytes: {abs_[:32]}")
-        print(f"  packed positional: {_score_positional(abs_, exp)}/32")
+        print(f"  packed V(B) bytes: {bbs[:32]}")
+        print(f"  packed V(B) positional: {_score_positional(bbs, exp)}/32")
+        if qk_identity:
+            print(f"  packed P(A) bytes: {abs_[:32]}")
 
     # Global worst-case across all tids
     min_pos = 32
@@ -251,8 +287,8 @@ def main() -> None:
     for tid in range(512):
         lane = tid & 63
         exp = exp0 if lane < 32 else exp32
-        abs_ = a_bytes_for_tid(tid)
-        pos = _score_positional(abs_, exp)
+        bbs = b_bytes_for_tid(tid)
+        pos = _score_positional(bbs, exp)
         min_pos = min(min_pos, pos)
         if pos == 32:
             perfect += 1
