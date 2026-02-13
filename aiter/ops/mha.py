@@ -9,10 +9,7 @@ from torch import Generator, Tensor
 from ..jit.core import CK_DIR, AITER_META_DIR, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
-from ..jit.utils.mha_recipes import (
-    compose_mha_fwd_variant_suffix_and_filter,
-    get_mha_varlen_prebuild_variants_by_names,
-)
+from ..jit.utils.mha_recipes import compose_mha_fwd_variant_suffix_and_filter
 from ..utility import dtypes
 
 
@@ -333,9 +330,16 @@ def cmdGenFunc_mha_varlen_fwd(
             skip_zero=skip_zero,
             has_qscale=has_qscale,
         )
-        md_name = f"mha_varlen_fwd{suffix}"
-        variants = get_mha_varlen_prebuild_variants_by_names([md_name], CK_DIR)
-        blob_gen_cmd = variants[0]["blob_gen_cmd"]
+        has_sink = (sink_ptr is not None) or (sink_size > 0)
+        sink_token = "_sink" if has_sink else "_nsink"
+        md_name = f"mha_varlen_fwd{suffix}{sink_token}"
+        filter_fwd += f"{sink_token}*"
+        # Explicitly filter sink/nsink kernels to avoid generating both
+        # variants in one TU, which causes duplicate symbol definitions.
+        blob_gen_cmd = [
+            f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 200 --filter "{filter_fwd}" --output_dir {{}}',
+            f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --filter " @ " --output_dir {{}}',
+        ]
     else:
         md_name = "mha_varlen_fwd"
         filter_fwd_splitkv1 = "*"  # get_fwd_splitkv_combine_blobs()
